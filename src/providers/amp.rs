@@ -170,6 +170,65 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
         windows,
     })
 }
+pub struct AmpApiProvider;
+impl AmpApiProvider {
+    async fn fetch_api(
+        &self,
+        context: &ProviderContext,
+        endpoint: &str,
+    ) -> Result<ProviderUsage, ProviderError> {
+        let key = context
+            .credentials
+            .get("AMP_API_KEY")
+            .ok_or(ProviderError::Authentication)?;
+        let response: serde_json::Value = super::http::json(
+            context
+                .http
+                .post(endpoint)
+                .header(
+                    "Authorization",
+                    super::http::sensitive(&format!("Bearer {}", key.0))?,
+                )
+                .header("Accept", "application/json")
+                .json(&serde_json::json!({"method":"userDisplayBalanceInfo","params":{}})),
+            context.clock.now(),
+        )
+        .await?;
+        if response
+            .pointer("/error/code")
+            .and_then(serde_json::Value::as_str)
+            == Some("auth-required")
+        {
+            return Err(ProviderError::Authentication);
+        }
+        if response.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+            return Err(ProviderError::InvalidData);
+        }
+        let text = response
+            .pointer("/result/displayText")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ProviderError::InvalidData)?;
+        let mut usage = parse(text, context.clock.now())?;
+        for window in &mut usage.windows {
+            window.provenance.source = "amp_api".into();
+        }
+        Ok(usage)
+    }
+}
+impl ProviderAdapter for AmpApiProvider {
+    fn id(&self) -> ProviderId {
+        ProviderId("amp".into())
+    }
+    fn idempotent(&self) -> bool {
+        true
+    }
+    fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
+        Box::pin(self.fetch_api(
+            context,
+            "https://ampcode.com/api/internal?userDisplayBalanceInfo",
+        ))
+    }
+}
 impl ProviderAdapter for AmpProvider {
     fn id(&self) -> ProviderId {
         ProviderId("amp".into())
@@ -223,5 +282,29 @@ mod tests {
                 "accepted malformed percentage"
             );
         }
+    }
+    #[tokio::test]
+    async fn api_uses_bearer_and_preserves_parsed_balances() {
+        use std::sync::Arc;
+        struct Keys;
+        impl super::super::CredentialStore for Keys {
+            fn get(&self, name: &str) -> Option<super::super::Secret> {
+                (name == "AMP_API_KEY").then(|| super::super::Secret("synthetic-key".into()))
+            }
+        }
+        let (url, task) = super::super::http::fixture::server(vec![
+            serde_json::json!({"ok":true,"result":{"displayText":FIXTURE}}),
+        ])
+        .await;
+        let mut context = super::super::http::fixture::context();
+        context.credentials = Arc::new(Keys);
+        let usage = AmpApiProvider.fetch_api(&context, &url).await.unwrap();
+        assert_eq!(usage.windows.len(), 5);
+        assert_eq!(usage.windows[0].provenance.source, "amp_api");
+        let requests = task.await.unwrap();
+        assert!(requests[0].starts_with("POST / "));
+        assert!(requests[0].contains("Bearer synthetic-key"));
+        assert!(requests[0].contains("userDisplayBalanceInfo"));
+        assert!(!requests[0].to_lowercase().contains("cookie:"));
     }
 }
