@@ -463,4 +463,37 @@ mod tests {
             assert_eq!(task.await.unwrap().len(), 2);
         }
     }
+    #[test]
+    fn credential_files_are_bounded_and_never_rewritten() {
+        let directory =
+            std::env::temp_dir().join(format!("quotio-antigravity-auth-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("auth.json");
+        let contents = br#"{"access_token":"synthetic-token","refresh_token":"untouched"}"#;
+        std::fs::write(&path, contents).unwrap();
+        assert_eq!(read_auth(&path).unwrap().0, "synthetic-token");
+        assert_eq!(std::fs::read(&path).unwrap(), contents);
+        #[cfg(unix)]
+        {
+            let link = directory.join("link.json");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(matches!(
+                read_auth(&link),
+                Err(ProviderError::Authentication)
+            ));
+            std::fs::remove_file(link).unwrap();
+        }
+        std::fs::write(&path, vec![b'a'; 1024 * 1024 + 1]).unwrap();
+        assert!(matches!(
+            read_auth(&path),
+            Err(ProviderError::Authentication)
+        ));
+        std::fs::write(&path, b"not-json-sentinel").unwrap();
+        assert!(matches!(
+            read_auth(&path),
+            Err(ProviderError::Authentication)
+        ));
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
 }
