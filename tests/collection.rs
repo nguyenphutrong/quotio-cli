@@ -241,3 +241,36 @@ async fn deadline_drops_inflight_work() {
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert_eq!(report.failures[0].code, ProviderError::Timeout);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_stdio_protocol_is_exercised_offline() {
+    use quotio::providers::codex::CodexProvider;
+    use std::os::unix::fs::PermissionsExt;
+    let directory = std::env::temp_dir().join(format!("quotio-codex-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let script = directory.join("codex-fixture");
+    std::fs::write(&script, r#"#!/bin/sh
+while IFS= read -r request; do
+case "$request" in
+*'"id":1,'*) printf '%s\n' '{"id":1,"result":{}}';;
+*'"id":2,'*) printf '%s\n' '{"id":2,"result":{"account":{"type":"chatgpt","email":"demo@example.com","planType":"pro"}}}';;
+*'"id":3,'*) printf '%s\n' '{"method":"account/rateLimits/updated","params":{}}' '{"id":3,"result":{"rateLimits":{"primary":{"usedPercent":25}}}}';;
+*'"id":4,'*) printf '%s\n' '{"id":4,"result":{"account":{"type":"chatgpt","email":"demo@example.com","planType":"pro"}}}';;
+esac
+done
+"#).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let report = collector()
+        .collect(request(vec![Arc::new(CodexProvider {
+            executable: script.clone(),
+        })]))
+        .await;
+    assert_eq!(report.exit_code(), 0);
+    assert_eq!(
+        report.providers[0].windows[0].quota,
+        Quota::from_used(Some(25.0))
+    );
+    std::fs::remove_file(script).unwrap();
+    std::fs::remove_dir(directory).unwrap();
+}

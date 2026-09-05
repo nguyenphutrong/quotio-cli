@@ -54,3 +54,51 @@ pub(crate) async fn output(program: &Path, args: &[&str]) -> Result<Vec<u8>, Pro
     }
     Ok(bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn protocol_lines_are_bounded() {
+        let mut input = BufReader::new(&b"{\"id\":1}\n"[..]);
+        assert_eq!(line(&mut input).await.unwrap(), b"{\"id\":1}\n");
+        assert_eq!(
+            line(&mut input).await.unwrap_err(),
+            ProviderError::InvalidData
+        );
+        let oversized = vec![b'a'; MAX_BYTES + 1];
+        let mut input = BufReader::new(oversized.as_slice());
+        assert_eq!(
+            line(&mut input).await.unwrap_err(),
+            ProviderError::InvalidData
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_subprocess_kills_it() {
+        let mut child = spawn(Path::new("/bin/sh"), &["-c", "printf ready; read value"]).unwrap();
+        let pid = child.id().unwrap();
+        let mut output = child.stdout.take().unwrap();
+        let mut ready = [0; 5];
+        output.read_exact(&mut ready).await.unwrap();
+        assert_eq!(&ready, b"ready");
+        drop(child);
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let status = Command::new("/bin/kill")
+                    .args(["-0", &pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await
+                    .unwrap();
+                if !status.success() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(gone.is_ok());
+    }
+}

@@ -130,6 +130,80 @@ fn parse(
         windows,
     })
 }
+impl FactoryProvider {
+    async fn fetch_api(
+        &self,
+        context: &ProviderContext,
+        global: &str,
+        eu: &str,
+    ) -> Result<ProviderUsage, ProviderError> {
+        let key = context
+            .credentials
+            .get("FACTORY_API_KEY")
+            .filter(|key| !key.0.trim().is_empty())
+            .ok_or(ProviderError::Authentication)?;
+        let region = context.credentials.get("FACTORY_REGION");
+        let base = match region
+            .as_ref()
+            .map(|value| value.0.as_str())
+            .unwrap_or("global")
+        {
+            "global" => global,
+            "eu" => eu,
+            _ => return Err(ProviderError::InvalidData),
+        };
+        let authorization = http::sensitive(&format!("Bearer {}", key.0))?;
+        let organization = context.credentials.get("FACTORY_ORG_ID");
+        let mut who = context
+            .http
+            .get(format!("{base}/api/cli/whoami"))
+            .header("Authorization", authorization.clone())
+            .header("X-Factory-Whoami-Extended", "true");
+        if let Some(org) = &organization {
+            who = who.header("X-Factory-Org-Id", http::sensitive(&org.0)?);
+        }
+        let before: Identity = http::json(who, context.clock.now()).await?;
+        if before.is_on_prem
+            || before.org_id.is_empty()
+            || before.user_id.is_empty()
+            || before.region.as_deref().is_some_and(|actual| {
+                actual != region.as_ref().map(|r| r.0.as_str()).unwrap_or("global")
+            })
+        {
+            return Err(ProviderError::InvalidData);
+        }
+        if organization
+            .as_ref()
+            .is_some_and(|org| org.0 != before.org_id)
+        {
+            return Err(ProviderError::InvalidData);
+        }
+        let org = http::sensitive(&before.org_id)?;
+        let response: Response = http::json(
+            context
+                .http
+                .get(format!("{base}/api/billing/limits"))
+                .header("Authorization", authorization.clone())
+                .header("X-Factory-Org-Id", org.clone()),
+            context.clock.now(),
+        )
+        .await?;
+        let after: Identity = http::json(
+            context
+                .http
+                .get(format!("{base}/api/cli/whoami"))
+                .header("Authorization", authorization)
+                .header("X-Factory-Whoami-Extended", "true")
+                .header("X-Factory-Org-Id", org),
+            context.clock.now(),
+        )
+        .await?;
+        if before != after {
+            return Err(ProviderError::InvalidData);
+        }
+        parse(after, response, context.clock.now())
+    }
+}
 impl ProviderAdapter for FactoryProvider {
     fn id(&self) -> ProviderId {
         ProviderId("factory".into())
@@ -138,73 +212,11 @@ impl ProviderAdapter for FactoryProvider {
         true
     }
     fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
-        Box::pin(async move {
-            let key = context
-                .credentials
-                .get("FACTORY_API_KEY")
-                .filter(|key| !key.0.trim().is_empty())
-                .ok_or(ProviderError::Authentication)?;
-            let region = context.credentials.get("FACTORY_REGION");
-            let base = match region
-                .as_ref()
-                .map(|value| value.0.as_str())
-                .unwrap_or("global")
-            {
-                "global" => "https://api.factory.ai",
-                "eu" => "https://api.eu.factory.ai",
-                _ => return Err(ProviderError::InvalidData),
-            };
-            let authorization = http::sensitive(&format!("Bearer {}", key.0))?;
-            let organization = context.credentials.get("FACTORY_ORG_ID");
-            let mut who = context
-                .http
-                .get(format!("{base}/api/cli/whoami"))
-                .header("Authorization", authorization.clone())
-                .header("X-Factory-Whoami-Extended", "true");
-            if let Some(org) = &organization {
-                who = who.header("X-Factory-Org-Id", http::sensitive(&org.0)?);
-            }
-            let before: Identity = http::json(who, context.clock.now()).await?;
-            if before.is_on_prem
-                || before.org_id.is_empty()
-                || before.user_id.is_empty()
-                || before.region.as_deref().is_some_and(|actual| {
-                    actual != region.as_ref().map(|r| r.0.as_str()).unwrap_or("global")
-                })
-            {
-                return Err(ProviderError::InvalidData);
-            }
-            if organization
-                .as_ref()
-                .is_some_and(|org| org.0 != before.org_id)
-            {
-                return Err(ProviderError::InvalidData);
-            }
-            let org = http::sensitive(&before.org_id)?;
-            let response: Response = http::json(
-                context
-                    .http
-                    .get(format!("{base}/api/billing/limits"))
-                    .header("Authorization", authorization.clone())
-                    .header("X-Factory-Org-Id", org.clone()),
-                context.clock.now(),
-            )
-            .await?;
-            let after: Identity = http::json(
-                context
-                    .http
-                    .get(format!("{base}/api/cli/whoami"))
-                    .header("Authorization", authorization)
-                    .header("X-Factory-Whoami-Extended", "true")
-                    .header("X-Factory-Org-Id", org),
-                context.clock.now(),
-            )
-            .await?;
-            if before != after {
-                return Err(ProviderError::InvalidData);
-            }
-            parse(after, response, context.clock.now())
-        })
+        Box::pin(self.fetch_api(
+            context,
+            "https://api.factory.ai",
+            "https://api.eu.factory.ai",
+        ))
     }
 }
 #[cfg(test)]
@@ -239,5 +251,39 @@ mod tests {
         );
         let response = serde_json::from_value(serde_json::json!({"limits":{}})).unwrap();
         assert!(parse(identity(), response, OffsetDateTime::UNIX_EPOCH).is_err());
+    }
+    #[tokio::test]
+    async fn identity_and_org_are_checked_across_requests() {
+        for changed in [false, true] {
+            let before =
+                serde_json::json!({"userId":"demo-user","orgId":"demo-org","region":"global"});
+            let after = if changed {
+                serde_json::json!({"userId":"different-user","orgId":"demo-org","region":"global"})
+            } else {
+                before.clone()
+            };
+            let (base, task) = http::fixture::server(vec![
+                before,
+                serde_json::json!({"limits":{"standard":{"fiveHour":{"usedPercent":25}}}}),
+                after,
+            ])
+            .await;
+            let context = http::fixture::context();
+            let result = FactoryProvider.fetch_api(&context, &base, &base).await;
+            assert_eq!(result.is_err(), changed);
+            let requests = task.await.unwrap();
+            assert!(requests[0].starts_with("GET /api/cli/whoami "));
+            assert!(requests[1].starts_with("GET /api/billing/limits "));
+            assert!(
+                requests[1]
+                    .to_lowercase()
+                    .contains("x-factory-org-id: demo-org")
+            );
+            assert!(
+                requests
+                    .iter()
+                    .all(|r| r.contains("Bearer synthetic-token"))
+            );
+        }
     }
 }

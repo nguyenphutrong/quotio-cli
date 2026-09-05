@@ -160,3 +160,73 @@ mod tests {
         task.await.unwrap();
     }
 }
+
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::*;
+    use crate::providers::{Clock, CredentialStore, ProviderContext, Secret};
+    use std::sync::Arc;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+        net::TcpListener,
+    };
+    struct Credentials;
+    impl CredentialStore for Credentials {
+        fn get(&self, name: &str) -> Option<Secret> {
+            matches!(name, "ANTIGRAVITY_ACCESS_TOKEN" | "FACTORY_API_KEY")
+                .then(|| Secret("synthetic-token".into()))
+        }
+    }
+    struct FixedClock;
+    impl Clock for FixedClock {
+        fn now(&self) -> OffsetDateTime {
+            OffsetDateTime::UNIX_EPOCH
+        }
+    }
+    pub fn context() -> ProviderContext {
+        ProviderContext {
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            clock: Arc::new(FixedClock),
+            credentials: Arc::new(Credentials),
+        }
+    }
+    pub async fn server(
+        responses: Vec<serde_json::Value>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut request = String::new();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    socket.read_line(&mut line).await.unwrap();
+                    if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                    request.push_str(&line);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                assert!(length < 4096);
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).await.unwrap();
+                request.push_str(std::str::from_utf8(&body).unwrap());
+                requests.push(request);
+                let body = response.to_string();
+                socket.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (format!("http://{address}"), task)
+    }
+}

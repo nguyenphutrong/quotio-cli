@@ -223,6 +223,80 @@ fn models(value: Value, now: OffsetDateTime) -> Result<Vec<QuotaWindow>, Provide
     }
     Ok(windows)
 }
+impl AntigravityProvider {
+    async fn fetch_api(
+        &self,
+        context: &ProviderContext,
+        base: &str,
+        user_info: &str,
+    ) -> Result<ProviderUsage, ProviderError> {
+        let token = self.token(context)?;
+        let authorization = http::sensitive(&format!("Bearer {}", token.0))?;
+        let before: Identity = http::json(
+            context
+                .http
+                .get(user_info)
+                .header("Authorization", authorization.clone()),
+            context.clock.now(),
+        )
+        .await?;
+        if !identity_valid(&before) {
+            return Err(ProviderError::InvalidData);
+        }
+        let post = |method: &str, payload: Value| {
+            context
+                .http
+                .post(format!("{base}{method}"))
+                .header("Authorization", authorization.clone())
+                .header("User-Agent", "quotio-cli/0.1.0")
+                .json(&payload)
+        };
+        let subscription: Value = http::json(
+            post(
+                "loadCodeAssist",
+                json!({"metadata":{"ideType":"ANTIGRAVITY"}}),
+            ),
+            context.clock.now(),
+        )
+        .await?;
+        let project = subscription.get("cloudaicompanionProject");
+        let project = match project {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(value) => string(value.get("id")),
+        };
+        let payload = project
+            .map(|p| json!({"project":p}))
+            .unwrap_or_else(|| json!({}));
+        let result: Result<Value, _> = http::json(
+            post("retrieveUserQuotaSummary", payload.clone()),
+            context.clock.now(),
+        )
+        .await;
+        let windows = match result {
+            Ok(value) => match summary(&value, context.clock.now()) {
+                Ok(windows) => windows,
+                Err(_) => models(
+                    http::json(post("fetchAvailableModels", payload), context.clock.now()).await?,
+                    context.clock.now(),
+                )?,
+            },
+            Err(ProviderError::Unavailable | ProviderError::InvalidData) => models(
+                http::json(post("fetchAvailableModels", payload), context.clock.now()).await?,
+                context.clock.now(),
+            )?,
+            Err(error) => return Err(error),
+        };
+        Ok(ProviderUsage {
+            provider: self.id(),
+            account: AccountIdentity {
+                id: before.id,
+                label: before.email,
+            },
+            windows,
+        })
+    }
+}
 impl ProviderAdapter for AntigravityProvider {
     fn id(&self) -> ProviderId {
         ProviderId("antigravity".into())
@@ -231,74 +305,11 @@ impl ProviderAdapter for AntigravityProvider {
         true
     }
     fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
-        Box::pin(async move {
-            let token = self.token(context)?;
-            let authorization = http::sensitive(&format!("Bearer {}", token.0))?;
-            let before: Identity = http::json(
-                context
-                    .http
-                    .get("https://www.googleapis.com/oauth2/v2/userinfo")
-                    .header("Authorization", authorization.clone()),
-                context.clock.now(),
-            )
-            .await?;
-            if !identity_valid(&before) {
-                return Err(ProviderError::InvalidData);
-            }
-            let post = |method: &str, payload: Value| {
-                context
-                    .http
-                    .post(format!("{BASE}{method}"))
-                    .header("Authorization", authorization.clone())
-                    .header("User-Agent", "quotio-cli/0.1.0")
-                    .json(&payload)
-            };
-            let subscription: Value = http::json(
-                post(
-                    "loadCodeAssist",
-                    json!({"metadata":{"ideType":"ANTIGRAVITY"}}),
-                ),
-                context.clock.now(),
-            )
-            .await?;
-            let project = subscription.get("cloudaicompanionProject");
-            let project = match project {
-                None | Some(Value::Null) => None,
-                Some(Value::String(s)) => Some(s.as_str()),
-                Some(value) => string(value.get("id")),
-            };
-            let payload = project
-                .map(|p| json!({"project":p}))
-                .unwrap_or_else(|| json!({}));
-            let result: Result<Value, _> = http::json(
-                post("retrieveUserQuotaSummary", payload.clone()),
-                context.clock.now(),
-            )
-            .await;
-            let windows = match result {
-                Ok(value) => match summary(&value, context.clock.now()) {
-                    Ok(windows) => windows,
-                    Err(_) => models(
-                        http::json(post("fetchAvailableModels", payload), context.clock.now())
-                            .await?,
-                        context.clock.now(),
-                    )?,
-                },
-                Err(ProviderError::Unavailable | ProviderError::InvalidData) => models(
-                    http::json(post("fetchAvailableModels", payload), context.clock.now()).await?,
-                    context.clock.now(),
-                )?,
-                Err(error) => return Err(error),
-            };
-            Ok(ProviderUsage {
-                provider: self.id(),
-                account: AccountIdentity {
-                    id: before.id,
-                    label: before.email,
-                },
-                windows,
-            })
-        })
+        Box::pin(self.fetch_api(
+            context,
+            BASE,
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+        ))
     }
 }
 #[cfg(test)]
@@ -330,5 +341,44 @@ mod tests {
             .is_err()
         );
         assert!(summary(&json!({"groups":[]}), OffsetDateTime::UNIX_EPOCH).is_err());
+    }
+    #[tokio::test]
+    async fn direct_api_sequence_and_fallback_use_same_credential() {
+        let (base, task) = http::fixture::server(vec![
+            json!({"id":"demo-id","email":"demo@example.com"}),
+            json!({"cloudaicompanionProject":"demo-project"}),
+            json!({}),
+            json!({"models":{"test-model":{"quotaInfo":{"remainingFraction":0.5}}}}),
+        ])
+        .await;
+        let provider = AntigravityProvider {
+            auth_directory: None,
+        };
+        let context = http::fixture::context();
+        let usage = provider
+            .fetch_api(
+                &context,
+                &format!("{base}/v1internal:"),
+                &format!("{base}/userinfo"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(usage.windows[0].provenance.source, "antigravity_api_models");
+        let requests = task.await.unwrap();
+        assert!(requests[0].starts_with("GET /userinfo "));
+        for (request, method) in requests[1..].iter().zip([
+            "loadCodeAssist",
+            "retrieveUserQuotaSummary",
+            "fetchAvailableModels",
+        ]) {
+            assert!(request.starts_with(&format!("POST /v1internal:{method} ")));
+        }
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.contains("Bearer synthetic-token"))
+        );
+        assert!(requests[2].contains("demo-project"));
+        assert!(requests[3].contains("demo-project"));
     }
 }
