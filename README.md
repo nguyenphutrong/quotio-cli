@@ -346,3 +346,8 @@ symlinks or submodules. Build and runtime do not need the reference checkout.
 - Factory windows whose end is in the past remain unknown until replaced by fresh data.
 - The main Quotio repository was consulted read-only for Antigravity API behavior.
   The CLI builds without that repository and without CodexBar.
+
+## License
+
+Quotio CLI is licensed under the [MIT License](LICENSE). Dependencies retain their
+own licenses; binary distributions also need the applicable third-party notices.
