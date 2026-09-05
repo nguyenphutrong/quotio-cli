@@ -1,1 +1,22 @@
 /target/
+
+# Local environment and credentials; keep sanitized templates versionable.
+.env
+.env.*
+!.env.example
+!.env.sample
+!*.env.example
+/auth.json
+/credentials.json
+/secrets.json
+
+# Private signing material and local diagnostics.
+*.key
+*.pem
+*.p12
+*.pfx
+*.mobileprovision
+*.provisionprofile
+*.log
+gitleaks-report*.json
+.DS_Store
