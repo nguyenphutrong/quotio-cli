@@ -200,9 +200,8 @@ Missing executables or unsupported output become per-provider failures.
 ## Other credential sources
 
 Antigravity reads `ANTIGRAVITY_ACCESS_TOKEN`, or the `access_token` field in the JSON
-file selected by `ANTIGRAVITY_AUTH_FILE`. Without either, it selects exactly one
-`antigravity-*.json` in `~/.cli-proxy-api`, as used by the main Quotio app. Multiple
-files require explicit selection. It obtains identity from Google userinfo and
+file selected by `ANTIGRAVITY_AUTH_FILE`. One of these must be set; the CLI does
+not search local credential directories. It obtains identity from Google userinfo and
 calls Google quota APIs with the same token. File contents are never rewritten.
 This version does not refresh tokens, scrape native SQLite/keychain stores or start
 a login flow. Refresh an expired token through its existing login owner.

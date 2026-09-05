@@ -2,25 +2,11 @@ use super::{FetchFuture, ProviderAdapter, ProviderContext, Secret, http};
 use crate::{domain::*, error::ProviderError};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{
-    collections::BTreeMap,
-    io::Read,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, io::Read, path::Path};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const BASE: &str = "https://cloudcode-pa.googleapis.com/v1internal:";
-pub struct AntigravityProvider {
-    pub auth_directory: Option<PathBuf>,
-}
-impl Default for AntigravityProvider {
-    fn default() -> Self {
-        Self {
-            auth_directory: directories::BaseDirs::new()
-                .map(|dirs| dirs.home_dir().join(".cli-proxy-api")),
-        }
-    }
-}
+pub struct AntigravityProvider;
 #[derive(Deserialize)]
 struct AuthFile {
     access_token: String,
@@ -68,26 +54,7 @@ impl AntigravityProvider {
         if let Some(path) = context.credentials.get("ANTIGRAVITY_AUTH_FILE") {
             return read_auth(Path::new(&path.0));
         }
-        let directory = self
-            .auth_directory
-            .as_ref()
-            .ok_or(ProviderError::Authentication)?;
-        let entries = std::fs::read_dir(directory).map_err(|_| ProviderError::Authentication)?;
-        let mut paths = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|_| ProviderError::Authentication)?;
-            let name = entry.file_name();
-            if name
-                .to_str()
-                .is_some_and(|name| name.starts_with("antigravity-") && name.ends_with(".json"))
-            {
-                paths.push(entry.path());
-            }
-        }
-        if paths.len() != 1 {
-            return Err(ProviderError::Authentication);
-        }
-        read_auth(&paths[0])
+        Err(ProviderError::Authentication)
     }
 }
 #[derive(Deserialize, PartialEq)]
@@ -331,6 +298,47 @@ impl ProviderAdapter for AntigravityProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct Credentials {
+        token: Option<String>,
+        file: Option<String>,
+    }
+    impl super::super::CredentialStore for Credentials {
+        fn get(&self, name: &str) -> Option<Secret> {
+            match name {
+                "ANTIGRAVITY_ACCESS_TOKEN" => self.token.clone().map(Secret),
+                "ANTIGRAVITY_AUTH_FILE" => self.file.clone().map(Secret),
+                _ => panic!("unexpected credential source"),
+            }
+        }
+    }
+    #[test]
+    fn credentials_require_explicit_selection_and_prefer_token() {
+        let mut context = http::fixture::context();
+        context.credentials = std::sync::Arc::new(Credentials {
+            token: None,
+            file: None,
+        });
+        assert!(matches!(
+            AntigravityProvider.token(&context),
+            Err(ProviderError::Authentication)
+        ));
+        context.credentials = std::sync::Arc::new(Credentials {
+            token: Some("synthetic-token".into()),
+            file: Some("unread-file.json".into()),
+        });
+        assert_eq!(
+            AntigravityProvider.token(&context).unwrap().0,
+            "synthetic-token"
+        );
+        context.credentials = std::sync::Arc::new(Credentials {
+            token: Some(" ".into()),
+            file: None,
+        });
+        assert!(matches!(
+            AntigravityProvider.token(&context),
+            Err(ProviderError::Authentication)
+        ));
+    }
     #[test]
     fn summary_keeps_groups_windows_and_unknown() {
         let value = json!({"groups":[{"displayName":"Gemini","buckets":[{"bucketId":"session","remainingFraction":0.25},{"bucketId":"weekly","remaining":{"case":"remainingFraction","value":"0.75"}}]},{"name":"Claude","buckets":[{"name":"weekly"}]}]});
@@ -368,9 +376,7 @@ mod tests {
             json!({"models":{"test-model":{"quotaInfo":{"remainingFraction":0.5}}}}),
         ])
         .await;
-        let provider = AntigravityProvider {
-            auth_directory: None,
-        };
+        let provider = AntigravityProvider;
         let context = http::fixture::context();
         let usage = provider
             .fetch_api(
@@ -414,9 +420,7 @@ mod tests {
             }
             responses.push((200,json!({"groups":[{"name":"Gemini","buckets":[{"name":"weekly","remainingFraction":0.5}]}]})));
             let (base, task) = http::fixture::server_status(responses).await;
-            let provider = AntigravityProvider {
-                auth_directory: None,
-            };
+            let provider = AntigravityProvider;
             let context = http::fixture::context();
             let usage = provider
                 .fetch_api(
@@ -452,9 +456,7 @@ mod tests {
             ])
             .await;
             let context = http::fixture::context();
-            let provider = AntigravityProvider {
-                auth_directory: None,
-            };
+            let provider = AntigravityProvider;
             let result = provider
                 .fetch_api(
                     &context,
@@ -474,7 +476,15 @@ mod tests {
         let path = directory.join("auth.json");
         let contents = br#"{"access_token":"synthetic-token","refresh_token":"untouched"}"#;
         std::fs::write(&path, contents).unwrap();
-        assert_eq!(read_auth(&path).unwrap().0, "synthetic-token");
+        let mut context = http::fixture::context();
+        context.credentials = std::sync::Arc::new(Credentials {
+            token: None,
+            file: Some(path.to_str().unwrap().into()),
+        });
+        assert_eq!(
+            AntigravityProvider.token(&context).unwrap().0,
+            "synthetic-token"
+        );
         assert_eq!(std::fs::read(&path).unwrap(), contents);
         #[cfg(unix)]
         {

@@ -78,7 +78,7 @@ impl Provider {
             Self::Mock => std::sync::Arc::new(MockProvider),
             Self::Codex => std::sync::Arc::new(CodexProvider::default()),
             Self::Amp => std::sync::Arc::new(AmpProvider::default()),
-            Self::Antigravity => std::sync::Arc::new(AntigravityProvider::default()),
+            Self::Antigravity => std::sync::Arc::new(AntigravityProvider),
             Self::Factory => std::sync::Arc::new(FactoryProvider),
         }
     }
