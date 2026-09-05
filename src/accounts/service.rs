@@ -31,11 +31,12 @@ fn scoped(
         organization,
     } = credential
     {
-        let key = match provider {
-            Provider::Amp => "AMP_API_KEY",
-            Provider::Factory => "FACTORY_API_KEY",
-            _ => return Err(AccountError::Unsupported),
-        };
+        let key = provider.api_key_name().ok_or(AccountError::Unsupported)?;
+        if let Some(name) = provider.key_api().and_then(|k| k.region_key())
+            && let Some(region) = region
+        {
+            keys.insert(name.into(), region.clone());
+        }
         keys.insert(key.into(), token.clone());
         if provider == Provider::Factory {
             if let Some(region) = region {
@@ -62,6 +63,7 @@ pub async fn validate(
         Provider::Amp => AmpApiProvider.fetch(&ctx).await?,
         Provider::Factory => FactoryProvider.fetch(&ctx).await?,
         Provider::Codex => codex_api::fetch(&ctx, credential).await?,
+        provider if provider.key_api().is_some() => provider.adapter().fetch(&ctx).await?,
         _ => return Err(AccountError::Unsupported),
     };
     if usage.windows.is_empty()
@@ -311,7 +313,15 @@ fn executable_available(name: &str) -> bool {
     })
 }
 async fn local_sources(requested: &[Provider], timeout: std::time::Duration) -> Vec<Provider> {
-    let mut sources = Vec::new();
+    let mut sources: Vec<_> = requested
+        .iter()
+        .copied()
+        .filter(|p| {
+            p.key_api().is_some()
+                && p.api_key_name()
+                    .is_some_and(|name| std::env::var_os(name).is_some())
+        })
+        .collect();
     if requested.contains(&Provider::Codex) && executable_available("codex") {
         sources.push(Provider::Codex);
     }
@@ -376,10 +386,7 @@ fn choose(
     }
     let mut selected = Vec::new();
     for provider in providers {
-        if !matches!(
-            provider,
-            Provider::Codex | Provider::Amp | Provider::Factory
-        ) {
+        if !provider.supports_accounts() {
             selected.push(provider.adapter());
             continue;
         }
@@ -388,11 +395,10 @@ fn choose(
                 let matching: Vec<_> = accounts
                     .iter()
                     .filter(|a| {
-                        a.provider == provider
-                            && (matches!(provider, Provider::Codex | Provider::Amp) || a.active)
+                        a.provider == provider && (provider != Provider::Factory || a.active)
                     })
                     .collect();
-                if matches!(provider, Provider::Codex | Provider::Amp) {
+                if provider != Provider::Factory {
                     if local_sources.contains(&provider) || matching.is_empty() {
                         selected.push(provider.adapter());
                     }
@@ -437,10 +443,7 @@ pub async fn adapters(
         }
         return Ok(providers.into_iter().map(Provider::adapter).collect());
     }
-    if !providers
-        .iter()
-        .any(|p| matches!(p, Provider::Codex | Provider::Amp | Provider::Factory))
-    {
+    if !providers.iter().any(|p| p.supports_accounts()) {
         if filter.is_some() {
             return Err(AccountError::NotFound);
         }
@@ -688,6 +691,75 @@ mod tests {
         ));
         drop(held);
         cleanup(path);
+    }
+    #[test]
+    fn added_key_providers_scope_credentials_and_select_all_accounts() {
+        for provider in [
+            Provider::Synthetic,
+            Provider::OpenRouter,
+            Provider::Zai,
+            Provider::MiniMax,
+        ] {
+            let (vault, _, _, _, path) = setup(3600, false, false, false);
+            let credential = Credential::ApiKey {
+                token: "saved-test-key".into(),
+                region: provider
+                    .key_api()
+                    .unwrap()
+                    .region_key()
+                    .map(|_| "cn".into()),
+                organization: None,
+            };
+            let ctx = scoped(&http::fixture::context(), provider, &credential).unwrap();
+            assert_eq!(
+                ctx.credentials
+                    .get(provider.api_key_name().unwrap())
+                    .unwrap()
+                    .0,
+                "saved-test-key"
+            );
+            assert!(ctx.credentials.get("FACTORY_API_KEY").is_none());
+            if let Some(name) = provider.key_api().unwrap().region_key() {
+                assert_eq!(ctx.credentials.get(name).unwrap().0, "cn");
+            }
+            let mut tx = vault.begin().unwrap();
+            let first = tx
+                .document
+                .add(provider, "First", "key:first".into(), credential.clone())
+                .unwrap();
+            let second = tx
+                .document
+                .add(provider, "Second", "key:second".into(), credential)
+                .unwrap();
+            let accounts = tx.document.accounts.clone();
+            drop(tx);
+            let selected = choose(
+                vec![provider],
+                None,
+                Ok(accounts.clone()),
+                &vault,
+                &[provider],
+            )
+            .unwrap();
+            assert_eq!(
+                selected
+                    .iter()
+                    .map(|p| p.account_ref().unwrap().id)
+                    .collect::<Vec<_>>(),
+                vec!["local".to_owned(), first, second.clone()]
+            );
+            let selected = choose(
+                vec![provider],
+                Some(&second),
+                Ok(accounts),
+                &vault,
+                &[provider],
+            )
+            .unwrap();
+            assert_eq!(selected.len(), 1);
+            assert_eq!(selected[0].account_ref().unwrap().id, second);
+            cleanup(path);
+        }
     }
     #[test]
     fn amp_selection_keeps_local_and_all_saved_accounts() {

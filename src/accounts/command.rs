@@ -70,18 +70,26 @@ pub async fn run(
             if let Some(label) = &label {
                 validate_label(label)?;
             }
-            if provider != Provider::Factory && (region.is_some() || organization.is_some()) {
+            let region_valid = matches!(
+                (provider, region.as_deref()),
+                (_, None)
+                    | (Provider::Factory, Some("global" | "eu"))
+                    | (Provider::Zai | Provider::MiniMax, Some("global" | "cn"))
+            );
+            if !region_valid || (provider != Provider::Factory && organization.is_some()) {
                 return Err(AccountError::Unsupported);
             }
             let credential = match provider {
                 Provider::Codex if !token_stdin => {
                     super::oauth::login(context, !no_browser).await?
                 }
-                Provider::Amp | Provider::Factory if !no_browser => {
-                    let name = if provider == Provider::Amp {
-                        "Amp"
-                    } else {
-                        "Factory"
+                provider if provider.api_key_name().is_some() && !no_browser => {
+                    let name = provider.to_possible_value().expect("provider");
+                    let name = match provider {
+                        Provider::Amp => "Amp",
+                        Provider::Factory => "Factory",
+                        Provider::MiniMax => "MiniMax Token Plan",
+                        _ => name.get_name(),
                     };
                     let token = super::input::read_api_key(name, token_stdin).await?;
                     let token = token.trim();

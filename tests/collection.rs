@@ -280,6 +280,7 @@ done
 }
 
 struct AccountCandidate {
+    provider: &'static str,
     selector: &'static str,
     identity: &'static str,
     email: &'static str,
@@ -288,7 +289,7 @@ struct AccountCandidate {
 }
 impl ProviderAdapter for AccountCandidate {
     fn id(&self) -> ProviderId {
-        ProviderId("codex".into())
+        ProviderId(self.provider.into())
     }
     fn account_ref(&self) -> Option<AccountRef> {
         Some(AccountRef {
@@ -315,6 +316,7 @@ fn candidate(
     plan: Option<&'static str>,
 ) -> Arc<dyn ProviderAdapter> {
     Arc::new(AccountCandidate {
+        provider: "codex",
         selector,
         identity,
         email,
@@ -393,6 +395,7 @@ async fn duplicates_prefer_saved_but_workspace_or_ambiguous_emails_stay_separate
 #[tokio::test(start_paused = true)]
 async fn account_timeout_preserves_other_accounts_and_identifies_the_failure() {
     let slow = Arc::new(AccountCandidate {
+        provider: "codex",
         selector: "saved-slow",
         identity: "slow-id",
         email: "slow@example.com",
@@ -536,6 +539,39 @@ async fn amp_local_failure_keeps_saved_usage_and_failure_identity() {
         report.providers[0].account_ref.as_ref().unwrap().id,
         "saved"
     );
+}
+
+#[tokio::test]
+async fn key_scoped_providers_do_not_merge_different_keys() {
+    for provider in ["synthetic", "openrouter", "zai", "minimax"] {
+        for saved_id in ["key:local", "key:other"] {
+            let candidates: Vec<Arc<dyn ProviderAdapter>> =
+                [("local", "key:local"), ("saved", saved_id)]
+                    .into_iter()
+                    .map(|(selector, identity)| {
+                        Arc::new(AccountCandidate {
+                            provider,
+                            selector,
+                            identity,
+                            email: "same-owner",
+                            plan: None,
+                            delay: Duration::ZERO,
+                        }) as Arc<dyn ProviderAdapter>
+                    })
+                    .collect();
+            let report = collector().collect(request(candidates)).await;
+            assert_eq!(
+                report.providers.len(),
+                if saved_id == "key:local" { 1 } else { 2 }
+            );
+            if saved_id == "key:local" {
+                assert_eq!(
+                    report.providers[0].account_ref.as_ref().unwrap().id,
+                    "saved"
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]

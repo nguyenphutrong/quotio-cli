@@ -517,3 +517,36 @@ fn api_key_pipe_requires_flag_and_preserves_validation() {
         }));
     }
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn new_key_providers_reach_key_validation_without_network() {
+    use std::{io::Write, process::Stdio};
+    for provider in ["synthetic", "openrouter", "zai", "minimax"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_quotio"));
+        command.args(["accounts", "add", "--provider", provider, "--token-stdin"]);
+        if matches!(provider, "zai" | "minimax") {
+            command.args(["--region", "cn"]);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"invalid\tkey\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("credential input")
+        );
+        assert!(output.stdout.is_empty());
+    }
+}

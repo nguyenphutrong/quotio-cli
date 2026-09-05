@@ -6,6 +6,7 @@ pub mod codex;
 pub mod codex_api;
 pub mod factory;
 pub(crate) mod http;
+pub mod key_api;
 pub mod mock;
 pub(crate) mod process;
 use crate::{

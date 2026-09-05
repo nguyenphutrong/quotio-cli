@@ -1,7 +1,8 @@
 # Quotio CLI
 
 A standalone Rust CLI for provider quota reports. The CLI supports `mock`, `codex`,
-`amp`, `antigravity`, and `factory` (aliases `droid`, `factory-droid`). No TUI yet.
+`amp`, `antigravity`, `factory` (aliases `droid`, `factory-droid`), `synthetic`,
+`openrouter`, `zai` (alias `glm`), and `minimax`. No TUI yet.
 
 | Provider | Data source | Current verification |
 | --- | --- | --- |
@@ -9,6 +10,10 @@ A standalone Rust CLI for provider quota reports. The CLI supports `mock`, `code
 | Amp | Saved/environment/local API key + direct API; CLI fallback | Live API and parser verified |
 | Antigravity | Direct Google API with native Keychain auth; running-app fallback | Native auth/refresh verified; local quota matched OpenUsage |
 | Factory Droid | Saved API key or environment key + direct API | Offline tests passed; user key validation needed |
+| Synthetic | Subscription, rolling and search quota via API key | Offline contract tests; live key validation pending |
+| OpenRouter | Per-key USD spend and optional spending cap | Offline contract tests; live key validation pending |
+| Z.ai / BigModel | Coding Plan and MCP quota via API key | Offline contract tests; monitor API is version-sensitive |
+| MiniMax | Token Plan remaining quota via subscription key | Offline contract tests; documented host not validated live |
 | Mock | Fixed fixture | Offline tests passed |
 
 Antigravity can use the running app's local service when direct API quota is unavailable.
@@ -150,7 +155,9 @@ are created. Empty local lock files coordinate short vault transactions and per-
 preserve the previous document. Listing prints metadata only.
 
 For Codex and Amp, `usage --provider <provider>` reads the available local account
-and all saved accounts, including inactive ones. Factory retains its active-account
+and all saved accounts, including inactive ones. Synthetic, OpenRouter, Z.ai and
+MiniMax likewise read all saved keys plus an explicit environment key when present.
+Factory retains its active-account
 selection. Use `--account local` or `--account <saved-account-id>` to select one:
 
 ```sh
@@ -207,6 +214,47 @@ Amp retains its CLI route. Quotio submits no prompts and never starts login/logo
 through those fallback CLIs.
 Those CLIs may perform their usual internal auth maintenance or update checks.
 Missing executables or unsupported output become per-provider failures.
+
+## Additional API-key providers
+
+```sh
+cargo run -- accounts add --provider synthetic
+cargo run -- accounts add --provider openrouter
+cargo run -- accounts add --provider zai --region global
+cargo run -- accounts add --provider minimax --region global
+cargo run -- usage --provider synthetic --provider openrouter --provider zai --provider minimax
+```
+
+These commands use the hidden key prompt; scripts can pass `--token-stdin`.
+Z.ai and MiniMax accept `--region global|cn`, defaulting to global. Factory still
+accepts only global/eu. No key is automatically retried against another region.
+
+| Provider | Environment credential | Optional region |
+| --- | --- | --- |
+| Synthetic | `SYNTHETIC_API_KEY` | — |
+| OpenRouter | `OPENROUTER_API_KEY` | — |
+| Z.ai | `ZAI_API_KEY` | `ZAI_REGION=global|cn` |
+| MiniMax | `MINIMAX_API_KEY` | `MINIMAX_REGION=global|cn` |
+
+MiniMax requires a Coding/Token Plan key. The global route follows the documented
+`www.minimax.io/v1/token_plan/remains` endpoint. Z.ai uses its monitor API;
+its schema is backed by reference implementations and may change.
+
+OpenRouter reads `/api/v1/key`, not the management-key-only account credits API.
+Daily/weekly/monthly amounts are USD spend. A spending cap uses `limit_remaining`,
+not lifetime spend, to calculate the percentage. Uncapped keys show consumption
+without an invented remaining balance. Synthetic's next replenishment is kept as
+a description, not misrepresented as a full reset timestamp. MiniMax's
+`usage_count` fields are interpreted as remaining counts; modern percentages take
+precedence over legacy zero placeholders. MiniMax status3 lanes are omitted because
+they can mean unavailable or unlimited rather than a metered quota; unknown status
+codes are rejected until their semantics are verified.
+
+These providers identify each key with a provider/region-scoped fingerprint after
+successful quota validation. This identifies a key, not an account email; different
+keys can have different caps even when owned by the same person. Saved labels still
+default to the masked key. No browser cookies, local app credential imports, proxy
+credential directories, endpoint overrides or generation requests are used.
 
 ## Other credential sources
 
@@ -392,18 +440,22 @@ symlinks or submodules. Build and runtime do not need the reference checkout.
 
 ## Limits of this milestone
 
-- Prior live evidence covers the Codex/Amp CLI routes on this macOS installation.
-  The new OAuth/direct-key onboarding needs user sign-in/key acceptance testing.
-- Antigravity direct API and Factory live verification await credential approval.
-  Offline tests do not establish provider availability or account entitlements.
-- Antigravity/Factory internal endpoints and Amp text output can change. Unknown
-  formats fail explicitly instead of fabricating usage.
-- Codex token refresh is implemented for saved accounts. Antigravity refresh,
-  multi-account fan-out for other providers, cache, automatic polling and TUI remain future work.
+- Live evidence covers the Codex CLI, Amp direct API/multi-account, and Antigravity
+  native authentication/local-service routes on this macOS installation.
+- Synthetic, OpenRouter, Z.ai, MiniMax and Factory still need live acceptance with
+  appropriate keys. Offline tests do not prove account entitlements or API stability.
+- Antigravity direct quota can be denied even with valid authentication; its local
+  fallback requires the app to be running.
+- Z.ai monitor and other internal endpoints may change. MiniMax uses the documented
+  global host; compatibility with actual subscription keys remains unverified.
+- Saved account storage is macOS-only. Factory selects the active saved account;
+  the other managed providers support multiple saved accounts/keys.
+- No general usage cache, automatic polling or TUI is implemented. Native Antigravity
+  has a separate short-lived access-token cache, not a cache of quota results.
 - Dates without a timezone in Amp output have no invented reset instant.
 - Factory windows whose end is in the past remain unknown until replaced by fresh data.
-- The main Quotio repository was consulted read-only for Antigravity API behavior.
-  The CLI builds without that repository and without CodexBar.
+- Reference projects were consulted read-only. Build/runtime require none of their
+  checkouts, binaries, or proxy credential directories.
 
 ## License
 

@@ -29,6 +29,15 @@ pub enum Provider {
     Codex,
     Amp,
     Antigravity,
+    Synthetic,
+    #[value(name = "openrouter")]
+    #[serde(rename = "openrouter")]
+    OpenRouter,
+    #[value(alias = "glm")]
+    Zai,
+    #[value(name = "minimax")]
+    #[serde(rename = "minimax")]
+    MiniMax,
     #[value(alias = "droid", alias = "factory-droid")]
     Factory,
 }
@@ -60,8 +69,33 @@ pub struct UsageArgs {
 }
 
 impl Provider {
+    pub fn key_api(self) -> Option<crate::providers::key_api::Kind> {
+        use crate::providers::key_api::Kind;
+        match self {
+            Self::Synthetic => Some(Kind::Synthetic),
+            Self::OpenRouter => Some(Kind::OpenRouter),
+            Self::Zai => Some(Kind::Zai),
+            Self::MiniMax => Some(Kind::MiniMax),
+            _ => None,
+        }
+    }
+    pub fn api_key_name(self) -> Option<&'static str> {
+        match self {
+            Self::Amp => Some("AMP_API_KEY"),
+            Self::Factory => Some("FACTORY_API_KEY"),
+            other => other.key_api().map(|k| k.key()),
+        }
+    }
+    pub fn supports_accounts(self) -> bool {
+        self == Self::Codex || self.api_key_name().is_some()
+    }
+
     pub fn description(self) -> &'static str {
         match self {
+            Self::Synthetic => "Subscription, rolling and search quota via Synthetic API key",
+            Self::OpenRouter => "Key spending limits and USD usage via OpenRouter API key",
+            Self::Zai => "Coding Plan quota via Z.ai or BigModel API key",
+            Self::MiniMax => "Token Plan quota via MiniMax subscription key",
             Self::Mock => "Deterministic demo data; no live requests",
             Self::Codex => "ChatGPT quota via saved OAuth or installed Codex CLI",
             Self::Amp => "Quota and balances via saved API key or installed Amp CLI",
@@ -70,6 +104,9 @@ impl Provider {
         }
     }
     pub fn adapter(self) -> std::sync::Arc<dyn crate::providers::ProviderAdapter> {
+        if let Some(kind) = self.key_api() {
+            return std::sync::Arc::new(crate::providers::key_api::KeyApiProvider(kind));
+        }
         use crate::providers::{
             amp::AmpProvider, antigravity::AntigravityProvider, codex::CodexProvider,
             factory::FactoryProvider, mock::MockProvider,
@@ -80,6 +117,9 @@ impl Provider {
             Self::Amp => std::sync::Arc::new(AmpProvider::default()),
             Self::Antigravity => std::sync::Arc::new(AntigravityProvider),
             Self::Factory => std::sync::Arc::new(FactoryProvider),
+            Self::Synthetic | Self::OpenRouter | Self::Zai | Self::MiniMax => {
+                unreachable!("key API provider handled above")
+            }
         }
     }
 }
@@ -103,13 +143,14 @@ pub enum AccountCommand {
         /// Override the default email or masked API-key label
         #[arg(long)]
         label: Option<String>,
-        /// Read an Amp or Factory API key from a pipe instead of the hidden terminal prompt
+        /// Read an API key from a pipe instead of the hidden terminal prompt
         #[arg(long)]
         token_stdin: bool,
         /// Print the Codex sign-in URL without opening a browser
         #[arg(long)]
         no_browser: bool,
-        #[arg(long,value_parser=["global","eu"])]
+        /// Factory: global/eu; Z.ai and MiniMax: global/cn
+        #[arg(long,value_parser=["global","eu","cn"])]
         region: Option<String>,
         #[arg(long)]
         organization: Option<String>,

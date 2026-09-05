@@ -121,8 +121,10 @@ fn reconcile_accounts(providers: &mut Vec<ProviderUsage>) {
     };
     let mut remove = Vec::new();
     for (index, local) in providers.iter().enumerate() {
-        if !matches!(local.provider.0.as_str(), "codex" | "amp")
-            || local.account_ref.as_ref().is_none_or(|a| a.id != "local")
+        if !matches!(
+            local.provider.0.as_str(),
+            "codex" | "amp" | "synthetic" | "openrouter" | "zai" | "minimax"
+        ) || local.account_ref.as_ref().is_none_or(|a| a.id != "local")
         {
             continue;
         }
@@ -133,6 +135,16 @@ fn reconcile_accounts(providers: &mut Vec<ProviderUsage>) {
                     && p.account_ref.as_ref().is_some_and(|a| a.id != "local")
             })
             .collect();
+        if !matches!(local.provider.0.as_str(), "codex" | "amp") {
+            if !local.account.id.is_empty()
+                && managed
+                    .iter()
+                    .any(|saved| saved.account.id == local.account.id)
+            {
+                remove.push(index);
+            }
+            continue;
+        }
         if local.provider.0 == "amp" {
             let duplicate = managed.iter().any(|saved| {
                 !local.account.id.is_empty()
