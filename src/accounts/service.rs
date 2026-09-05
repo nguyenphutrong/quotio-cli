@@ -171,6 +171,24 @@ pub async fn rename(vault: Vault, id: String, label: String) -> Result<(), Accou
     tx.document.rename(&id, &label)?;
     commit(tx).await
 }
+pub async fn patch(
+    vault: Vault,
+    id: String,
+    label: Option<String>,
+    active: Option<bool>,
+) -> Result<Account, AccountError> {
+    let mut tx = begin(vault).await?;
+    tx.document.patch(&id, label.as_deref(), active)?;
+    let account = tx
+        .document
+        .accounts
+        .iter()
+        .find(|account| account.id == id)
+        .cloned()
+        .ok_or(AccountError::NotFound)?;
+    commit(tx).await?;
+    Ok(account)
+}
 pub fn provider_settings(
     provider: Provider,
     mut values: std::collections::BTreeMap<String, String>,

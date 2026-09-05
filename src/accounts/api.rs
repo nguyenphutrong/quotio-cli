@@ -83,18 +83,50 @@ fn credential(input: ApiKeyInput, context: &ProviderContext) -> Result<Credentia
         Err(AccountError::Unsupported)
     }
 }
+pub struct PreparedAccount {
+    provider: Provider,
+    label: String,
+    credential: Credential,
+    identity: String,
+}
+pub async fn prepare(
+    context: &ProviderContext,
+    input: ApiKeyInput,
+) -> Result<PreparedAccount, AccountError> {
+    let provider = input.provider;
+    let requested_label = input.label.clone();
+    let credential = credential(input, context)?;
+    let usage = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        service::validate(context, provider, &credential),
+    )
+    .await
+    .map_err(|_| AccountError::Cancelled)??;
+    let label = service::default_label(requested_label.as_deref(), &credential)?;
+    Ok(PreparedAccount {
+        provider,
+        label,
+        credential,
+        identity: usage.account.id,
+    })
+}
+pub async fn save(vault: Vault, prepared: PreparedAccount) -> Result<AccountDto, AccountError> {
+    let id = service::add(
+        vault.clone(),
+        prepared.provider,
+        prepared.label,
+        prepared.credential,
+        prepared.identity,
+    )
+    .await?;
+    get(vault, id).await
+}
 pub async fn create(
     vault: Vault,
     context: &ProviderContext,
     input: ApiKeyInput,
 ) -> Result<AccountDto, AccountError> {
-    let provider = input.provider;
-    let requested_label = input.label.clone();
-    let credential = credential(input, context)?;
-    let usage = service::validate(context, provider, &credential).await?;
-    let label = service::default_label(requested_label.as_deref(), &credential)?;
-    let id = service::add(vault.clone(), provider, label, credential, usage.account.id).await?;
-    get(vault, id).await
+    save(vault, prepare(context, input).await?).await
 }
 pub async fn list(vault: Vault) -> Result<Vec<AccountDto>, AccountError> {
     Ok(service::list(vault)
@@ -112,16 +144,8 @@ pub async fn update(
     id: String,
     patch: AccountPatch,
 ) -> Result<AccountDto, AccountError> {
-    if patch.active == Some(false) {
-        return Err(AccountError::Unsupported);
-    }
-    if let Some(label) = patch.label {
-        service::rename(vault.clone(), id.clone(), label).await?;
-    }
-    if patch.active == Some(true) {
-        service::select(vault.clone(), id.clone()).await?;
-    }
-    get(vault, id).await
+    let account = service::patch(vault, id, patch.label, patch.active).await?;
+    Ok(AccountDto::from(&account))
 }
 pub async fn remove(vault: Vault, id: String) -> Result<(), AccountError> {
     service::remove(vault, id).await
@@ -143,6 +167,63 @@ mod tests {
                 r#"{"provider":"amp","api_key":"secret","identity":"caller-controlled"}"#,
             )
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_is_one_transaction_when_label_conflicts() {
+        use crate::accounts::vault::tests::Memory;
+        use std::sync::Arc;
+        let path = std::env::temp_dir().join(format!(
+            "quotio-api-{}.lock",
+            crate::accounts::random_string().unwrap()
+        ));
+        let vault = Vault::new(Arc::new(Memory::default()), path);
+        let key = |token: &str| Credential::ApiKey {
+            token: token.into(),
+            region: None,
+            organization: None,
+        };
+        let first = service::add(
+            vault.clone(),
+            Provider::Amp,
+            "first".into(),
+            key("one"),
+            "one".into(),
+        )
+        .await
+        .unwrap();
+        let second = service::add(
+            vault.clone(),
+            Provider::Amp,
+            "second".into(),
+            key("two"),
+            "two".into(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            update(
+                vault.clone(),
+                second.clone(),
+                AccountPatch {
+                    label: Some("first".into()),
+                    active: Some(true)
+                }
+            )
+            .await,
+            Err(AccountError::Duplicate)
+        ));
+        let accounts = list(vault).await.unwrap();
+        assert!(
+            accounts
+                .iter()
+                .any(|account| account.id == first && account.active)
+        );
+        assert!(
+            accounts
+                .iter()
+                .any(|account| account.id == second && !account.active)
         );
     }
 

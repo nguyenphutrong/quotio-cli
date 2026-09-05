@@ -183,6 +183,27 @@ impl Document {
             .label = label;
         Ok(())
     }
+    pub fn patch(
+        &mut self,
+        id: &str,
+        label: Option<&str>,
+        active: Option<bool>,
+    ) -> Result<(), AccountError> {
+        if active == Some(false) {
+            return Err(AccountError::Unsupported);
+        }
+        if let Some(label) = label {
+            self.rename(id, label)?;
+        }
+        if active == Some(true) {
+            self.select(id)?;
+        }
+        if self.accounts.iter().any(|account| account.id == id) {
+            Ok(())
+        } else {
+            Err(AccountError::NotFound)
+        }
+    }
 }
 pub fn validate_label(label: &str) -> Result<String, AccountError> {
     let label = label.trim();

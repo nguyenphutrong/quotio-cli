@@ -213,7 +213,7 @@ pub enum OAuthMode {
     Relay,
     Loopback,
 }
-#[derive(Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Serialize, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     Waiting,
@@ -240,10 +240,12 @@ struct PendingSession {
     created: Instant,
     status: SessionStatus,
     account_id: Option<String>,
+    cancel: Arc<tokio::sync::Notify>,
 }
 struct Sessions {
     sessions: HashMap<String, PendingSession>,
 }
+#[derive(Clone)]
 pub struct OAuthSessionManager {
     context: ProviderContext,
     vault: Vault,
@@ -285,6 +287,7 @@ impl OAuthSessionManager {
             {
                 session.status = SessionStatus::Expired;
                 session.authorization = None;
+                session.cancel.notify_waiters();
             }
         }
         sessions
@@ -311,11 +314,20 @@ impl OAuthSessionManager {
     pub async fn begin(
         &self,
         label: Option<String>,
-        _mode: OAuthMode,
+        mode: OAuthMode,
     ) -> Result<SessionDto, AccountError> {
         if let Some(label) = &label {
             super::validate_label(label)?;
         }
+        let listener = if matches!(mode, OAuthMode::Loopback) {
+            Some(
+                TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 1455))
+                    .await
+                    .map_err(|_| AccountError::CallbackPort)?,
+            )
+        } else {
+            None
+        };
         let authorization = begin_authorization()?;
         let id = random_string()?;
         let expires_at = self
@@ -327,6 +339,9 @@ impl OAuthSessionManager {
             .ok_or(AccountError::OAuth)?;
         let mut sessions = self.sessions.lock().await;
         Self::prune(&mut sessions);
+        if sessions.sessions.len() >= 128 {
+            return Err(AccountError::Busy);
+        }
         let url = authorization.url.clone();
         sessions.sessions.insert(
             id.clone(),
@@ -338,8 +353,25 @@ impl OAuthSessionManager {
                 created: Instant::now(),
                 status: SessionStatus::Waiting,
                 account_id: None,
+                cancel: Arc::new(tokio::sync::Notify::new()),
             },
         );
+        if let Some(listener) = listener {
+            let state = sessions
+                .sessions
+                .get(&id)
+                .expect("inserted")
+                .authorization
+                .as_ref()
+                .expect("inserted")
+                .state
+                .clone();
+            let manager = self.clone();
+            let session_id = id.clone();
+            tokio::spawn(async move {
+                manager.wait_loopback(session_id, listener, state).await;
+            });
+        }
         Ok(Self::dto(
             id.clone(),
             sessions.sessions.get(&id).expect("inserted"),
@@ -370,31 +402,67 @@ impl OAuthSessionManager {
             return Err(AccountError::Busy);
         }
         session.status = SessionStatus::Cancelled;
+        session.authorization = None;
+        session.cancel.notify_waiters();
         Ok(Self::dto(id.into(), session))
     }
-    pub async fn callback(&self, id: &str, full_url: &str) -> Result<SessionDto, AccountError> {
-        let (authorization, label) = {
-            let mut sessions = self.sessions.lock().await;
-            Self::prune(&mut sessions);
-            let session = sessions
-                .sessions
-                .get_mut(id)
-                .ok_or(AccountError::NotFound)?;
-            if session.status != SessionStatus::Waiting {
-                return Err(AccountError::Busy);
+    async fn wait_loopback(&self, id: String, listener: TcpListener, state: String) {
+        let cancel = {
+            let sessions = self.sessions.lock().await;
+            match sessions.sessions.get(&id) {
+                Some(session) => session.cancel.clone(),
+                None => return,
             }
-            if Instant::now().duration_since(session.created) > Duration::from_secs(180) {
-                session.status = SessionStatus::Expired;
-                return Err(AccountError::Cancelled);
-            }
-            session.status = SessionStatus::Processing;
-            (
-                session.authorization.take().ok_or(AccountError::Busy)?,
-                session.label.clone(),
-            )
         };
+        let result = tokio::select! { _ = cancel.notified() => Err(AccountError::Cancelled), result = tokio::time::timeout(Duration::from_secs(180), callback(listener, &state)) => result.map_err(|_| AccountError::Cancelled).and_then(|result| result) };
+        match result {
+            Ok(code) => {
+                let _ = self.complete_code(&id, code).await;
+            }
+            Err(_) => {
+                let mut sessions = self.sessions.lock().await;
+                if let Some(session) = sessions.sessions.get_mut(&id)
+                    && session.status == SessionStatus::Waiting
+                {
+                    session.status = SessionStatus::Expired;
+                    session.authorization = None;
+                }
+            }
+        }
+    }
+    async fn complete_code(&self, id: &str, code: String) -> Result<SessionDto, AccountError> {
+        let (authorization, label) = self.claim(id).await?;
+        self.finish(
+            id,
+            exchange_code(&self.context, authorization, &code).await,
+            label,
+        )
+        .await
+    }
+    async fn claim(&self, id: &str) -> Result<(Authorization, Option<String>), AccountError> {
+        let mut sessions = self.sessions.lock().await;
+        Self::prune(&mut sessions);
+        let session = sessions
+            .sessions
+            .get_mut(id)
+            .ok_or(AccountError::NotFound)?;
+        if session.status != SessionStatus::Waiting {
+            return Err(AccountError::Busy);
+        }
+        session.status = SessionStatus::Processing;
+        Ok((
+            session.authorization.take().ok_or(AccountError::Busy)?,
+            session.label.clone(),
+        ))
+    }
+    async fn finish(
+        &self,
+        id: &str,
+        credential: Result<Credential, AccountError>,
+        label: Option<String>,
+    ) -> Result<SessionDto, AccountError> {
         let result = async {
-            let credential = exchange(&self.context, authorization, full_url).await?;
+            let credential = credential?;
             let usage =
                 service::validate(&self.context, crate::cli::Provider::Codex, &credential).await?;
             let label = service::default_label(label.as_deref(), &credential)?;
@@ -427,6 +495,15 @@ impl OAuthSessionManager {
                 Err(error)
             }
         }
+    }
+    pub async fn callback(&self, id: &str, full_url: &str) -> Result<SessionDto, AccountError> {
+        let (authorization, label) = self.claim(id).await?;
+        self.finish(
+            id,
+            exchange(&self.context, authorization, full_url).await,
+            label,
+        )
+        .await
     }
 }
 async fn callback(listener: TcpListener, state: &str) -> Result<String, AccountError> {
@@ -601,5 +678,58 @@ mod tests {
         assert!(credential(tokens(), Some("nonce"), None, 0).is_ok());
         assert!(credential(tokens(), Some("different"), None, 0).is_err());
         assert!(credential(tokens(), Some("nonce"), None, 20000).is_err());
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::accounts::vault::tests::Memory;
+
+    fn manager() -> OAuthSessionManager {
+        let path = std::env::temp_dir().join(format!(
+            "quotio-oauth-session-{}.lock",
+            random_string().unwrap()
+        ));
+        OAuthSessionManager::new(
+            http::fixture::context(),
+            Vault::new(Arc::new(Memory::default()), path),
+            Arc::new(tokio::sync::Mutex::new(())),
+            Arc::new(AtomicU64::new(0)),
+        )
+    }
+
+    #[tokio::test]
+    async fn loopback_binds_before_return_and_cancel_is_terminal() {
+        let manager = manager();
+        let first = manager.begin(None, OAuthMode::Loopback).await.unwrap();
+        assert_eq!(first.status, SessionStatus::Waiting);
+        assert!(matches!(
+            manager.begin(None, OAuthMode::Loopback).await,
+            Err(AccountError::CallbackPort)
+        ));
+        let cancelled = manager.cancel(&first.id).await.unwrap();
+        assert_eq!(cancelled.status, SessionStatus::Cancelled);
+        assert!(matches!(
+            manager
+                .callback(
+                    &first.id,
+                    "http://localhost:1455/auth/callback?state=x&code=y"
+                )
+                .await,
+            Err(AccountError::Busy)
+        ));
+    }
+
+    #[tokio::test]
+    async fn relay_sessions_are_bounded() {
+        let manager = manager();
+        for _ in 0..128 {
+            manager.begin(None, OAuthMode::Relay).await.unwrap();
+        }
+        assert!(matches!(
+            manager.begin(None, OAuthMode::Relay).await,
+            Err(AccountError::Busy)
+        ));
     }
 }
