@@ -5,10 +5,10 @@ A standalone Rust CLI for provider quota reports. The CLI supports `mock`, `code
 
 | Provider | Data source | Current verification |
 | --- | --- | --- |
-| Codex / ChatGPT | Installed `codex app-server` account quota RPC | Live read passed |
-| Amp | Installed `amp usage` | Live read passed |
+| Codex / ChatGPT | Saved OAuth + direct API; installed CLI fallback | OAuth/direct API tested offline; CLI live read previously passed |
+| Amp | Saved API key + direct API; installed CLI fallback | API tested offline; CLI live read previously passed |
 | Antigravity | Direct Google quota API, following the main Quotio project | Offline tests passed; live token use awaiting approval |
-| Factory Droid | Factory identity and billing limits API | Offline tests passed; no live authentication verified |
+| Factory Droid | Saved API key or environment key + direct API | Offline tests passed; user key validation needed |
 | Mock | Fixed fixture | Offline tests passed |
 
 Antigravity does not use the app's local service or require the app to be running.
@@ -59,14 +59,63 @@ Do not put credentials in config. Unknown fields, including token fields, are
 rejected. Parse errors show a line and column without echoing input. Argument
 errors also omit input values; use `quotio usage --help` for valid syntax.
 `CredentialStore` reads environment variables, but mock never requests a secret.
-No credentials are persisted, printed or logged by this implementation.
+Credentials are persisted only by explicit account commands in Keychain; they are
+never printed or logged.
 
-## Existing accounts and credentials
+## Add and manage accounts on macOS
 
-Codex and Amp run their installed CLIs and leave login management to them. Quotio
-submits no prompts and never starts login/logout or redeems quota resets. Those
-CLIs may perform their usual internal auth maintenance or update checks. Missing
-executables or unsupported output become per-provider failures.
+```sh
+# Codex opens the official sign-in page. No Codex CLI is required.
+cargo run -- accounts add --provider codex --label Personal
+
+# Keys come from your existing secret-manager environment, never command arguments.
+printenv AMP_API_KEY | cargo run -- accounts add --provider amp --label Work --token-stdin
+printenv FACTORY_API_KEY | cargo run -- accounts add --provider factory --label Work --token-stdin
+
+cargo run -- accounts list
+cargo run -- accounts list --format json
+cargo run -- accounts use <account-id>
+cargo run -- accounts remove <account-id>
+cargo run -- usage --provider codex --provider amp --provider factory
+```
+
+For Codex, `--no-browser` prints the login URL without opening it. Callback binds to
+`localhost:1455/auth/callback`; close another login process if that port is busy.
+Login uses PKCE, state and nonce validation, then reads quota before saving. It has
+a 180-second budget and supports Ctrl-C. No browser cookies are read.
+
+For Factory, `--region global|eu` and `--organization <id>` may be supplied during
+Add account. Amp/Factory accept one key line from a pipe, not an interactive visible
+prompt. A failed validation or save does not create an account.
+
+The first saved account for each provider becomes active. Additional accounts are
+saved without changing the selection; use `accounts use` to select them. Removing
+an active account selects the next account for that provider. Removal affects only
+Quotio's saved record; it does not revoke remote tokens or log other apps out.
+
+All account metadata and tokens live in one protected Keychain item:
+service `app.quotio.cli.accounts.v1`, account `vault`. No plaintext credential files
+are created. A local empty lock file coordinates processes. Failed atomic writes
+preserve the previous document. Listing prints metadata only.
+
+Saved active accounts take precedence over environment/local CLI sources. Use
+`usage --no-saved-accounts` to explicitly skip the vault. A locked/denied vault
+returns a provider failure rather than silently selecting another account.
+Managed storage currently supports macOS only; other platforms retain the previous
+environment/CLI usage routes. There is no plaintext storage fallback.
+
+Saved Codex accounts use `source: codex_api`. Refresh occurs near expiry or after
+authentication failure, and all rotated tokens are saved before a quota retry.
+Refresh is serialized and never automatically replayed after an uncertain failure.
+Saved Amp accounts use `source: amp_api` and require no Amp binary. Factory uses
+`source: factory_billing_limits` with account/organization validation.
+
+Without saved accounts, Codex and Amp retain their installed-CLI routes. Quotio
+submits no prompts and never starts login/logout through those fallback CLIs.
+Those CLIs may perform their usual internal auth maintenance or update checks.
+Missing executables or unsupported output become per-provider failures.
+
+## Other credential sources
 
 Antigravity reads `ANTIGRAVITY_ACCESS_TOKEN`, or the `access_token` field in the JSON
 file selected by `ANTIGRAVITY_AUTH_FILE`. Without either, it selects exactly one
@@ -76,7 +125,7 @@ calls Google quota APIs with the same token. File contents are never rewritten.
 This version does not refresh tokens, scrape native SQLite/keychain stores or start
 a login flow. Refresh an expired token through its existing login owner.
 
-Factory currently requires `FACTORY_API_KEY`. Optional `FACTORY_REGION` is `global`
+Without a saved account, Factory uses `FACTORY_API_KEY`. Optional `FACTORY_REGION` is `global`
 or `eu`; `FACTORY_ORG_ID` selects the organization. The adapter validates user and
 organization with Factory before and after reading quota. Local encrypted Droid
 auth reuse is not implemented pending the requested explicit authorization.
@@ -162,7 +211,9 @@ executable. Tokio supplies concurrency, deadlines, cancellation channels and sig
 no extra async trait or cancellation dependency is needed. Serde, JSON and TOML
 handle data/config; time handles timestamp offsets; thiserror provides fixed typed
 errors; tracing sends diagnostics; clap parses arguments; directories resolves the
-config location. These are the dependencies requested for this milestone.
+config location. Account onboarding additionally uses ring for secure randomness and PKCE hashing,
+base64 for protocol encoding, libc for native file locking and cancellable input,
+and security-framework on macOS for Keychain access.
 
 To add a live provider:
 
@@ -205,12 +256,14 @@ symlinks or submodules. Build and runtime do not need the reference checkout.
 
 ## Limits of this milestone
 
-- Live evidence covers Codex and Amp on the current macOS installation only.
+- Prior live evidence covers the Codex/Amp CLI routes on this macOS installation.
+  The new OAuth/direct-key onboarding needs user sign-in/key acceptance testing.
 - Antigravity direct API and Factory live verification await credential approval.
   Offline tests do not establish provider availability or account entitlements.
 - Antigravity/Factory internal endpoints and Amp text output can change. Unknown
   formats fail explicitly instead of fabricating usage.
-- No token refresh, multi-account report, cache, automatic polling or TUI is added.
+- Codex token refresh is implemented for saved accounts. Antigravity refresh,
+  multi-account fan-out, cache, automatic polling and TUI remain future work.
 - Dates without a timezone in Amp output have no invented reset instant.
 - Factory windows whose end is in the past remain unknown until replaced by fresh data.
 - The main Quotio repository was consulted read-only for Antigravity API behavior.
