@@ -20,6 +20,7 @@ pub struct Definition {
 pub mod balances;
 pub mod coding;
 pub mod common;
+pub mod doubao;
 pub mod gateways;
 pub mod infrastructure;
 pub mod oauth_cloud;
@@ -28,6 +29,7 @@ pub mod oauth_primary;
 pub mod tools;
 pub fn definitions() -> impl Iterator<Item = &'static Definition> {
     [
+        doubao::DEFINITIONS,
         balances::DEFINITIONS,
         infrastructure::DEFINITIONS,
         coding::DEFINITIONS,
