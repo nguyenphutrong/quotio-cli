@@ -22,6 +22,9 @@ pub mod coding;
 pub mod common;
 pub mod gateways;
 pub mod infrastructure;
+pub mod oauth_cloud;
+pub mod oauth_editors;
+pub mod oauth_primary;
 pub mod tools;
 pub fn definitions() -> impl Iterator<Item = &'static Definition> {
     [
@@ -30,6 +33,9 @@ pub fn definitions() -> impl Iterator<Item = &'static Definition> {
         coding::DEFINITIONS,
         gateways::DEFINITIONS,
         tools::DEFINITIONS,
+        oauth_primary::DEFINITIONS,
+        oauth_editors::DEFINITIONS,
+        oauth_cloud::DEFINITIONS,
     ]
     .into_iter()
     .flatten()
