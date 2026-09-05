@@ -1,8 +1,18 @@
 # Quotio CLI
 
-A standalone Rust CLI for provider quota reports. This milestone includes only
-`mock`, a deterministic fixture with three quota windows. It does not check any
-live account. No TUI is included yet.
+A standalone Rust CLI for provider quota reports. The CLI supports `mock`, `codex`,
+`amp`, `antigravity`, and `factory` (aliases `droid`, `factory-droid`). No TUI yet.
+
+| Provider | Data source | Current verification |
+| --- | --- | --- |
+| Codex / ChatGPT | Installed `codex app-server` account quota RPC | Live read passed |
+| Amp | Installed `amp usage` | Live read passed |
+| Antigravity | Direct Google quota API, following the main Quotio project | Offline tests passed; live token use awaiting approval |
+| Factory Droid | Factory identity and billing limits API | Offline tests passed; no live authentication verified |
+| Mock | Fixed fixture | Offline tests passed |
+
+Antigravity does not use the app's local service or require the app to be running.
+See [provider contracts](plans/20260905-first-live-provider/) for source evidence.
 
 ## Run
 
@@ -16,6 +26,8 @@ cargo run -- usage --provider mock --format text
 cargo run -- usage --provider mock --format json
 cargo run -- usage --provider mock --provider mock --timeout 5 --no-color --verbose
 cargo run -- usage --config ./config.toml
+cargo run -- usage --provider codex --provider amp --timeout 30
+cargo run -- usage --provider antigravity --provider factory --format json
 ```
 
 Repeated provider IDs are deduplicated, keeping the first occurrence. Timeout is
@@ -46,8 +58,35 @@ The CLI does not create config or cache directories.
 Do not put credentials in config. Unknown fields, including token fields, are
 rejected. Parse errors show a line and column without echoing input. Argument
 errors also omit input values; use `quotio usage --help` for valid syntax.
-`CredentialStore` can read environment variables, but mock never requests a secret.
+`CredentialStore` reads environment variables, but mock never requests a secret.
 No credentials are persisted, printed or logged by this implementation.
+
+## Existing accounts and credentials
+
+Codex and Amp run their installed CLIs and leave login management to them. Quotio
+submits no prompts and never starts login/logout or redeems quota resets. Those
+CLIs may perform their usual internal auth maintenance or update checks. Missing
+executables or unsupported output become per-provider failures.
+
+Antigravity reads `ANTIGRAVITY_ACCESS_TOKEN`, or the `access_token` field in the JSON
+file selected by `ANTIGRAVITY_AUTH_FILE`. Without either, it selects exactly one
+`antigravity-*.json` in `~/.cli-proxy-api`, as used by the main Quotio app. Multiple
+files require explicit selection. It obtains identity from Google userinfo and
+calls Google quota APIs with the same token. File contents are never rewritten.
+This version does not refresh tokens, scrape native SQLite/keychain stores or start
+a login flow. Refresh an expired token through its existing login owner.
+
+Factory currently requires `FACTORY_API_KEY`. Optional `FACTORY_REGION` is `global`
+or `eu`; `FACTORY_ORG_ID` selects the organization. The adapter validates user and
+organization with Factory before and after reading quota. Local encrypted Droid
+auth reuse is not implemented pending the requested explicit authorization.
+The internal billing endpoint is verified from first-party code, but API-key
+acceptance has not yet been validated live.
+
+Set credentials through your existing environment/secret manager. Do not put them
+in TOML, shell command arguments, fixture files or bug reports. See the contract
+notes for the exact authenticated destinations. Remote HTTP uses normal TLS and
+disables redirects; no self-signed local-service client remains.
 
 ## Output contract
 
@@ -57,6 +96,10 @@ Arrays preserve request order within successes and failures. Each provider conta
 
 Each window contains `label`, `quota`, nullable `resets_at`, `provenance` with
 `source` and `confidence`, and RFC 3339 `fetched_at`. Timestamps include an offset.
+Optional `amounts` records a balance as `remaining`, nullable `limit`, and `unit`.
+USD credit balances with no limit retain unknown percentage, including a zero
+balance. Amp subscription dollar/hour allowances are separate windows.
+
 The mock's fixed observation date is January 1, 2026. It is demo data, not fresh
 account usage. The report generation time uses the injected clock.
 
@@ -75,7 +118,8 @@ Confidence is `exact`, `estimated` or `unknown`. Consumers can calculate observa
 age from `fetched_at`; this milestone has no cache or automatic stale threshold.
 
 A failure contains `provider`, a fixed `code`, and a safe `message`. Codes are
-`timeout`, `cancelled`, `transient`, `authentication`, `invalid_data`, and `internal`.
+`timeout`, `cancelled`, `transient`, `authentication`, `invalid_data`, `internal`,
+`unavailable`, and `rate_limited`.
 A failed provider does not remove successful results. Failures are included in
 reports and summarized on stderr. Consumers should allow future additive fields;
 incompatible changes require a new schema version.
@@ -95,6 +139,8 @@ the same success/partial/empty exit rules. Output write errors use code 3.
 - `src/domain.rs`: renderer-independent identity, quota, provenance and report types.
 - `src/providers/mod.rs`: `ProviderAdapter`, injected HTTP client, clock and credential store.
 - `src/providers/mock.rs`: fixed fixture, with available, exhausted and unknown windows.
+- `src/providers/{codex,amp,antigravity,factory}.rs`: independent provider adapters.
+- `src/providers/http.rs`, `src/providers/process.rs`: bounded transport and child lifecycle.
 - `src/fetch.rs`: `Collector::collect(CollectRequest) -> UsageReport`.
 - `src/cli.rs`, `src/config.rs`, `src/main.rs`: arguments, config and executable wiring.
 - `src/output/`: independent text and JSON renderers.
@@ -105,6 +151,9 @@ The collector runs adapters concurrently with Tokio. Each provider gets a deadli
 covering fetches and retry delays. Only an idempotent adapter returning `Transient`
 is retried, up to three total attempts, with 100 ms then 200 ms backoff. Cancellation
 and timeout drop the adapter future. Dropping collection aborts its owned tasks.
+HTTP 429 honors Retry-After within the deadline. Missing/invalid delays or delays
+over one hour return rate_limited without rapid retries.
+
 Adapters must remain async and cancellation-safe, and must not detach work or block
 the runtime. Completed results are ordered before rendering.
 
@@ -126,9 +175,9 @@ To add a live provider:
 5. Verify live behavior separately with authorized credentials. Mock tests cannot
    establish that live authentication or quota fetching works.
 
-An adapter can try documented fallback sources internally under the same deadline.
-It must preserve account identity and report the source actually used. No fallback
-source or live endpoint is implemented here.
+Antigravity tries quota summary with a project, then without a project when needed,
+then model quota. Optional project discovery failures do not block this fallback;
+authentication and rate-limit failures stop it. Every window records its source.
 
 A future TUI can own `Collector`, call `collect`, display the domain report and use
 `Cancellation` on refresh or exit. It must not parse the CLI text or require changes
@@ -152,3 +201,17 @@ CodexBar was inspected read-only for modeling and test ideas. Relevant files wer
 `UsageFormatter.swift`, and `CopilotUsageModelsTests.swift`. No implementation was
 copied. This project contains no CodexBar imports, path dependencies, binaries,
 symlinks or submodules. Build and runtime do not need the reference checkout.
+
+
+## Limits of this milestone
+
+- Live evidence covers Codex and Amp on the current macOS installation only.
+- Antigravity direct API and Factory live verification await credential approval.
+  Offline tests do not establish provider availability or account entitlements.
+- Antigravity/Factory internal endpoints and Amp text output can change. Unknown
+  formats fail explicitly instead of fabricating usage.
+- No token refresh, multi-account report, cache, automatic polling or TUI is added.
+- Dates without a timezone in Amp output have no invented reset instant.
+- Factory windows whose end is in the past remain unknown until replaced by fresh data.
+- The main Quotio repository was consulted read-only for Antigravity API behavior.
+  The CLI builds without that repository and without CodexBar.
