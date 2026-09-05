@@ -91,6 +91,11 @@ Settings patches include the current `revision`; a stale revision returns 409
 into the callback endpoint for relay mode, then poll the session with `GET` or cancel
 it with `DELETE`.
 
+Provider capabilities include `auth`, supported operations, native-login instructions,
+and field metadata. Use each setting's `field_path` to place its value in an account
+request: core fields such as `region` are top-level; catalog fields use paths such
+as `settings.project_id`. Frontends do not need a separate provider-to-form mapping.
+
 ## Refresh and failures
 
 The first refresh starts when the server starts. HTTP reads use memory snapshots

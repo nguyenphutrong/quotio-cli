@@ -13,6 +13,7 @@ pub enum AuthMethod {
 #[derive(Clone, Serialize, PartialEq, Eq)]
 pub struct SettingMetadata {
     pub name: &'static str,
+    pub field_path: String,
     pub required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub values: Option<&'static [&'static str]>,
@@ -51,6 +52,7 @@ pub fn capability(provider: Provider) -> ProviderCapability {
                 .iter()
                 .map(|setting| SettingMetadata {
                     name: setting.name,
+                    field_path: format!("settings.{}", setting.name),
                     required: setting.required,
                     values: None,
                 })
@@ -61,23 +63,30 @@ pub fn capability(provider: Provider) -> ProviderCapability {
         Provider::Factory => {
             settings.push(SettingMetadata {
                 name: "region",
+                field_path: "region".into(),
                 required: false,
                 values: Some(FACTORY_REGIONS),
             });
             settings.push(SettingMetadata {
                 name: "organization",
+                field_path: "organization".into(),
                 required: false,
                 values: None,
             });
         }
         Provider::Zai | Provider::MiniMax => settings.push(SettingMetadata {
             name: "region",
+            field_path: "region".into(),
             required: false,
             values: Some(ASIA_REGIONS),
         }),
         _ => (),
     }
     let native = match provider {
+        Provider::Codex => Some(
+            "Use the existing Codex CLI login, or add a separate Quotio-managed OAuth account.",
+        ),
+        Provider::Amp => Some("Use the existing Amp CLI login, or add a Quotio-managed API key."),
         Provider::Antigravity => Some(
             "Sign in with the Antigravity app, then authorize Quotio to read its existing local login.",
         ),
@@ -104,7 +113,8 @@ pub fn capability(provider: Provider) -> ProviderCapability {
         _ => None,
     };
     let auth = match provider {
-        Provider::Codex => vec![AuthMethod::OAuth],
+        Provider::Codex => vec![AuthMethod::OAuth, AuthMethod::Native],
+        Provider::Amp => vec![AuthMethod::ApiKey, AuthMethod::Native],
         Provider::Antigravity => vec![AuthMethod::Native],
         Provider::Catalog(_) if native.is_some() => vec![AuthMethod::Native],
         _ if provider.api_key_name().is_some() => vec![AuthMethod::ApiKey],
@@ -152,10 +162,16 @@ mod tests {
                 .iter()
                 .any(|setting| setting.name == "organization")
         );
-        assert_eq!(capability(Provider::Codex).auth, vec![AuthMethod::OAuth]);
+        assert_eq!(
+            capability(Provider::Codex).auth,
+            vec![AuthMethod::OAuth, AuthMethod::Native]
+        );
         for definition in crate::providers::catalog::definitions() {
             let capability = capability(Provider::Catalog(definition.id));
             assert_eq!(capability.settings.len(), definition.settings.len());
+            for setting in capability.settings {
+                assert_eq!(setting.field_path, format!("settings.{}", setting.name));
+            }
         }
     }
 }

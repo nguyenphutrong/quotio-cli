@@ -1873,7 +1873,7 @@
           "settings": {
             "type": "array",
             "items": {
-              "type": "object"
+              "$ref": "#/components/schemas/SettingMetadata"
             }
           },
           "usage_platform": {
@@ -1942,7 +1942,13 @@
             "type": "string"
           },
           "kind": {
-            "type": "string"
+            "type": "string",
+            "enum": [
+              "refresh",
+              "account_create",
+              "account_update",
+              "account_remove"
+            ]
           },
           "status": {
             "type": "string",
@@ -1952,7 +1958,43 @@
               "failed"
             ]
           },
-          "result": {},
+          "result": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "account_id"
+                ],
+                "properties": {
+                  "account_id": {
+                    "type": "string"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "providers",
+                  "failures"
+                ],
+                "properties": {
+                  "providers": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "failures": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                }
+              }
+            ]
+          },
           "error": {
             "type": [
               "string",
@@ -2229,6 +2271,33 @@
           }
         },
         "additionalProperties": false
+      },
+      "SettingMetadata": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "field_path",
+          "required"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "field_path": {
+            "type": "string",
+            "description": "JSON request field location, e.g. region or settings.project_id"
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
       }
     }
   }
