@@ -231,6 +231,8 @@ pub struct SessionDto {
     pub status: SessionStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<&'static str>,
 }
 struct PendingSession {
     authorization: Option<Authorization>,
@@ -240,6 +242,7 @@ struct PendingSession {
     created: Instant,
     status: SessionStatus,
     account_id: Option<String>,
+    error_code: Option<&'static str>,
     cancel: Arc<tokio::sync::Notify>,
 }
 struct Sessions {
@@ -277,17 +280,18 @@ impl OAuthSessionManager {
             expires_at: session.expires_at,
             status: session.status,
             account_id: session.account_id.clone(),
+            error_code: session.error_code,
         }
     }
     fn prune(sessions: &mut Sessions) {
         let now = Instant::now();
         for session in sessions.sessions.values_mut() {
             if session.status == SessionStatus::Waiting
-                && now.duration_since(session.created) > Duration::from_secs(180)
+                && now.duration_since(session.created) >= Duration::from_secs(180)
             {
                 session.status = SessionStatus::Expired;
                 session.authorization = None;
-                session.cancel.notify_waiters();
+                session.cancel.notify_one();
             }
         }
         sessions
@@ -353,6 +357,7 @@ impl OAuthSessionManager {
                 created: Instant::now(),
                 status: SessionStatus::Waiting,
                 account_id: None,
+                error_code: None,
                 cancel: Arc::new(tokio::sync::Notify::new()),
             },
         );
@@ -385,7 +390,7 @@ impl OAuthSessionManager {
             .get_mut(id)
             .ok_or(AccountError::NotFound)?;
         if session.status == SessionStatus::Waiting
-            && Instant::now().duration_since(session.created) > Duration::from_secs(180)
+            && Instant::now().duration_since(session.created) >= Duration::from_secs(180)
         {
             session.status = SessionStatus::Expired;
         }
@@ -403,15 +408,15 @@ impl OAuthSessionManager {
         }
         session.status = SessionStatus::Cancelled;
         session.authorization = None;
-        session.cancel.notify_waiters();
+        session.cancel.notify_one();
         Ok(Self::dto(id.into(), session))
     }
     async fn wait_loopback(&self, id: String, listener: TcpListener, state: String) {
         let cancel = {
             let sessions = self.sessions.lock().await;
             match sessions.sessions.get(&id) {
-                Some(session) => session.cancel.clone(),
-                None => return,
+                Some(session) if session.status == SessionStatus::Waiting => session.cancel.clone(),
+                _ => return,
             }
         };
         let result = tokio::select! { _ = cancel.notified() => Err(AccountError::Cancelled), result = tokio::time::timeout(Duration::from_secs(180), callback(listener, &state)) => result.map_err(|_| AccountError::Cancelled).and_then(|result| result) };
@@ -450,10 +455,19 @@ impl OAuthSessionManager {
             return Err(AccountError::Busy);
         }
         session.status = SessionStatus::Processing;
+        session.cancel.notify_one();
         Ok((
             session.authorization.take().ok_or(AccountError::Busy)?,
             session.label.clone(),
         ))
+    }
+    fn failure_code(error: &AccountError) -> &'static str {
+        match error {
+            AccountError::Storage => "credential_storage_unavailable",
+            AccountError::Cancelled => "cancelled",
+            AccountError::Provider(_) => "validation_failed",
+            _ => "oauth_failed",
+        }
     }
     async fn finish(
         &self,
@@ -492,6 +506,7 @@ impl OAuthSessionManager {
             }
             Err(error) => {
                 session.status = SessionStatus::Failed;
+                session.error_code = Some(Self::failure_code(&error));
                 Err(error)
             }
         }
@@ -719,6 +734,36 @@ mod session_tests {
                 .await,
             Err(AccountError::Busy)
         ));
+    }
+
+    #[tokio::test]
+    async fn expiry_is_inclusive_and_failed_sessions_expose_safe_code() {
+        let manager = manager();
+        let session = manager.begin(None, OAuthMode::Relay).await.unwrap();
+        {
+            let mut sessions = manager.sessions.lock().await;
+            sessions.sessions.get_mut(&session.id).unwrap().created = Instant::now()
+                .checked_sub(Duration::from_secs(180))
+                .unwrap();
+        }
+        assert_eq!(
+            manager.get(&session.id).await.unwrap().status,
+            SessionStatus::Expired
+        );
+        let failed = manager.begin(None, OAuthMode::Relay).await.unwrap();
+        assert!(
+            manager
+                .callback(
+                    &failed.id,
+                    "https://localhost:1455/auth/callback?state=x&code=y"
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            manager.get(&failed.id).await.unwrap().error_code,
+            Some("oauth_failed")
+        );
     }
 
     #[tokio::test]

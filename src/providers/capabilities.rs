@@ -77,7 +77,7 @@ pub fn capability(provider: Provider) -> ProviderCapability {
     }
     let native = match provider {
         Provider::Antigravity => Some(
-            "Sign in with the Antigravity CLI, then authorize Quotio to read its existing local login.",
+            "Sign in with the Antigravity app, then authorize Quotio to read its existing local login.",
         ),
         Provider::Catalog(id)
             if provider.catalog().is_some_and(|definition| {
