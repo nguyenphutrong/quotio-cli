@@ -46,6 +46,9 @@ pub type FetchFuture<'a> =
 /// quota metadata belongs in ProviderUsage.
 pub trait ProviderAdapter: Send + Sync {
     fn id(&self) -> ProviderId;
+    fn account_ref(&self) -> Option<crate::domain::AccountRef> {
+        None
+    }
     fn idempotent(&self) -> bool {
         false
     }

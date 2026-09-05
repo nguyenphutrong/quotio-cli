@@ -8,6 +8,8 @@ pub struct ProviderId(pub String);
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AccountIdentity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
     pub id: String,
     pub label: String,
 }
@@ -100,13 +102,22 @@ pub struct QuotaWindow {
     pub fetched_at: OffsetDateTime,
 }
 #[derive(Clone, Debug, Serialize)]
+pub struct AccountRef {
+    pub id: String,
+    pub label: String,
+}
+#[derive(Clone, Debug, Serialize)]
 pub struct ProviderUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_ref: Option<AccountRef>,
     pub provider: ProviderId,
     pub account: AccountIdentity,
     pub windows: Vec<QuotaWindow>,
 }
 #[derive(Debug, Serialize)]
 pub struct ProviderFailure {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_ref: Option<AccountRef>,
     pub provider: ProviderId,
     pub code: ProviderError,
     pub message: String,

@@ -67,40 +67,19 @@ impl Vault {
     pub fn new(backend: Arc<dyn Backend>, lock_path: PathBuf) -> Self {
         Self { backend, lock_path }
     }
+    pub fn refresh_lock(&self, id: &str) -> Result<File, AccountError> {
+        if id.is_empty()
+            || id.len() > 80
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(AccountError::Corrupt);
+        }
+        acquire(&self.lock_path.with_file_name(format!("refresh-{id}.lock")))
+    }
     pub fn begin(&self) -> Result<Transaction, AccountError> {
-        let parent = self.lock_path.parent().ok_or(AccountError::Storage)?;
-        std::fs::create_dir_all(parent).map_err(|_| AccountError::Storage)?;
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
-        }
-        let lock = options
-            .open(&self.lock_path)
-            .map_err(|_| AccountError::Storage)?;
-        if !lock
-            .metadata()
-            .map_err(|_| AccountError::Storage)?
-            .is_file()
-        {
-            return Err(AccountError::Storage);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            // The descriptor remains alive for the full transaction, including refresh.
-            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                return Err(AccountError::Busy);
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            return Err(AccountError::Unsupported);
-        }
+        let lock = acquire(&self.lock_path)?;
         let document = match self.backend.read()? {
             None => Document::empty(),
             Some(bytes) => {
@@ -121,6 +100,40 @@ impl Vault {
             document,
         })
     }
+}
+fn acquire(path: &std::path::Path) -> Result<File, AccountError> {
+    let parent = path.parent().ok_or(AccountError::Storage)?;
+    std::fs::create_dir_all(parent).map_err(|_| AccountError::Storage)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let lock = options.open(path).map_err(|_| AccountError::Storage)?;
+    if !lock
+        .metadata()
+        .map_err(|_| AccountError::Storage)?
+        .is_file()
+    {
+        return Err(AccountError::Storage);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // Keep the descriptor alive until the protected operation completes.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(AccountError::Busy);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        return Err(AccountError::Unsupported);
+    }
+    Ok(lock)
 }
 impl Transaction {
     pub fn commit(self) -> Result<(), AccountError> {

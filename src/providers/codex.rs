@@ -152,8 +152,10 @@ fn parse(
     }
     let email = account.email.ok_or(ProviderError::InvalidData)?;
     Ok(ProviderUsage {
+        account_ref: None,
         provider: ProviderId("codex".into()),
         account: AccountIdentity {
+            plan: account.plan_type,
             id: email.clone(),
             label: email,
         },
@@ -205,6 +207,12 @@ async fn rpc(
     Err(ProviderError::InvalidData)
 }
 impl ProviderAdapter for CodexProvider {
+    fn account_ref(&self) -> Option<AccountRef> {
+        Some(AccountRef {
+            id: "local".into(),
+            label: "Local Codex".into(),
+        })
+    }
     fn id(&self) -> ProviderId {
         ProviderId("codex".into())
     }
@@ -266,6 +274,7 @@ mod tests {
     fn prefer_all_buckets_and_omit_missing_windows() {
         let report = parse(identity(), json!({"rateLimits":{"primary":{"usedPercent":90}},"rateLimitsByLimitId":{"a":{"primary":{"usedPercent":25,"windowDurationMins":300,"resetsAt":1780000000}},"b":{"primary":{"usedPercent":100},"secondary":{"usedPercent":0}}}}), OffsetDateTime::UNIX_EPOCH).unwrap();
         assert_eq!(report.windows.len(), 3);
+        assert_eq!(report.account.plan.as_deref(), Some("pro"));
         assert_eq!(report.windows[0].quota, Quota::from_used(Some(25.0)));
         assert_eq!(report.windows[1].quota, Quota::from_used(Some(100.0)));
         assert_eq!(report.windows[2].quota, Quota::from_used(Some(0.0)));

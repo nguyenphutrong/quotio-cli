@@ -27,6 +27,10 @@ pub(crate) fn parse(
     email: &str,
     now: time::OffsetDateTime,
 ) -> Result<ProviderUsage, ProviderError> {
+    let plan = value
+        .get("plan_type")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let mut buckets = serde_json::Map::new();
     if let Some(rate) = value.get("rate_limit").filter(|v| !v.is_null()) {
         buckets.insert("codex".into(), translated_rate(rate, "codex")?);
@@ -55,6 +59,7 @@ pub(crate) fn parse(
         return Err(ProviderError::InvalidData);
     }
     let mut usage = super::codex::parse_direct(email, json!({"rateLimitsByLimitId":buckets}), now)?;
+    usage.account.plan = plan;
     // Keep the main Codex windows first, followed by model-specific limits.
     usage
         .windows
@@ -111,7 +116,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn direct_quota_preserves_identity_headers_and_sparse_windows() {
-        let (url,task)=http::fixture::server(vec![json!({"rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":604800}},"additional_rate_limits":[{"limit_name":"GPT Spark","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000}}}]})]).await;
+        let (url,task)=http::fixture::server(vec![json!({"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":604800}},"additional_rate_limits":[{"limit_name":"GPT Spark","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000}}}]})]).await;
         let credential = Credential::CodexOAuth {
             access_token: "synthetic-token".into(),
             refresh_token: "refresh".into(),
@@ -127,6 +132,7 @@ mod tests {
         assert_eq!(usage.windows[0].label, "Weekly");
         assert_eq!(usage.windows[1].label, "Codex Spark Session");
         assert_eq!(usage.account.id, "workspace-a");
+        assert_eq!(usage.account.plan.as_deref(), Some("pro"));
         let req = task.await.unwrap();
         assert!(
             req[0]

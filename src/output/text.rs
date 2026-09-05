@@ -1,4 +1,4 @@
-use crate::domain::{Quota, UsageReport};
+use crate::domain::{ProviderFailure, Quota, UsageReport};
 use std::fmt::Write;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 fn timestamp(time: Option<OffsetDateTime>) -> String {
@@ -22,6 +22,14 @@ pub fn render(report: &UsageReport) -> String {
             safe(&usage.account.label),
             safe(&usage.account.id)
         );
+        if let Some(account) = &usage.account_ref {
+            let _ = writeln!(
+                text,
+                "  Account: {} [{}]",
+                safe(&account.label),
+                safe(&account.id)
+            );
+        }
         for window in &usage.windows {
             let quota = match window.quota {
                 Quota::Unknown => "usage unknown; remaining unknown".into(),
@@ -57,7 +65,16 @@ pub fn render(report: &UsageReport) -> String {
         }
     }
     for failure in &report.failures {
-        let _ = writeln!(text, "{}: {}", safe(&failure.provider.0), failure.code);
+        let _ = writeln!(text, "{}", self::failure(failure));
     }
     text
+}
+
+pub fn failure(failure: &ProviderFailure) -> String {
+    let account = failure
+        .account_ref
+        .as_ref()
+        .map(|a| format!(" [{}: {}]", safe(&a.id), safe(&a.label)))
+        .unwrap_or_default();
+    format!("{}{account}: {}", safe(&failure.provider.0), failure.code)
 }

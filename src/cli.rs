@@ -54,6 +54,9 @@ pub struct UsageArgs {
     /// Use environment/local CLI sources without reading saved accounts
     #[arg(long)]
     pub no_saved_accounts: bool,
+    /// Select one saved account ID, or local; requires exactly one provider
+    #[arg(long, requires = "provider", conflicts_with = "no_saved_accounts")]
+    pub account: Option<String>,
 }
 
 impl Provider {

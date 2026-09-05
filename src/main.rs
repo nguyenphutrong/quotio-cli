@@ -121,8 +121,15 @@ async fn main() -> ExitCode {
                 }
             }
             let providers = tokio::select! {
-                providers=quotio::accounts::service::adapters(unique, !args.no_saved_accounts, Duration::from_secs(args.timeout))=>providers,
+                providers=quotio::accounts::service::adapters(unique, !args.no_saved_accounts, Duration::from_secs(args.timeout), args.account.as_deref())=>providers,
                 _=tokio::signal::ctrl_c()=>{eprintln!("Account discovery cancelled.");return ExitCode::from(3)},
+            };
+            let providers = match providers {
+                Ok(providers) => providers,
+                Err(error) => {
+                    eprintln!("{error}");
+                    return ExitCode::from(2);
+                }
             };
             if providers.is_empty() {
                 eprintln!(
@@ -165,7 +172,7 @@ async fn main() -> ExitCode {
             };
             let code = report.exit_code();
             for failure in &report.failures {
-                eprintln!("{}: {}", failure.provider.0, failure.code);
+                eprintln!("{}", output::text::failure(failure));
             }
             let text = match args.format {
                 Format::Text => output::text::render(&report),

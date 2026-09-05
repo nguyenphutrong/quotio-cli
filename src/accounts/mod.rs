@@ -36,7 +36,7 @@ pub enum AccountError {
 }
 
 // These values are serialized only inside the OS-protected vault, never reports.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Credential {
     ApiKey {

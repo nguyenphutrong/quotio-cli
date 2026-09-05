@@ -162,8 +162,10 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
         return Err(ProviderError::InvalidData);
     }
     Ok(ProviderUsage {
+        account_ref: None,
         provider: ProviderId("amp".into()),
         account: AccountIdentity {
+            plan: None,
             id: email.into(),
             label: email.into(),
         },

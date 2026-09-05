@@ -13,8 +13,10 @@ impl ProviderAdapter for MockProvider {
         Box::pin(async move {
             let fetched_at = datetime!(2026-01-01 0:00 UTC);
             Ok(ProviderUsage {
+                account_ref: None,
                 provider: self.id(),
                 account: AccountIdentity {
+                    plan: None,
                     id: "mock-account".into(),
                     label: "Demo account".into(),
                 },

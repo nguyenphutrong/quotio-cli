@@ -122,8 +122,10 @@ fn parse(
         });
     }
     Ok(ProviderUsage {
+        account_ref: None,
         provider: ProviderId("factory".into()),
         account: AccountIdentity {
+            plan: None,
             id: format!("{}:{}", identity.user_id, identity.org_id),
             label: format!("{} / {}", identity.user_id, identity.org_id),
         },

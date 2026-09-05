@@ -301,8 +301,10 @@ impl AntigravityProvider {
             )?,
         };
         Ok(ProviderUsage {
+            account_ref: None,
             provider: self.id(),
             account: AccountIdentity {
+                plan: None,
                 id: before.id,
                 label: before.email,
             },

@@ -31,9 +31,11 @@ impl Collector {
     pub async fn collect(&self, request: CollectRequest) -> UsageReport {
         let mut tasks = JoinSet::new();
         let mut ids = Vec::new();
+        let mut accounts = Vec::new();
         let mut task_order = std::collections::HashMap::new();
         for (index, adapter) in request.providers.into_iter().enumerate() {
             ids.push(adapter.id());
+            accounts.push(adapter.account_ref());
             let context = self.context.clone();
             let cancellation = request.cancellation.clone();
             let timeout = request.timeout;
@@ -86,14 +88,64 @@ impl Collector {
                 }
             });
             match result {
-                Ok(usage) => report.providers.push(usage),
+                Ok(mut usage) => {
+                    usage.account_ref = accounts[index].clone();
+                    report.providers.push(usage);
+                }
                 Err(code) => report.failures.push(ProviderFailure {
+                    account_ref: accounts[index].clone(),
                     provider: ids[index].clone(),
                     code,
                     message: code.to_string(),
                 }),
             }
         }
+        reconcile_codex(&mut report.providers);
         report
     }
+}
+
+// Prefer a managed snapshot only when it identifies the same account. Email-only
+// local identity is sufficient for a unique personal account, never a workspace.
+fn reconcile_codex(providers: &mut Vec<ProviderUsage>) {
+    let personal = |usage: &ProviderUsage| {
+        matches!(
+            usage.account.plan.as_deref(),
+            Some("free" | "plus" | "pro" | "go")
+        )
+    };
+    let mut remove = Vec::new();
+    for (index, local) in providers.iter().enumerate() {
+        if local.provider.0 != "codex" || local.account_ref.as_ref().is_none_or(|a| a.id != "local")
+        {
+            continue;
+        }
+        let managed: Vec<_> = providers
+            .iter()
+            .filter(|p| {
+                p.provider == local.provider
+                    && p.account_ref.as_ref().is_some_and(|a| a.id != "local")
+            })
+            .collect();
+        let exact = managed
+            .iter()
+            .any(|p| !local.account.id.is_empty() && p.account.id == local.account.id);
+        let email_matches: Vec<_> = managed
+            .iter()
+            .filter(|p| p.account.label.eq_ignore_ascii_case(&local.account.label))
+            .collect();
+        let same_personal = personal(local)
+            && local.account.label.contains('@')
+            && email_matches.len() == 1
+            && personal(email_matches[0]);
+        if exact || same_personal {
+            remove.push(index);
+        }
+    }
+    let mut index = 0;
+    providers.retain(|_| {
+        let keep = !remove.contains(&index);
+        index += 1;
+        keep
+    });
 }

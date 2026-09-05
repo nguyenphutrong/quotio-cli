@@ -275,3 +275,48 @@ fn account_commands_are_explicit_and_help_exposes_no_secret_argument() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
 }
+
+#[test]
+fn account_selector_requires_one_provider_and_conflicts_with_skip_vault() {
+    assert!(
+        Cli::try_parse_from([
+            "quotio",
+            "usage",
+            "--provider",
+            "codex",
+            "--account",
+            "local"
+        ])
+        .is_ok()
+    );
+    assert!(Cli::try_parse_from(["quotio", "usage", "--account", "id"]).is_err());
+    assert!(
+        Cli::try_parse_from([
+            "quotio",
+            "usage",
+            "--provider",
+            "codex",
+            "--account",
+            "id",
+            "--no-saved-accounts"
+        ])
+        .is_err()
+    );
+    let config = ConfigFile::new("enabled_providers = []");
+    let output = Command::new(env!("CARGO_BIN_EXE_quotio"))
+        .args([
+            "usage",
+            "--provider",
+            "codex",
+            "--provider",
+            "amp",
+            "--account",
+            "id",
+            "--config",
+        ])
+        .arg(&config.0)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+}
