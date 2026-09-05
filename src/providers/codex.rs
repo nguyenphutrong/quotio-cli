@@ -84,9 +84,38 @@ fn parse(
     };
     let mut windows = Vec::new();
     for (id, bucket) in buckets {
-        let name = bucket.limit_name.filter(|s| !s.is_empty()).unwrap_or(id);
-        for (slot, window) in [("primary", bucket.primary), ("secondary", bucket.secondary)] {
-            let (quota, reset, duration) = match window {
+        let name = bucket
+            .limit_name
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| id.clone());
+        let prefix = if id == "codex" {
+            String::new()
+        } else if name.to_ascii_lowercase().contains("codex-spark") || name == "Codex Spark" {
+            "Codex Spark ".into()
+        } else {
+            format!("{name} ")
+        };
+        let durations = [
+            bucket.primary.as_ref().and_then(|w| w.window_duration_mins),
+            bucket
+                .secondary
+                .as_ref()
+                .and_then(|w| w.window_duration_mins),
+        ];
+        let mut bucket_windows = Vec::new();
+        for (index, window) in [bucket.primary, bucket.secondary].into_iter().enumerate() {
+            let (order, period) = match durations[index] {
+                Some(300) => (0, "Session"),
+                Some(10080) => (1, "Weekly"),
+                None => match durations[1 - index] {
+                    Some(10080) => (0, "Session"),
+                    Some(300) => (1, "Weekly"),
+                    _ if index == 0 => (0, "Session"),
+                    _ => (1, "Weekly"),
+                },
+                Some(_) => (2, "Quota"),
+            };
+            let (quota, reset) = match window {
                 Some(window) => (
                     Quota::from_used(window.used_percent),
                     window
@@ -94,31 +123,36 @@ fn parse(
                         .map(OffsetDateTime::from_unix_timestamp)
                         .transpose()
                         .map_err(|_| ProviderError::InvalidData)?,
-                    window.window_duration_mins,
                 ),
-                None => (Quota::Unknown, None, None),
+                None => (Quota::Unknown, None),
             };
-            let label = match duration {
-                Some(minutes) => format!("{name} {slot} ({minutes} min)"),
-                None => format!("{name} {slot}"),
+            let label = if period == "Quota" {
+                format!("{prefix}Quota {}", index + 1)
+            } else {
+                format!("{prefix}{period}")
             };
             let confidence = if quota == Quota::Unknown {
                 Confidence::Unknown
             } else {
                 Confidence::Exact
             };
-            windows.push(QuotaWindow {
-                amounts: None,
-                label,
-                quota,
-                resets_at: reset,
-                fetched_at: now,
-                provenance: Provenance {
-                    source: "codex_app_server".into(),
-                    confidence,
+            bucket_windows.push((
+                order,
+                QuotaWindow {
+                    amounts: None,
+                    label,
+                    quota,
+                    resets_at: reset,
+                    fetched_at: now,
+                    provenance: Provenance {
+                        source: "codex_app_server".into(),
+                        confidence,
+                    },
                 },
-            });
+            ));
         }
+        bucket_windows.sort_by_key(|(order, _)| *order);
+        windows.extend(bucket_windows.into_iter().map(|(_, window)| window));
     }
     let email = account.email.ok_or(ProviderError::InvalidData)?;
     Ok(ProviderUsage {
@@ -236,6 +270,43 @@ mod tests {
                 OffsetDateTime::UNIX_EPOCH
             )
             .is_err()
+        );
+    }
+    #[test]
+    fn compact_labels_preserve_weekly_primary_and_missing_session() {
+        let report = parse(identity(), json!({"rateLimitsByLimitId":{
+            "codex":{"primary":{"usedPercent":70,"windowDurationMins":10080}},
+            "codex_bengalfox":{"limitName":"GPT-5.3-Codex-Spark","primary":{"usedPercent":25,"windowDurationMins":300},"secondary":{"usedPercent":40,"windowDurationMins":10080}}
+        }}), OffsetDateTime::UNIX_EPOCH).unwrap();
+        assert_eq!(
+            report
+                .windows
+                .iter()
+                .map(|w| w.label.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Session",
+                "Weekly",
+                "Codex Spark Session",
+                "Codex Spark Weekly"
+            ]
+        );
+        assert_eq!(report.windows[0].quota, Quota::Unknown);
+        assert_eq!(report.windows[1].quota, Quota::from_used(Some(70.0)));
+        assert_eq!(report.windows[2].quota, Quota::from_used(Some(25.0)));
+        assert_eq!(report.windows[3].quota, Quota::from_used(Some(40.0)));
+    }
+    #[test]
+    fn labels_keep_other_buckets_and_do_not_misname_unusual_durations() {
+        let report = parse(identity(),json!({"rateLimits":{"primary":{"usedPercent":10,"windowDurationMins":300},"secondary":{"usedPercent":20,"windowDurationMins":10080}}}),OffsetDateTime::UNIX_EPOCH).unwrap();
+        assert_eq!(report.windows[0].label, "Session");
+        assert_eq!(report.windows[1].label, "Weekly");
+        let report = parse(identity(),json!({"rateLimitsByLimitId":{"other":{"limitName":"Other model","primary":{"usedPercent":10,"windowDurationMins":60}}}}),OffsetDateTime::UNIX_EPOCH).unwrap();
+        assert!(
+            report
+                .windows
+                .iter()
+                .any(|w| w.label == "Other model Quota 1")
         );
     }
 }
