@@ -4,7 +4,21 @@ Reviewed revision: 9ff9d9d98417e10d496cfcbf17cbc1052c9d7f3a.
 Date: 2026-09-05. This is an audit report, not a claim of vulnerability-free software.
 No push, real credential access, login or Keychain vault access was performed.
 
-## Verdict
+## Remediation update
+
+The user approved implementation after this audit. The findings below describe the
+reviewed pre-fix revision; they are retained as historical evidence.
+
+- time upgraded to 0.3.47 with a 128-byte Retry-After bound and malformed/deep-input tests.
+- MIT LICENSE added, with package.license metadata and non-personal attribution.
+- Local credential/signing ignores added; safe environment templates remain trackable.
+- Read-only CI now scans Git history with Gitleaks and locked versions with OSV.
+- GitHub Actions are pinned and audited continuously with zizmor.
+
+See [remediation verification](SECURITY_REMEDIATION.md) for final results. Dependency
+notices remain a packaging requirement when publishing binary releases.
+
+## Original audit verdict
 
 Fix the known `time` dependency vulnerability and select/apply a project license
 before treating this revision as ready for public use. No leaked credentials were
@@ -129,5 +143,5 @@ alone does not replace dependency notices. No dependency source was modified her
 3. Add local-secret ignores and security/advisory automation.
 4. Prepare third-party notices if distributing signed binaries.
 
-This review changes documentation only. Runtime fixes and license application
-remain proposed, and the repository has not been pushed.
+The original audit was documentation-only. Its approved fixes are now implemented
+as summarized above. The repository has not been pushed.

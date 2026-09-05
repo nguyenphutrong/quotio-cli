@@ -351,3 +351,19 @@ symlinks or submodules. Build and runtime do not need the reference checkout.
 
 Quotio CLI is licensed under the [MIT License](LICENSE). Dependencies retain their
 own licenses; binary distributions also need the applicable third-party notices.
+
+## Security checks
+
+The GitHub workflows run on pull requests and pushes to main, with manual dispatch
+available. They use read-only repository permissions, pinned action commits and no
+stored checkout credentials. No developer certificate or provider secret is needed.
+
+- Gitleaks scans full Git history with redacted findings.
+- `python3 scripts/check-advisories.py` checks Cargo.lock against OSV and fails on
+  advisories or incomplete/unavailable results. Only crates.io package names and
+  versions are sent; private registries require an explicit policy and are not sent.
+- `python3 scripts/test-check-advisories.py` tests the checker without network access.
+- zizmor audits GitHub Actions changes with code-scanning uploads disabled.
+
+The patched date parser uses time 0.3.47 and bounds Retry-After header input. See
+[security remediation evidence](SECURITY_REMEDIATION.md) for verified results.
