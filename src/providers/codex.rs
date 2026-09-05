@@ -104,6 +104,7 @@ fn parse(
         ];
         let mut bucket_windows = Vec::new();
         for (index, window) in [bucket.primary, bucket.secondary].into_iter().enumerate() {
+            let Some(window) = window else { continue };
             let (order, period) = match durations[index] {
                 Some(300) => (0, "Session"),
                 Some(10080) => (1, "Weekly"),
@@ -115,17 +116,12 @@ fn parse(
                 },
                 Some(_) => (2, "Quota"),
             };
-            let (quota, reset) = match window {
-                Some(window) => (
-                    Quota::from_used(window.used_percent),
-                    window
-                        .resets_at
-                        .map(OffsetDateTime::from_unix_timestamp)
-                        .transpose()
-                        .map_err(|_| ProviderError::InvalidData)?,
-                ),
-                None => (Quota::Unknown, None),
-            };
+            let quota = Quota::from_used(window.used_percent);
+            let reset = window
+                .resets_at
+                .map(OffsetDateTime::from_unix_timestamp)
+                .transpose()
+                .map_err(|_| ProviderError::InvalidData)?;
             let label = if period == "Quota" {
                 format!("{prefix}Quota {}", index + 1)
             } else {
@@ -252,12 +248,12 @@ mod tests {
             .unwrap()
     }
     #[test]
-    fn prefer_all_buckets_and_keep_missing_unknown() {
+    fn prefer_all_buckets_and_omit_missing_windows() {
         let report = parse(identity(), json!({"rateLimits":{"primary":{"usedPercent":90}},"rateLimitsByLimitId":{"a":{"primary":{"usedPercent":25,"windowDurationMins":300,"resetsAt":1780000000}},"b":{"primary":{"usedPercent":100},"secondary":{"usedPercent":0}}}}), OffsetDateTime::UNIX_EPOCH).unwrap();
-        assert_eq!(report.windows.len(), 4);
+        assert_eq!(report.windows.len(), 3);
         assert_eq!(report.windows[0].quota, Quota::from_used(Some(25.0)));
-        assert_eq!(report.windows[1].quota, Quota::Unknown);
-        assert_eq!(report.windows[2].quota, Quota::from_used(Some(100.0)));
+        assert_eq!(report.windows[1].quota, Quota::from_used(Some(100.0)));
+        assert_eq!(report.windows[2].quota, Quota::from_used(Some(0.0)));
     }
     #[test]
     fn reject_unknown_identity_and_invalid_payload() {
@@ -273,7 +269,7 @@ mod tests {
         );
     }
     #[test]
-    fn compact_labels_preserve_weekly_primary_and_missing_session() {
+    fn compact_labels_omit_absent_session_and_preserve_weekly_primary() {
         let report = parse(identity(), json!({"rateLimitsByLimitId":{
             "codex":{"primary":{"usedPercent":70,"windowDurationMins":10080}},
             "codex_bengalfox":{"limitName":"GPT-5.3-Codex-Spark","primary":{"usedPercent":25,"windowDurationMins":300},"secondary":{"usedPercent":40,"windowDurationMins":10080}}
@@ -284,17 +280,11 @@ mod tests {
                 .iter()
                 .map(|w| w.label.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                "Session",
-                "Weekly",
-                "Codex Spark Session",
-                "Codex Spark Weekly"
-            ]
+            vec!["Weekly", "Codex Spark Session", "Codex Spark Weekly"]
         );
-        assert_eq!(report.windows[0].quota, Quota::Unknown);
-        assert_eq!(report.windows[1].quota, Quota::from_used(Some(70.0)));
-        assert_eq!(report.windows[2].quota, Quota::from_used(Some(25.0)));
-        assert_eq!(report.windows[3].quota, Quota::from_used(Some(40.0)));
+        assert_eq!(report.windows[0].quota, Quota::from_used(Some(70.0)));
+        assert_eq!(report.windows[1].quota, Quota::from_used(Some(25.0)));
+        assert_eq!(report.windows[2].quota, Quota::from_used(Some(40.0)));
     }
     #[test]
     fn labels_keep_other_buckets_and_do_not_misname_unusual_durations() {
@@ -308,5 +298,40 @@ mod tests {
                 .iter()
                 .any(|w| w.label == "Other model Quota 1")
         );
+    }
+    #[test]
+    fn absent_windows_are_omitted_but_present_unknown_usage_is_kept() {
+        for value in [
+            json!({"rateLimits":{"primary":null,"secondary":null}}),
+            json!({"rateLimits":{}}),
+        ] {
+            assert!(
+                parse(identity(), value, OffsetDateTime::UNIX_EPOCH)
+                    .unwrap()
+                    .windows
+                    .is_empty()
+            );
+        }
+        let report = parse(
+            identity(),
+            json!({"rateLimits":{"primary":{"windowDurationMins":300},"secondary":null}}),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.windows[0].label, "Session");
+        assert_eq!(report.windows[0].quota, Quota::Unknown);
+        let report = parse(
+            identity(),
+            json!({"rateLimits":{"primary":{"usedPercent":15,"windowDurationMins":43200}}}),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.windows[0].quota, Quota::from_used(Some(15.0)));
+        assert!(!matches!(
+            report.windows[0].label.as_str(),
+            "Session" | "Weekly"
+        ));
     }
 }
