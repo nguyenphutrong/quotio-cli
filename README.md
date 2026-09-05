@@ -6,7 +6,7 @@ A standalone Rust CLI for provider quota reports. The CLI supports `mock`, `code
 | Provider | Data source | Current verification |
 | --- | --- | --- |
 | Codex / ChatGPT | Saved OAuth + direct API; installed CLI fallback | OAuth/direct API tested offline; CLI live read previously passed |
-| Amp | Saved API key + direct API; installed CLI fallback | API tested offline; CLI live read previously passed |
+| Amp | Saved/environment/local API key + direct API; CLI fallback | Live API and parser verified |
 | Antigravity | Direct Google quota API, following the main Quotio project | Offline tests passed; live token use awaiting approval |
 | Factory Droid | Saved API key or environment key + direct API | Offline tests passed; user key validation needed |
 | Mock | Fixed fixture | Offline tests passed |
@@ -185,11 +185,15 @@ environment/CLI usage routes. There is no plaintext storage fallback.
 Saved Codex accounts use `source: codex_api`. Refresh occurs near expiry or after
 authentication failure, and all rotated tokens are saved before a quota retry.
 Refresh is serialized and never automatically replayed after an uncertain failure.
-Saved Amp accounts use `source: amp_api` and require no Amp binary. Factory uses
+Amp API accounts use `source: amp_api` and require no Amp binary. Factory uses
 `source: factory_billing_limits` with account/organization validation.
 
-Without saved accounts, Codex and Amp retain their installed-CLI routes. Quotio
-submits no prompts and never starts login/logout through those fallback CLIs.
+Without saved accounts, Codex retains its installed-CLI route. Amp first uses
+`AMP_API_KEY`, then the public-host key in `~/.local/share/amp/secrets.json`, and
+calls the quota API directly. That existing file is read-only and size-bounded;
+symlinks are rejected on Unix. If no key exists, or AMP_URL selects a custom host,
+Amp retains its CLI route. Quotio submits no prompts and never starts login/logout
+through those fallback CLIs.
 Those CLIs may perform their usual internal auth maintenance or update checks.
 Missing executables or unsupported output become per-provider failures.
 
@@ -224,8 +228,9 @@ Arrays preserve request order within successes and failures. Each provider conta
 Each window contains `label`, `quota`, nullable `resets_at`, `provenance` with
 `source` and `confidence`, and RFC 3339 `fetched_at`. Timestamps include an offset.
 Optional `amounts` records a balance as `remaining`, nullable `limit`, and `unit`.
-USD credit balances with no limit retain unknown percentage, including a zero
-balance. Amp subscription dollar/hour allowances are separate windows.
+USD credit balances with no limit retain unknown percentage in JSON, including a
+zero balance. Text renders those as balances rather than missing usage. Amp
+subscription dollar/hour allowances are separate windows with used/remaining amounts.
 
 The mock's fixed observation date is January 1, 2026. It is demo data, not fresh
 account usage. The report generation time uses the injected clock.
