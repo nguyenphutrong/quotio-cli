@@ -1,20 +1,23 @@
 # Quotio CLI
 
-A standalone Rust CLI for provider quota reports. The CLI supports `mock`, `codex`,
-`amp`, `antigravity`, `factory` (aliases `droid`, `factory-droid`), `synthetic`,
-`openrouter`, `zai` (alias `glm`), and `minimax`. No TUI yet.
+A standalone Rust CLI for provider quota and usage reports. The current registry
+contains 46 real providers: 8 original routes and 38 catalog `Definition`s. `mock`
+is a separate deterministic fixture, not a real provider. No TUI yet.
 
-| Provider | Data source | Current verification |
-| --- | --- | --- |
-| Codex / ChatGPT | Saved OAuth + direct API; installed CLI fallback | OAuth/direct API tested offline; CLI live read previously passed |
-| Amp | Saved/environment/local API key + direct API; CLI fallback | Live API and parser verified |
-| Antigravity | Direct Google API with native Keychain auth; running-app fallback | Native auth/refresh verified; local quota matched OpenUsage |
-| Factory Droid | Saved API key or environment key + direct API | Offline tests passed; user key validation needed |
-| Synthetic | Subscription, rolling and search quota via API key | Offline contract tests; live key validation pending |
-| OpenRouter | Per-key USD spend and optional spending cap | Offline contract tests; live key validation pending |
-| Z.ai / BigModel | Coding Plan and MCP quota via API key | Offline contract tests; monitor API is version-sensitive |
-| MiniMax | Token Plan remaining quota via subscription key | Offline contract tests; documented host not validated live |
-| Mock | Fixed fixture | Offline tests passed |
+| Group | Providers | Credential path | Verification boundary |
+| --- | --- | --- | --- |
+| Original routes (8) | Codex, Amp, Antigravity, Factory, Synthetic, OpenRouter, Z.ai, MiniMax | Provider-specific OAuth, API-key, CLI, or native-service route | Route-specific automated coverage; live acceptance varies by provider |
+| Catalog API-key routes (30) | ai&, Alibaba Coding Plan, Chutes, ClawRouter, ClinePass, Codebuff, Crof, Deepgram, DeepInfra, DeepSeek, Devin, Doubao Coding Plan, ElevenLabs, Fireworks, Groq, IBM Bob, Kilo, Kimi Code, LiteLLM, LLM Proxy, Moonshot, NeuralWatt, OpenAI organization usage, OpenCode Go, Poe, sub2api, Venice, Warp, xAI, ZenMux | Hidden key prompt, `--token-stdin`, or the named environment variable | Offline tests passed; no live credential acceptance |
+| Catalog OAuth routes (8) | Azure OpenAI, Claude, Gemini, GitHub Copilot, Cursor, Grok, Kiro, Vertex AI | Explicit access token, supported native source, or provider CLI fallback | Offline tests passed; no standalone Quotio sign-in |
+| Mock | Mock | No credential | Fixed offline fixture |
+
+Azure OpenAI cost and Doubao Coding Plan are registered catalog providers. Azure
+uses an Entra bearer or noninteractive Azure CLI fallback with a required ARM
+`resource_id`; Doubao uses a hidden Volcengine SecretAccessKey with a required
+nonsecret AccessKey ID. Their automated coverage does not establish live account
+access, IAM authorization, or subscription entitlement. Ollama Cloud and OpenCode
+Zen remain absent because the reviewed sources do not provide an API-key quota or
+balance route without browser state. OpenCode Go is a separate, implemented provider.
 
 Antigravity can use the running app's local service when direct API quota is unavailable.
 See [provider contracts](plans/20260905-first-live-provider/) for source evidence.
@@ -214,6 +217,79 @@ Amp retains its CLI route. Quotio submits no prompts and never starts login/logo
 through those fallback CLIs.
 Those CLIs may perform their usual internal auth maintenance or update checks.
 Missing executables or unsupported output become per-provider failures.
+
+## Catalog API-key accounts
+
+Run `cargo run -- providers` to see each catalog credential and every allowed
+setting. For a catalog API-key provider, `accounts add` asks for the key with
+terminal echo disabled. The key is never accepted as a command argument. Scripts
+may provide one key on stdin with `--token-stdin`.
+
+```sh
+cargo run -- accounts add --provider fireworks --setting account_id=acct_123
+cargo run -- accounts add --provider devin --setting organization_id=org_123
+cargo run -- accounts add --provider doubao --setting access_key_id=AKLTEXAMPLE
+cargo run -- accounts add --provider litellm --setting base_url=https://proxy.example
+```
+
+`--setting NAME=VALUE` stores only allowlisted, nonsecret metadata with the key.
+Repeat it for multiple settings. A required setting can also come from its
+documented environment variable. Unknown, duplicate, empty, and control-character
+settings are rejected. Do not put a token, secret, or password in `--setting`.
+
+| Provider | `--setting` metadata | Requirement |
+| --- | --- | --- |
+| Moonshot / Kimi | `region` | Optional; `MOONSHOT_REGION` |
+| xAI | `team_id` | Required; `XAI_TEAM_ID` |
+| Alibaba Coding Plan | `region` | Required; `ALIBABA_CODING_PLAN_REGION` |
+| Kilo | `organization_id` | Optional; `KILO_ORGANIZATION_ID` |
+| Fireworks | `account_id` | Required; `FIREWORKS_ACCOUNT_ID` |
+| Deepgram | `project_id` | Required; `DEEPGRAM_PROJECT_ID` |
+| Devin | `organization_id` | Required; `DEVIN_ORG_ID` |
+| Doubao Coding Plan | `access_key_id` | Required; `DOUBAO_ACCESS_KEY_ID` |
+| ClawRouter | `base_url` | Optional; `CLAWROUTER_BASE_URL` |
+| LiteLLM | `base_url` | Required; `LITELLM_BASE_URL` |
+| LLM Proxy | `base_url` | Required; `LLM_PROXY_BASE_URL` |
+| sub2api | `base_url` | Required; `SUB2API_BASE_URL` |
+| OpenAI organization usage | `project_id` | Optional; `OPENAI_PROJECT_ID` |
+
+The command saves validated metadata with the API key. Environment metadata is a
+fallback for an omitted setting. `cargo run -- providers` shows the current
+required/optional flag, so use it instead of copying an old table after upgrades.
+Doubao's hidden API key is `DOUBAO_SECRET_ACCESS_KEY`; its `access_key_id` setting
+is nonsecret metadata and must not contain the SecretAccessKey.
+
+### Admin and Management keys
+
+`openai` reads organization usage and costs with `OPENAI_ADMIN_KEY`; an ordinary
+project key is not a substitute. `xai` and `zenmux` use `XAI_MANAGEMENT_API_KEY`
+and `ZENMUX_MANAGEMENT_API_KEY`, respectively. These privileged keys are still
+entered through the hidden prompt or `--token-stdin`, never as a command argument.
+
+### Catalog OAuth routes
+
+Azure OpenAI, Claude, Gemini, GitHub Copilot, Cursor, Grok, Kiro, and Vertex AI
+are OAuth catalog providers. `accounts add` does not start or import a standalone
+OAuth login for them. Supply the documented explicit access-token environment
+variable: `AZURE_ACCESS_TOKEN`, `CLAUDE_OAUTH_ACCESS_TOKEN`,
+`GEMINI_OAUTH_ACCESS_TOKEN`, `COPILOT_API_TOKEN`, `CURSOR_ACCESS_TOKEN`,
+`GROK_OAUTH_TOKEN`, `KIRO_ACCESS_TOKEN`, or `VERTEXAI_ACCESS_TOKEN`.
+
+Azure OpenAI also requires nonsecret `resource_id` metadata
+(`AZURE_OPENAI_RESOURCE_ID`). Without an explicit token, it can request an Azure
+Resource Manager token through noninteractive `az account get-access-token`; it
+does not run `az login`, scan Azure credential files, or read browser state.
+
+The adapters do not read browser cookies. Claude, Gemini, Copilot, Cursor, and
+Grok reuse a valid native token without a Quotio login or refresh flow. Kiro and
+Vertex AI can refresh recognized native credentials in memory, but they do not
+start a login or write the owning application's credential files. Codex keeps its
+separate Quotio-owned sign-in flow.
+
+Catalog implementation means that a `Definition` and synthetic parser/local
+HTTP-fixture coverage exist. It does not mean a real key, OAuth credential, IAM
+role, or subscription has been accepted live. The full offline suite passed 143
+library, 12 CLI, and 17 collection tests (172 total), with one opt-in test ignored.
 
 ## Additional API-key providers
 
