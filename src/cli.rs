@@ -257,12 +257,21 @@ pub struct ServeArgs {
     #[arg(long)]
     pub config: Option<PathBuf>,
     /// Seconds between completed refresh cycles
-    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=86400))]
-    pub refresh_interval: u64,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86400))]
+    pub refresh_interval: Option<u64>,
     /// Total seconds allowed for each provider, including retries
-    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=3600))]
-    pub timeout: u64,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    pub timeout: Option<u64>,
     /// Use environment/local sources without reading saved accounts
     #[arg(long)]
     pub no_saved_accounts: bool,
+    /// Enable account/auth/settings/refresh writes; requires QUOTIO_SERVER_TOKEN
+    #[arg(long)]
+    pub manage: bool,
+    /// External HTTPS origin supplied by your reverse proxy or tunnel
+    #[arg(long)]
+    pub public_url: Option<String>,
+    /// Allow this exact browser origin; repeat for multiple origins
+    #[arg(long)]
+    pub allow_origin: Vec<String>,
 }

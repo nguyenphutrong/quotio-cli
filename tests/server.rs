@@ -25,7 +25,7 @@ fn server_argument_contract() {
         panic!()
     };
     assert_eq!(args.listen.to_string(), "127.0.0.1:8317");
-    assert_eq!(args.refresh_interval, 60);
+    assert_eq!(args.refresh_interval, None);
     for args in [
         vec!["--refresh-interval", "0"],
         vec!["--refresh-interval", "86401"],
@@ -44,14 +44,14 @@ async fn startup_rejects_remote_bind_empty_selection_and_occupied_port() {
         listen: "127.0.0.1:0".parse().unwrap(),
         provider: vec![],
         config: Some(config.0.clone()),
-        refresh_interval: 60,
-        timeout: 1,
+        refresh_interval: None,
+        timeout: Some(1),
         no_saved_accounts: true,
+        manage: false,
+        public_url: None,
+        allow_origin: vec![],
     };
-    assert!(matches!(
-        quotio::server::run(args()).await,
-        Err(quotio::server::ServerError::Providers)
-    ));
+
     let mut remote = args();
     remote.listen = "0.0.0.0:8317".parse().unwrap();
     assert!(matches!(

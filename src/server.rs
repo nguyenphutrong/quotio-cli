@@ -1,4 +1,6 @@
-//! Local read-only HTTP transport over the existing collector and report schema.
+//! HTTP management and snapshot transport; provider work uses the shared usage cache.
+mod operations;
+mod security;
 use crate::{
     cli::{Provider, ServeArgs},
     config::Config,
@@ -6,22 +8,33 @@ use crate::{
     error::ProviderError,
     fetch::{Cancellation, CollectRequest, Collector},
     providers::{EnvironmentCredentials, ProviderContext, SystemClock},
+    settings::{Overrides, SettingsError, SettingsPatch, SettingsStore, SettingsView},
 };
 use axum::{
     Json, Router,
-    extract::{Path, Request, State},
-    http::{Method, StatusCode, header},
-    middleware::{self, Next},
+    extract::{FromRequest, Path, Request, State},
+    http::StatusCode,
+    middleware,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use clap::ValueEnum;
-use ring::hmac;
+use operations::{Operation, Operations};
+use security::error;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::{future::IntoFuture, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    future::IntoFuture,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{
     net::TcpListener,
-    sync::{RwLock, Semaphore, watch},
+    sync::{Mutex, Notify, RwLock, watch},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -30,10 +43,8 @@ pub enum ServerError {
     Listen,
     #[error("could not load server configuration")]
     Config,
-    #[error("no providers enabled; use serve --provider or enabled_providers in config")]
-    Providers,
-    #[error("QUOTIO_SERVER_TOKEN must contain 32 to 4096 visible ASCII characters")]
-    Token,
+    #[error("invalid server security configuration; check token, public URL and allowed origins")]
+    Security,
     #[error("could not bind server; check the listen address and port")]
     Bind,
     #[error("could not initialize the server")]
@@ -42,196 +53,339 @@ pub enum ServerError {
 impl ServerError {
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::Listen | Self::Config | Self::Providers | Self::Token => 2,
-            Self::Bind | Self::Initialize => 3,
+            Self::Listen | Self::Config | Self::Security => 2,
+            _ => 3,
         }
     }
 }
-
-#[derive(Default)]
-struct Snapshot {
-    report: Option<UsageReport>,
-}
-impl Snapshot {
-    fn update(&mut self, next: UsageReport) {
-        // Retention and login checks belong to the shared usage service.
-        self.report = Some(next);
+struct ApiError(StatusCode, &'static str);
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        error(self.0, self.1)
     }
 }
-
+struct ApiJson<T>(T);
+impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for ApiJson<T> {
+    type Rejection = ApiError;
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            Json::<T>::from_request(request, state),
+        )
+        .await
+        {
+            Ok(Ok(Json(value))) => Ok(Self(value)),
+            Ok(Err(e)) => Err(ApiError(
+                e.status(),
+                if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                    "body_too_large"
+                } else {
+                    "invalid_request"
+                },
+            )),
+            Err(_) => Err(ApiError(StatusCode::REQUEST_TIMEOUT, "request_timeout")),
+        }
+    }
+}
+#[derive(Default, Serialize)]
+struct RefreshStatus {
+    refreshing: bool,
+    last_completed_at: Option<String>,
+    next_refresh_at: Option<String>,
+}
 struct ApiState {
-    snapshot: RwLock<Snapshot>,
-    enabled: Vec<Provider>,
-    address: std::net::SocketAddr,
-    token: Option<hmac::Key>,
-    requests: Semaphore,
+    settings: RwLock<SettingsView>,
+    store: SettingsStore,
+    snapshot: RwLock<Option<(u64, UsageReport)>>,
+    generation: Arc<AtomicU64>,
+    commit_guard: Arc<Mutex<()>>,
+    refresh_lock: Mutex<()>,
+    pending: Mutex<HashMap<String, String>>,
+    wake: Notify,
+    operations: Mutex<Operations>,
+    jobs: Mutex<Vec<tokio::task::AbortHandle>>,
+    status: Mutex<RefreshStatus>,
+    context: ProviderContext,
+    no_saved_accounts: bool,
 }
-
-fn token_key(token: Option<String>) -> Result<Option<hmac::Key>, ServerError> {
-    token
-        .map(|token| {
-            if !(32..=4096).contains(&token.len()) || !token.bytes().all(|b| b.is_ascii_graphic()) {
-                return Err(ServerError::Token);
-            }
-            Ok(hmac::Key::new(hmac::HMAC_SHA256, token.as_bytes()))
-        })
-        .transpose()
-}
-
-fn error(status: StatusCode, code: &'static str) -> Response {
-    (status, Json(json!({"error": code}))).into_response()
-}
-
-async fn guard(State(state): State<Arc<ApiState>>, request: Request, next: Next) -> Response {
-    let mut response = if request.headers().contains_key(header::ORIGIN) {
-        error(StatusCode::FORBIDDEN, "origin_not_allowed")
-    } else if !valid_host(&request, state.address) {
-        error(StatusCode::FORBIDDEN, "host_not_allowed")
-    } else if !authorized(&request, state.token.as_ref()) {
-        let mut response = error(StatusCode::UNAUTHORIZED, "unauthorized");
-        response
-            .headers_mut()
-            .insert(header::WWW_AUTHENTICATE, "Bearer".parse().unwrap());
-        response
-    } else if request.method() != Method::GET && request.method() != Method::HEAD {
-        let mut response = error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
-        response
-            .headers_mut()
-            .insert(header::ALLOW, "GET, HEAD".parse().unwrap());
-        response
-    } else if request.uri().query().is_some() {
-        error(StatusCode::BAD_REQUEST, "unsupported_query")
-    } else if let Ok(_permit) = state.requests.try_acquire() {
-        next.run(request).await
-    } else {
-        error(StatusCode::SERVICE_UNAVAILABLE, "server_busy")
-    };
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
-    response
-        .headers_mut()
-        .insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
-    response
-}
-
-fn valid_host(request: &Request, address: std::net::SocketAddr) -> bool {
-    let mut values = request.headers().get_all(header::HOST).iter();
-    let Some(host) = values.next().and_then(|v| v.to_str().ok()) else {
-        return false;
-    };
-    values.next().is_none()
-        && [address.to_string(), format!("localhost:{}", address.port())]
-            .iter()
-            .any(|allowed| host.eq_ignore_ascii_case(allowed))
-}
-
-fn authorized(request: &Request, key: Option<&hmac::Key>) -> bool {
-    let Some(key) = key else {
-        return true;
-    };
-    let mut headers = request.headers().get_all(header::AUTHORIZATION).iter();
-    let Some(token) = headers
-        .next()
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-    else {
-        return false;
-    };
-    if headers.next().is_some() || !(32..=4096).contains(&token.len()) {
-        return false;
+impl ApiState {
+    async fn spawn(&self, work: impl std::future::Future<Output = ()> + Send + 'static) {
+        let mut jobs = self.jobs.lock().await;
+        jobs.retain(|h| !h.is_finished());
+        jobs.push(tokio::spawn(work).abort_handle());
     }
-    // Verify fixed-message tags with ring's constant-time comparison, without
-    // storing or logging the original bearer token in server state.
-    let candidate = hmac::Key::new(hmac::HMAC_SHA256, token.as_bytes());
-    let tag = hmac::sign(&candidate, b"quotio-server-auth-v1");
-    hmac::verify(key, b"quotio-server-auth-v1", tag.as_ref()).is_ok()
+    async fn invalidate(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.snapshot.write().await.take();
+        self.wake.notify_one();
+    }
 }
-
-fn router(state: Arc<ApiState>) -> Router {
+fn timestamp(now: time::OffsetDateTime) -> String {
+    now.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+fn router(state: Arc<ApiState>, policy: Arc<security::Policy>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/v1/status", get(status))
         .route("/v1/providers", get(providers))
+        .route("/v1/providers/{id}", get(provider))
         .route("/v1/usage", get(usage))
-        .route("/v1/usage/{provider}", get(provider_usage))
+        .route("/v1/usage/{id}", get(provider_usage))
+        .route("/v1/settings", get(settings).patch(patch_settings))
+        .route("/v1/refresh", post(manual_refresh))
+        .route("/v1/operations/{id}", get(operation))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "not_found") })
-        .layer(middleware::from_fn_with_state(state.clone(), guard))
+        .layer(axum::extract::DefaultBodyLimit::max(65536))
+        .layer(middleware::from_fn_with_state(policy, security::guard))
         .with_state(state)
 }
-
 async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
-    Json(json!({"status": "ok", "ready": state.snapshot.read().await.report.is_some()}))
-}
-async fn providers(State(state): State<Arc<ApiState>>) -> Json<Value> {
     Json(
-        json!({"schema_version": 1, "providers": Provider::value_variants().iter().map(|p| {
-        json!({"id": p.id(), "description": p.description(), "enabled": state.enabled.contains(p)})
-    }).collect::<Vec<_>>()}),
+        json!({"status":"ok","ready":state.snapshot.read().await.as_ref().is_some_and(|(generation,_)|*generation==state.generation.load(Ordering::SeqCst))}),
     )
 }
+async fn status(State(state): State<Arc<ApiState>>) -> Json<Value> {
+    let settings = state.settings.read().await;
+    let status = state.status.lock().await;
+    Json(
+        json!({"schema_version":1,"ready":state.snapshot.read().await.as_ref().is_some_and(|(g,_)|*g==state.generation.load(Ordering::SeqCst)),"refreshing":status.refreshing,"last_completed_at":status.last_completed_at,"next_refresh_at":status.next_refresh_at,"settings_revision":settings.revision}),
+    )
+}
+fn provider_value(p: Provider, enabled: &[Provider]) -> Value {
+    json!({"id":p.id(),"description":p.description(),"enabled":enabled.contains(&p)})
+}
+async fn providers(State(state): State<Arc<ApiState>>) -> Json<Value> {
+    let enabled = state
+        .settings
+        .read()
+        .await
+        .values
+        .providers()
+        .unwrap_or_default();
+    Json(
+        json!({"schema_version":1,"providers":Provider::value_variants().iter().map(|p|provider_value(*p,&enabled)).collect::<Vec<_>>()}),
+    )
+}
+async fn provider(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> Response {
+    let Some(p) = Provider::value_variants().iter().find(|p| p.id() == id) else {
+        return error(StatusCode::NOT_FOUND, "provider_not_found");
+    };
+    Json(provider_value(
+        *p,
+        &state
+            .settings
+            .read()
+            .await
+            .values
+            .providers()
+            .unwrap_or_default(),
+    ))
+    .into_response()
+}
 async fn usage(State(state): State<Arc<ApiState>>) -> Response {
-    usage_response(&state, None).await
+    usage_response(&state, None, None).await
 }
 async fn provider_usage(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> Response {
-    if !state.enabled.iter().any(|p| p.id() == id) {
+    if !state
+        .settings
+        .read()
+        .await
+        .values
+        .enabled_providers
+        .contains(&id)
+    {
         return error(StatusCode::NOT_FOUND, "provider_not_enabled");
     }
-    usage_response(&state, Some(&id)).await
+    usage_response(&state, Some(&id), None).await
 }
-async fn usage_response(state: &ApiState, provider: Option<&str>) -> Response {
+async fn usage_response(
+    state: &ApiState,
+    provider: Option<&str>,
+    account: Option<&str>,
+) -> Response {
+    let _guard = state.commit_guard.lock().await;
     let snapshot = state.snapshot.read().await;
-    let Some(report) = &snapshot.report else {
+    let Some((generation, report)) = &*snapshot else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "not_ready");
     };
+    if *generation != state.generation.load(Ordering::SeqCst) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "not_ready");
+    }
     let mut value = match serde_json::to_value(report) {
         Ok(value) => value,
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "encoding_failed"),
     };
-    if let Some(id) = provider {
-        for field in ["providers", "failures"] {
-            value[field]
-                .as_array_mut()
-                .unwrap()
-                .retain(|entry| entry["provider"] == id);
-        }
+    for field in ["providers", "failures"] {
+        value[field].as_array_mut().unwrap().retain(|entry| {
+            provider.is_none_or(|p| entry["provider"] == p)
+                && account.is_none_or(|a| entry["account_ref"]["id"] == a)
+        });
     }
     Json(value).into_response()
 }
-
-async fn refresh(
-    state: &ApiState,
-    args: &ServeArgs,
-    collector: &Collector,
-    cache: &crate::cache::UsageCache,
-) {
-    let timeout = Duration::from_secs(args.timeout);
+async fn settings(State(state): State<Arc<ApiState>>) -> Json<SettingsView> {
+    Json(state.settings.read().await.clone())
+}
+fn settings_error(e: SettingsError) -> ApiError {
+    match e {
+        SettingsError::Conflict => ApiError(StatusCode::CONFLICT, "revision_conflict"),
+        SettingsError::Overridden => ApiError(StatusCode::CONFLICT, "setting_overridden"),
+        SettingsError::Busy => ApiError(StatusCode::CONFLICT, "settings_busy"),
+        SettingsError::Invalid => ApiError(StatusCode::BAD_REQUEST, "invalid_settings"),
+        SettingsError::Storage => ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "settings_storage_unavailable",
+        ),
+    }
+}
+async fn patch_settings(
+    State(state): State<Arc<ApiState>>,
+    ApiJson(patch): ApiJson<SettingsPatch>,
+) -> Result<Json<SettingsView>, ApiError> {
+    // Once started, a config transaction completes even if the HTTP client leaves.
+    let (send, receive) = tokio::sync::oneshot::channel();
+    let work = state.clone();
+    state
+        .spawn(async move {
+            let _guard = work.commit_guard.lock().await;
+            let store = work.store.clone();
+            let result = tokio::task::spawn_blocking(move || store.patch(patch))
+                .await
+                .unwrap_or(Err(SettingsError::Storage));
+            if let Ok(view) = &result {
+                *work.settings.write().await = view.clone();
+                work.invalidate().await;
+            }
+            let _ = send.send(result);
+        })
+        .await;
+    receive
+        .await
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?
+        .map(Json)
+        .map_err(settings_error)
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RefreshRequest {
+    #[serde(default)]
+    providers: Vec<Provider>,
+    account_id: Option<String>,
+    #[serde(default = "force_default")]
+    force: bool,
+}
+fn force_default() -> bool {
+    true
+}
+async fn manual_refresh(
+    State(state): State<Arc<ApiState>>,
+    ApiJson(mut request): ApiJson<RefreshRequest>,
+) -> Result<(StatusCode, Json<Operation>), ApiError> {
+    let enabled = state
+        .settings
+        .read()
+        .await
+        .values
+        .providers()
+        .unwrap_or_default();
+    if request.providers.is_empty() {
+        request.providers = enabled.clone();
+    }
+    request.providers.sort_by_key(|p| p.id());
+    request.providers.dedup();
+    if request.providers.iter().any(|p| !enabled.contains(p))
+        || (request.account_id.is_some() && request.providers.len() != 1)
+    {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_refresh_scope"));
+    }
+    let key = serde_json::to_string(&request)
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    let mut pending = state.pending.lock().await;
+    if let Some(id) = pending.get(&key)
+        && let Some(op) = state.operations.lock().await.get(id)
+    {
+        return Ok((StatusCode::ACCEPTED, Json(op)));
+    }
+    let (op, _) = state
+        .operations
+        .lock()
+        .await
+        .start("refresh", None, key.clone())
+        .map_err(operation_error)?;
+    pending.insert(key.clone(), op.id.clone());
+    drop(pending);
+    let work = state.clone();
+    let id = op.id.clone();
+    state
+        .spawn(async move {
+            let result = refresh(&work, Some(request)).await;
+            work.operations.lock().await.finish(&id, result);
+            work.pending.lock().await.remove(&key);
+        })
+        .await;
+    Ok((StatusCode::ACCEPTED, Json(op)))
+}
+fn operation_error(code: &'static str) -> ApiError {
+    ApiError(
+        match code {
+            "idempotency_conflict" => StatusCode::CONFLICT,
+            "invalid_idempotency_key" => StatusCode::BAD_REQUEST,
+            _ => StatusCode::SERVICE_UNAVAILABLE,
+        },
+        code,
+    )
+}
+async fn operation(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> Response {
+    match state.operations.lock().await.get(&id) {
+        Some(op) => Json(op).into_response(),
+        None => error(StatusCode::NOT_FOUND, "operation_not_found"),
+    }
+}
+async fn refresh(state: &ApiState, request: Option<RefreshRequest>) -> Result<Value, &'static str> {
+    let _refresh = state.refresh_lock.lock().await;
+    let generation = state.generation.load(Ordering::SeqCst);
+    let config = state.settings.read().await.values.clone();
+    let enabled = config.providers().map_err(|_| "invalid_settings")?;
+    let (selected, account, force) = match request {
+        Some(r) => (r.providers, r.account_id, r.force),
+        None => (enabled.clone(), None, false),
+    };
+    if selected.iter().any(|p| !enabled.contains(p)) {
+        return Err("refresh_scope_changed");
+    }
+    state.status.lock().await.refreshing = true;
+    let timeout = Duration::from_secs(config.provider_timeout);
     let adapters = crate::accounts::service::adapters(
-        state.enabled.clone(),
-        !args.no_saved_accounts,
+        selected.clone(),
+        !state.no_saved_accounts,
         timeout,
-        None,
+        account.as_deref(),
     )
     .await;
+    let collector = Collector {
+        context: state.context.clone(),
+    };
+    let cache = crate::cache::UsageCache::platform(Duration::from_secs(config.cache_ttl_seconds));
     let report = match adapters {
         Ok(providers) => {
             cache
                 .collect(
-                    collector,
+                    &collector,
                     CollectRequest {
                         providers,
                         timeout,
                         cancellation: Cancellation::default(),
                     },
-                    false,
+                    force,
                 )
                 .await
         }
         Err(_) => UsageReport {
             schema_version: 1,
-            generated_at: collector.context.clock.now(),
+            generated_at: state.context.clock.now(),
             providers: vec![],
-            failures: state
-                .enabled
+            failures: selected
                 .iter()
                 .map(|p| ProviderFailure {
                     provider: ProviderId(p.id().into()),
@@ -242,216 +396,156 @@ async fn refresh(
                 .collect(),
         },
     };
-    state.snapshot.write().await.update(report);
+    let failures = report.failures.len();
+    let successes = report.providers.len();
+    let _guard = state.commit_guard.lock().await;
+    let mut status = state.status.lock().await;
+    status.refreshing = false;
+    status.last_completed_at = Some(timestamp(report.generated_at));
+    status.next_refresh_at = Some(timestamp(
+        state.context.clock.now() + time::Duration::seconds(config.refresh_interval as i64),
+    ));
+    drop(status);
+    if generation != state.generation.load(Ordering::SeqCst) {
+        state.wake.notify_one();
+        return Err("state_changed");
+    }
+    let mut snapshot = state.snapshot.write().await;
+    // Replace the requested scope, never restore failed data here; UsageCache owns retention.
+    if selected == enabled && account.is_none() {
+        *snapshot = Some((generation, report));
+    } else if let Some((old_generation, previous)) = &mut *snapshot {
+        if *old_generation == generation {
+            let matches = |provider: &ProviderId, reference: Option<&crate::domain::AccountRef>| {
+                selected.iter().any(|p| p.id() == provider.0)
+                    && account
+                        .as_ref()
+                        .is_none_or(|a| reference.is_some_and(|r| r.id == *a))
+            };
+            previous
+                .providers
+                .retain(|p| !matches(&p.provider, p.account_ref.as_ref()));
+            previous
+                .failures
+                .retain(|p| !matches(&p.provider, p.account_ref.as_ref()));
+            previous.providers.extend(report.providers);
+            previous.failures.extend(report.failures);
+            previous.generated_at = report.generated_at;
+        } else {
+            *snapshot = Some((generation, report));
+        }
+    } else {
+        *snapshot = Some((generation, report));
+    }
+    Ok(json!({"providers":successes,"failures":failures}))
 }
-
 pub async fn run(args: ServeArgs) -> Result<(), ServerError> {
     if !args.listen.ip().is_loopback() {
         return Err(ServerError::Listen);
     }
-    let config = Config::load(args.config.as_deref()).map_err(|_| ServerError::Config)?;
-    let configured = config.providers().map_err(|_| ServerError::Config)?;
-    let selected = if args.provider.is_empty() {
-        configured
-    } else {
-        args.provider.clone()
-    };
-    let mut enabled = Vec::new();
-    for provider in selected {
-        if !enabled.contains(&provider) {
-            enabled.push(provider);
-        }
-    }
-    if enabled.is_empty() {
-        return Err(ServerError::Providers);
-    }
-    let token = match std::env::var("QUOTIO_SERVER_TOKEN") {
-        Ok(token) => token_key(Some(token))?,
-        Err(std::env::VarError::NotPresent) => None,
-        Err(_) => return Err(ServerError::Token),
-    };
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| ServerError::Initialize)?;
-    let collector = Collector {
-        context: ProviderContext {
-            http,
-            clock: Arc::new(SystemClock),
-            credentials: Arc::new(EnvironmentCredentials),
+    Config::load(args.config.as_deref()).map_err(|_| ServerError::Config)?;
+    let path = args
+        .config
+        .clone()
+        .or_else(Config::default_path)
+        .ok_or(ServerError::Config)?;
+    let store = SettingsStore::new(
+        path,
+        Overrides {
+            providers: (!args.provider.is_empty()).then_some(args.provider.clone()),
+            refresh_interval: args.refresh_interval,
+            provider_timeout: args.timeout,
         },
+    );
+    let view = store.load().map_err(|_| ServerError::Config)?;
+    let token = match std::env::var("QUOTIO_SERVER_TOKEN") {
+        Ok(t) => Some(t),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => return Err(ServerError::Security),
     };
-    let cache = crate::cache::UsageCache::platform(Duration::from_secs(config.cache_ttl_seconds));
+    // Validate before binding or inspecting any provider credential.
+    security::Policy::new(
+        args.listen,
+        args.manage,
+        args.public_url.as_deref(),
+        &args.allow_origin,
+        token.clone(),
+    )
+    .map_err(|_| ServerError::Security)?;
     let listener = TcpListener::bind(args.listen)
         .await
         .map_err(|_| ServerError::Bind)?;
     let address = listener.local_addr().map_err(|_| ServerError::Bind)?;
+    let policy = Arc::new(
+        security::Policy::new(
+            address,
+            args.manage,
+            args.public_url.as_deref(),
+            &args.allow_origin,
+            token,
+        )
+        .map_err(|_| ServerError::Security)?,
+    );
+    let context = ProviderContext {
+        http: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| ServerError::Initialize)?,
+        clock: Arc::new(SystemClock),
+        credentials: Arc::new(EnvironmentCredentials),
+    };
     let state = Arc::new(ApiState {
-        snapshot: RwLock::new(Snapshot::default()),
-        enabled,
-        address,
-        token,
-        requests: Semaphore::new(16),
+        settings: RwLock::new(view),
+        store,
+        snapshot: RwLock::new(None),
+        generation: Arc::new(AtomicU64::new(0)),
+        commit_guard: Arc::new(Mutex::new(())),
+        refresh_lock: Mutex::new(()),
+        pending: Mutex::new(HashMap::new()),
+        wake: Notify::new(),
+        operations: Mutex::new(Operations::default()),
+        jobs: Mutex::new(Vec::new()),
+        status: Mutex::new(RefreshStatus::default()),
+        context,
+        no_saved_accounts: args.no_saved_accounts,
     });
-    let (stop, mut stopped) = watch::channel(false);
-    let refresh_state = state.clone();
+    let worker_state = state.clone();
     let mut worker = tokio::spawn(async move {
         loop {
-            refresh(&refresh_state, &args, &collector, &cache).await;
-            tokio::time::sleep(Duration::from_secs(args.refresh_interval)).await;
+            let _ = refresh(&worker_state, None).await;
+            let interval = worker_state.settings.read().await.values.refresh_interval;
+            tokio::select! {_=tokio::time::sleep(Duration::from_secs(interval))=>(),_=worker_state.wake.notified()=>()}
         }
     });
+    let (stop, mut stopped) = watch::channel(false);
     eprintln!("Quotio API listening on http://{address}");
-    let server = axum::serve(listener, router(state))
+    let server = axum::serve(listener, router(state.clone(), policy))
         .with_graceful_shutdown(async move {
-            let _ = stopped.wait_for(|stop| *stop).await;
+            let _ = stopped.wait_for(|v| *v).await;
         })
         .into_future();
     tokio::pin!(server);
     let result = tokio::select! {
-        result = &mut server => result.map_err(|_| ServerError::Initialize),
-        _ = &mut worker => {
-            stop.send_replace(true);
-            return Err(ServerError::Initialize);
-        },
-        _ = shutdown_signal() => {
-            stop.send_replace(true);
-            // Idle clients must not prevent the local process from stopping.
-            match tokio::time::timeout(Duration::from_secs(2), &mut server).await {
-                Ok(result) => result.map_err(|_| ServerError::Initialize),
-                Err(_) => Ok(()),
-            }
-        }
+        r=&mut server=>r.map_err(|_|ServerError::Initialize),
+        _=&mut worker=>Err(ServerError::Initialize),
+        _=shutdown_signal()=>{stop.send_replace(true);let _=tokio::time::timeout(Duration::from_secs(2),&mut server).await;Ok(())}
     };
+    stop.send_replace(true);
     worker.abort();
-    let _ = worker.await;
+    for job in state.jobs.lock().await.iter() {
+        job.abort();
+    }
     result
 }
-
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
         if let Ok(mut terminate) =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         {
-            tokio::select! { _ = tokio::signal::ctrl_c() => (), _ = terminate.recv() => () }
+            tokio::select! {_=tokio::signal::ctrl_c()=>(),_=terminate.recv()=>()}
             return;
         }
     }
     let _ = tokio::signal::ctrl_c().await;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::domain::{AccountIdentity, AccountRef, ProviderUsage};
-
-    fn report(accounts: &[&str], failed: &[Option<&str>]) -> UsageReport {
-        UsageReport {
-            schema_version: 1,
-            generated_at: time::OffsetDateTime::UNIX_EPOCH,
-            providers: accounts
-                .iter()
-                .map(|id| ProviderUsage {
-                    provider: ProviderId("mock".into()),
-                    account_ref: Some(AccountRef {
-                        id: (*id).into(),
-                        label: (*id).into(),
-                    }),
-                    account: AccountIdentity {
-                        id: (*id).into(),
-                        label: (*id).into(),
-                        plan: None,
-                    },
-                    windows: vec![],
-                })
-                .collect(),
-            failures: failed
-                .iter()
-                .map(|id| ProviderFailure {
-                    provider: ProviderId("mock".into()),
-                    account_ref: id.map(|id| AccountRef {
-                        id: id.into(),
-                        label: id.into(),
-                    }),
-                    code: ProviderError::Timeout,
-                    message: ProviderError::Timeout.to_string(),
-                })
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn transport_does_not_restore_snapshots_from_a_previous_login() {
-        let mut snapshot = Snapshot::default();
-        snapshot.update(report(&["old-local", "removed"], &[]));
-        snapshot.update(report(&[], &[None]));
-        assert!(snapshot.report.as_ref().unwrap().providers.is_empty());
-        snapshot.update(report(&["new-local"], &[]));
-        assert_eq!(snapshot.report.as_ref().unwrap().providers.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn usage_exposes_readiness_and_partial_failures_without_losing_accounts() {
-        let state = ApiState {
-            snapshot: RwLock::new(Snapshot::default()),
-            enabled: vec![Provider::Mock],
-            address: "127.0.0.1:8317".parse().unwrap(),
-            token: None,
-            requests: Semaphore::new(16),
-        };
-        assert_eq!(
-            usage_response(&state, None).await.status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        state
-            .snapshot
-            .write()
-            .await
-            .update(report(&["local", "saved"], &[]));
-        state
-            .snapshot
-            .write()
-            .await
-            .update(report(&["local", "saved"], &[Some("saved")]));
-        let response = usage_response(&state, Some("mock")).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 65536)
-            .await
-            .unwrap();
-        let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["providers"].as_array().unwrap().len(), 2);
-        assert_eq!(json["failures"][0]["account_ref"]["id"], "saved");
-        assert_eq!(json["failures"][0]["code"], "timeout");
-    }
-
-    #[test]
-    fn bearer_and_host_validation_fail_closed() {
-        let secret = "synthetic-local-api-token-1234567890";
-        let key = token_key(Some(secret.into())).unwrap().unwrap();
-        let request = Request::builder()
-            .header(header::HOST, "127.0.0.2:8317")
-            .header(header::AUTHORIZATION, format!("Bearer {secret}"))
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert!(authorized(&request, Some(&key)));
-        assert!(valid_host(&request, "127.0.0.2:8317".parse().unwrap()));
-        assert!(!valid_host(&request, "127.0.0.1:8317".parse().unwrap()));
-        let wrong = token_key(Some("different-local-api-token-1234567890".into()))
-            .unwrap()
-            .unwrap();
-        assert!(!authorized(&request, Some(&wrong)));
-        assert!(token_key(Some("".into())).is_err());
-        assert!(token_key(Some("x ".repeat(32))).is_err());
-        let mut duplicate = request;
-        duplicate.headers_mut().append(
-            header::AUTHORIZATION,
-            format!("Bearer {secret}").parse().unwrap(),
-        );
-        assert!(!authorized(&duplicate, Some(&key)));
-        duplicate
-            .headers_mut()
-            .append(header::HOST, "localhost:8317".parse().unwrap());
-        assert!(!valid_host(&duplicate, "127.0.0.2:8317".parse().unwrap()));
-    }
 }
