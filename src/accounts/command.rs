@@ -15,6 +15,16 @@ pub async fn run(
     }
     let vault = Vault::system()?;
     match command {
+        AccountCommand::Authorize { provider } => {
+            if provider != Provider::Antigravity {
+                return Err(AccountError::Unsupported);
+            }
+            crate::providers::antigravity_auth::authorize().await?;
+            Ok(
+                "Antigravity credentials are readable. Run quotio usage --provider antigravity.\n"
+                    .into(),
+            )
+        }
         AccountCommand::List { format } => {
             let accounts = service::list(vault).await?;
             match format {

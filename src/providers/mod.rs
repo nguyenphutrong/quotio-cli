@@ -1,5 +1,7 @@
 pub mod amp;
 pub mod antigravity;
+pub(crate) mod antigravity_auth;
+mod antigravity_local;
 pub mod codex;
 pub mod codex_api;
 pub mod factory;

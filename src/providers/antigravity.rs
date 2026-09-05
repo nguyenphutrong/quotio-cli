@@ -57,7 +57,7 @@ impl AntigravityProvider {
         Err(ProviderError::Authentication)
     }
 }
-#[derive(Deserialize, PartialEq)]
+#[derive(Clone, Deserialize, PartialEq)]
 struct Identity {
     id: String,
     email: String,
@@ -71,7 +71,7 @@ fn field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
 fn string(value: Option<&Value>) -> Option<&str> {
     value.and_then(Value::as_str).filter(|s| !s.is_empty())
 }
-fn fraction(value: Option<&Value>) -> Result<Option<f64>, ProviderError> {
+pub(super) fn fraction(value: Option<&Value>) -> Result<Option<f64>, ProviderError> {
     let Some(value) = value.filter(|v| !v.is_null()) else {
         return Ok(None);
     };
@@ -84,7 +84,7 @@ fn fraction(value: Option<&Value>) -> Result<Option<f64>, ProviderError> {
     }
     Ok(Some(n))
 }
-fn window(
+pub(super) fn window(
     label: String,
     remaining: Option<f64>,
     reset: Option<&Value>,
@@ -191,35 +191,137 @@ fn models(value: Value, now: OffsetDateTime) -> Result<Vec<QuotaWindow>, Provide
     }
     Ok(windows)
 }
+fn quota_buckets(value: Value, now: OffsetDateTime) -> Result<Vec<QuotaWindow>, ProviderError> {
+    let buckets = value
+        .get("buckets")
+        .and_then(Value::as_array)
+        .ok_or(ProviderError::InvalidData)?;
+    let mut windows = Vec::new();
+    for bucket in buckets {
+        let label = string(bucket.get("modelId")).ok_or(ProviderError::InvalidData)?;
+        windows.push(window(
+            label.into(),
+            fraction(bucket.get("remainingFraction"))?,
+            bucket.get("resetTime"),
+            "antigravity_api_quota",
+            now,
+        )?);
+    }
+    if windows.is_empty() || windows.iter().all(|w| w.quota == Quota::Unknown) {
+        return Err(ProviderError::QuotaUnavailable);
+    }
+    Ok(windows)
+}
+async fn quota_json<T: serde::de::DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+    now: OffsetDateTime,
+) -> Result<T, ProviderError> {
+    let response = request.send().await.map_err(|error| {
+        if error.is_timeout() {
+            ProviderError::Timeout
+        } else {
+            ProviderError::Transient
+        }
+    })?;
+    // Userinfo already authenticated this token. A quota endpoint can deny scope
+    // while other quota endpoints remain available; refreshing will not grant it.
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        return Err(ProviderError::QuotaUnavailable);
+    }
+    http::json_response(response, now).await
+}
 impl AntigravityProvider {
+    #[cfg(test)]
     async fn fetch_api(
         &self,
         context: &ProviderContext,
         base: &str,
         user_info: &str,
     ) -> Result<ProviderUsage, ProviderError> {
-        let token = self.token(context)?;
+        self.fetch_api_for_account(context, base, user_info, &mut None)
+            .await
+    }
+    async fn fetch_api_for_account(
+        &self,
+        context: &ProviderContext,
+        base: &str,
+        user_info: &str,
+        expected: &mut Option<Identity>,
+    ) -> Result<ProviderUsage, ProviderError> {
+        let explicit = context
+            .credentials
+            .get("ANTIGRAVITY_ACCESS_TOKEN")
+            .is_some()
+            || context.credentials.get("ANTIGRAVITY_AUTH_FILE").is_some();
+        if explicit {
+            return self
+                .fetch_with_token(context, base, user_info, &self.token(context)?, expected)
+                .await;
+        }
+        let mut session = super::antigravity_auth::Session::load(
+            std::sync::Arc::new(super::antigravity_auth::NativeStore),
+            context,
+        )
+        .await?;
+        let mut result = self
+            .fetch_with_token(context, base, user_info, &session.token, expected)
+            .await;
+        if matches!(result, Err(ProviderError::Authentication)) {
+            session.retry_auth(context).await?;
+            result = self
+                .fetch_with_token(context, base, user_info, &session.token, expected)
+                .await;
+        }
+        if result.is_ok() {
+            session.verify().await?;
+        }
+        result
+    }
+    async fn fetch_with_token(
+        &self,
+        context: &ProviderContext,
+        base: &str,
+        user_info: &str,
+        token: &Secret,
+        expected: &mut Option<Identity>,
+    ) -> Result<ProviderUsage, ProviderError> {
         let authorization = http::sensitive(&format!("Bearer {}", token.0))?;
-        let before: Identity = http::json(
+        let before: Result<Identity, _> = http::json(
             context
                 .http
                 .get(user_info)
                 .header("Authorization", authorization.clone()),
             context.clock.now(),
         )
-        .await?;
+        .await;
+        tracing::debug!(result = ?before.as_ref().map(|_| ()), "Antigravity userinfo response");
+        let before = before?;
         if !identity_valid(&before) {
             return Err(ProviderError::InvalidData);
         }
+        if expected
+            .as_ref()
+            .is_some_and(|previous| previous != &before)
+        {
+            return Err(ProviderError::Authentication);
+        }
+        *expected = Some(before.clone());
         let post = |method: &str, payload: Value| {
             context
                 .http
                 .post(format!("{base}{method}"))
                 .header("Authorization", authorization.clone())
-                .header("User-Agent", "quotio-cli/0.1.0")
+                .header(
+                    "User-Agent",
+                    if matches!(method, "loadCodeAssist" | "retrieveUserQuota") {
+                        "agy"
+                    } else {
+                        "antigravity"
+                    },
+                )
                 .json(&payload)
         };
-        let subscription: Result<Value, _> = http::json(
+        let subscription: Result<Value, _> = quota_json(
             post(
                 "loadCodeAssist",
                 json!({"metadata":{"ideType":"ANTIGRAVITY"}}),
@@ -227,9 +329,14 @@ impl AntigravityProvider {
             context.clock.now(),
         )
         .await;
+        tracing::debug!(result = ?subscription.as_ref().map(|_| ()), "Antigravity subscription response");
         let subscription = match subscription {
             Ok(value) => value,
-            Err(ProviderError::Unavailable | ProviderError::InvalidData) => json!({}),
+            Err(
+                ProviderError::Unavailable
+                | ProviderError::InvalidData
+                | ProviderError::QuotaUnavailable,
+            ) => json!({}),
             Err(error) => return Err(error),
         };
         let project = subscription.get("cloudaicompanionProject");
@@ -249,7 +356,8 @@ impl AntigravityProvider {
         let mut selected = None;
         for body in attempts {
             let result: Result<Value, _> =
-                http::json(post("retrieveUserQuotaSummary", body), context.clock.now()).await;
+                quota_json(post("retrieveUserQuotaSummary", body), context.clock.now()).await;
+            tracing::debug!(result = ?result.as_ref().map(|_| ()), "Antigravity quota summary response");
             match result {
                 Ok(value) => {
                     if let Ok(windows) = summary(&value, context.clock.now()) {
@@ -257,16 +365,34 @@ impl AntigravityProvider {
                         break;
                     }
                 }
-                Err(ProviderError::Unavailable | ProviderError::InvalidData) => (),
+                Err(
+                    ProviderError::Unavailable
+                    | ProviderError::InvalidData
+                    | ProviderError::QuotaUnavailable,
+                ) => (),
                 Err(error) => return Err(error),
             }
         }
         let windows = match selected {
             Some(windows) => windows,
-            None => models(
-                http::json(post("fetchAvailableModels", payload), context.clock.now()).await?,
-                context.clock.now(),
-            )?,
+            None => {
+                let result = quota_json(
+                    post("fetchAvailableModels", payload.clone()),
+                    context.clock.now(),
+                )
+                .await;
+                let model_windows = match result {
+                    Ok(value) => Some(models(value, context.clock.now())?),
+                    Err(ProviderError::QuotaUnavailable | ProviderError::Unavailable) => None,
+                    Err(error) => return Err(error),
+                };
+                // The catalog can advertise every model as full even when quota
+                // access is denied. Require a quota response to corroborate it.
+                match model_windows {
+                    Some(windows) if windows.iter().any(|w| matches!(w.quota, Quota::Exhausted { used_percent, .. } | Quota::Available { used_percent, .. } if used_percent > 0.0)) => windows,
+                    _ => quota_buckets(quota_json(post("retrieveUserQuota", payload), context.clock.now()).await?, context.clock.now())?,
+                }
+            }
         };
         Ok(ProviderUsage {
             account_ref: None,
@@ -285,14 +411,65 @@ impl ProviderAdapter for AntigravityProvider {
         ProviderId("antigravity".into())
     }
     fn idempotent(&self) -> bool {
-        true
+        // Fetch may exchange a native refresh token. Do not replay the whole
+        // operation after an uncertain OAuth response.
+        false
     }
     fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
-        Box::pin(self.fetch_api(
-            context,
-            BASE,
-            "https://www.googleapis.com/oauth2/v2/userinfo",
-        ))
+        Box::pin(async move {
+            let mut expected = None;
+            let mut last = ProviderError::QuotaUnavailable;
+            for base in [
+                "https://daily-cloudcode-pa.googleapis.com/v1internal:",
+                BASE,
+            ] {
+                match self
+                    .fetch_api_for_account(
+                        context,
+                        base,
+                        "https://www.googleapis.com/oauth2/v2/userinfo",
+                        &mut expected,
+                    )
+                    .await
+                {
+                    Ok(usage) => return Ok(usage),
+                    Err(error) => {
+                        last = error;
+                        if !matches!(
+                            error,
+                            ProviderError::QuotaUnavailable | ProviderError::Unavailable
+                        ) {
+                            break;
+                        }
+                    }
+                }
+            }
+            if context
+                .credentials
+                .get("ANTIGRAVITY_ACCESS_TOKEN")
+                .is_some()
+                || context.credentials.get("ANTIGRAVITY_AUTH_FILE").is_some()
+                || matches!(
+                    last,
+                    ProviderError::RateLimited
+                        | ProviderError::Cancelled
+                        | ProviderError::InvalidData
+                )
+            {
+                return Err(last);
+            }
+            tracing::debug!("Trying Antigravity local service fallback");
+            match super::antigravity_local::fetch(
+                context,
+                expected.as_ref().map(|i| (i.id.as_str(), i.email.as_str())),
+            )
+            .await
+            {
+                Ok(usage) => Ok(usage),
+                Err(ProviderError::Unavailable) => Err(last),
+                Err(error) => Err(error),
+            }
+        })
     }
 }
 #[cfg(test)]
@@ -467,6 +644,68 @@ mod tests {
             assert_eq!(result.unwrap_err(), expected);
             assert_eq!(task.await.unwrap().len(), 2);
         }
+    }
+    #[tokio::test]
+    async fn denied_summary_falls_back_but_full_catalog_requires_quota_evidence() {
+        for (fraction, quota_response, expected) in [
+            (0.5, None, Ok(50.0)),
+            (
+                1.0,
+                Some((403, json!({}))),
+                Err(ProviderError::QuotaUnavailable),
+            ),
+            (
+                1.0,
+                Some((
+                    200,
+                    json!({"buckets":[{"modelId":"test-model","remainingFraction":0.75}]}),
+                )),
+                Ok(25.0),
+            ),
+        ] {
+            let mut responses = vec![
+                (200, json!({"id":"test-id","email":"test@example.invalid"})),
+                (200, json!({})),
+                (403, json!({})),
+                (
+                    200,
+                    json!({"models":{"test-model":{"quotaInfo":{"remainingFraction":fraction}}}}),
+                ),
+            ];
+            if let Some(response) = quota_response {
+                responses.push(response);
+            }
+            let count = responses.len();
+            let (base, task) = http::fixture::server_status(responses).await;
+            let result = AntigravityProvider
+                .fetch_api(
+                    &http::fixture::context(),
+                    &format!("{base}/v1internal:"),
+                    &format!("{base}/userinfo"),
+                )
+                .await;
+            match expected {
+                Ok(used) => assert_eq!(
+                    result.unwrap().windows[0].quota,
+                    Quota::from_used(Some(used))
+                ),
+                Err(error) => assert_eq!(result.unwrap_err(), error),
+            }
+            assert_eq!(task.await.unwrap().len(), count);
+        }
+    }
+    #[test]
+    fn quota_buckets_preserve_missing_fraction() {
+        let windows = quota_buckets(
+            json!({"buckets":[{"modelId":"first","remainingFraction":0.5},{"modelId":"second"}]}),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        assert_eq!(windows[1].quota, Quota::Unknown);
+        assert_eq!(
+            quota_buckets(json!({"buckets":[]}), OffsetDateTime::UNIX_EPOCH).unwrap_err(),
+            ProviderError::QuotaUnavailable
+        );
     }
     #[test]
     fn credential_files_are_bounded_and_never_rewritten() {

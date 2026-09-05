@@ -7,11 +7,11 @@ A standalone Rust CLI for provider quota reports. The CLI supports `mock`, `code
 | --- | --- | --- |
 | Codex / ChatGPT | Saved OAuth + direct API; installed CLI fallback | OAuth/direct API tested offline; CLI live read previously passed |
 | Amp | Saved/environment/local API key + direct API; CLI fallback | Live API and parser verified |
-| Antigravity | Direct Google quota API, following the main Quotio project | Offline tests passed; live token use awaiting approval |
+| Antigravity | Direct Google API with native Keychain auth; running-app fallback | Native auth/refresh verified; local quota matched OpenUsage |
 | Factory Droid | Saved API key or environment key + direct API | Offline tests passed; user key validation needed |
 | Mock | Fixed fixture | Offline tests passed |
 
-Antigravity does not use the app's local service or require the app to be running.
+Antigravity can use the running app's local service when direct API quota is unavailable.
 See [provider contracts](plans/20260905-first-live-provider/) for source evidence.
 
 ## Run
@@ -199,12 +199,45 @@ Missing executables or unsupported output become per-provider failures.
 
 ## Other credential sources
 
-Antigravity reads `ANTIGRAVITY_ACCESS_TOKEN`, or the `access_token` field in the JSON
-file selected by `ANTIGRAVITY_AUTH_FILE`. One of these must be set; the CLI does
-not search local credential directories. It obtains identity from Google userinfo and
-calls Google quota APIs with the same token. File contents are never rewritten.
-This version does not refresh tokens, scrape native SQLite/keychain stores or start
-a login flow. Refresh an expired token through its existing login owner.
+Antigravity uses `ANTIGRAVITY_ACCESS_TOKEN` first, then the `access_token` field
+in the JSON file selected by `ANTIGRAVITY_AUTH_FILE`. On macOS, without either
+explicit source, it reads the existing Antigravity login from Keychain
+(service `gemini`, account `antigravity`) and calls Google's quota APIs directly.
+The direct API route does not require a running app. If it cannot provide quota,
+Quotio can fall back to the running Antigravity app's local language server.
+This fallback does not run for explicitly supplied environment/file credentials,
+so it cannot silently select a different account. No browser cookies are used.
+
+If Keychain access is blocked, authorize it once from the signed CLI:
+
+```sh
+cargo run -- accounts authorize --provider antigravity
+cargo run -- usage --provider antigravity --format text
+```
+
+The authorize command allows macOS to show its Keychain permission dialog. Choose
+Always Allow if you want subsequent usage checks to read the login without asking.
+Keep using the same signing identity. The `usage` command never opens that dialog;
+it reports an actionable error when the credential store cannot be read.
+
+Expired native access tokens are refreshed through Google OAuth using client
+configuration discovered from the installed Antigravity app. An unrecognized or
+ambiguous app layout stops refresh. Quotio stores only the derived access token
+in its own Keychain item, bound to the current login. It checks the original login
+before using cached tokens and before returning quota. Antigravity's credential
+values are never rewritten. Explicit environment/file tokens are not refreshed.
+A missing quota remains unknown; missing windows are not invented. If the models
+endpoint reports every quota as full, Quotio requires confirmation from
+`retrieveUserQuota` before displaying those limits. If confirmation is denied,
+it reports `quota_unavailable`. This conservative check can also hide genuinely
+unused or newly reset quotas. An all-full response alone does not prove that the
+values are defaults. Both the daily and stable Google Cloud Code hosts are tried
+when quota endpoints are unavailable. The native-session route then tries local
+`RetrieveUserQuotaSummary`, with source `antigravity_local_service`. It verifies
+the process and its IPv4 listening port, checks the local account before and after
+reading quota, and matches the Google account when already known. Only returned
+windows appear, using Session, Weekly, Claude Session and Claude Weekly labels.
+The app must already be running; Quotio does not launch it or `agy`.
 
 Without a saved account, Factory uses `FACTORY_API_KEY`. Optional `FACTORY_REGION` is `global`
 or `eu`; `FACTORY_ORG_ID` selects the organization. The adapter validates user and
@@ -216,7 +249,9 @@ acceptance has not yet been validated live.
 Set credentials through your existing environment/secret manager. Do not put them
 in TOML, shell command arguments, fixture files or bug reports. See the contract
 notes for the exact authenticated destinations. Remote HTTP uses normal TLS and
-disables redirects; no self-signed local-service client remains.
+disables redirects. A separate Antigravity loopback client accepts the local service's
+self-signed certificate only at a verified process-owned IPv4 port. That client
+cannot follow redirects, use a proxy, or send OAuth tokens.
 
 ## Output contract
 

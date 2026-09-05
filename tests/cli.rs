@@ -320,3 +320,17 @@ fn account_selector_requires_one_provider_and_conflicts_with_skip_vault() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
 }
+
+#[test]
+fn authorize_help_is_available_without_accessing_keychain() {
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_quotio"))
+        .args(["accounts", "authorize", "--help"])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert!(
+        String::from_utf8(result.stdout)
+            .unwrap()
+            .contains("--provider")
+    );
+}

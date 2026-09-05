@@ -17,13 +17,19 @@ pub(crate) async fn json<T: DeserializeOwned>(
     request: RequestBuilder,
     now: OffsetDateTime,
 ) -> Result<T, ProviderError> {
-    let mut response = request.send().await.map_err(|error| {
+    let response = request.send().await.map_err(|error| {
         if error.is_timeout() {
             ProviderError::Timeout
         } else {
             ProviderError::Transient
         }
     })?;
+    json_response(response, now).await
+}
+pub(crate) async fn json_response<T: DeserializeOwned>(
+    mut response: reqwest::Response,
+    now: OffsetDateTime,
+) -> Result<T, ProviderError> {
     match response.status().as_u16() {
         200..=299 => (),
         401 | 403 => return Err(ProviderError::Authentication),

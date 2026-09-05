@@ -91,6 +91,11 @@ pub struct AccountsArgs {
 }
 #[derive(Debug, Subcommand)]
 pub enum AccountCommand {
+    /// Allow Keychain to ask for access to the local Antigravity login
+    Authorize {
+        #[arg(long, value_enum)]
+        provider: Provider,
+    },
     /// Validate and save a new account in the OS credential store
     Add {
         #[arg(long, value_enum)]
