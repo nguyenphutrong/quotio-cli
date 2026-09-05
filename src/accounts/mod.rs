@@ -25,6 +25,8 @@ pub enum AccountError {
     Unsupported,
     #[error("credential input is empty, too large, or invalid")]
     Input,
+    #[error("enter the API key in a terminal without --token-stdin, or pipe it with --token-stdin")]
+    InputMode,
     #[error("credential validation failed: {0}")]
     Provider(#[from] ProviderError),
     #[error("login timed out or was cancelled")]

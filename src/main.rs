@@ -86,8 +86,10 @@ async fn run() -> ExitCode {
                 credentials: Arc::new(EnvironmentCredentials),
             };
             let result = tokio::select! {
-                result=tokio::time::timeout(Duration::from_secs(180),quotio::accounts::command::run(args.command,&context))=>result.unwrap_or(Err(quotio::accounts::AccountError::Cancelled)),
+                // Register Ctrl-C before an account command can disable terminal echo.
+                biased;
                 _=tokio::signal::ctrl_c()=>Err(quotio::accounts::AccountError::Cancelled),
+                result=tokio::time::timeout(Duration::from_secs(180),quotio::accounts::command::run(args.command,&context))=>result.unwrap_or(Err(quotio::accounts::AccountError::Cancelled)),
             };
             match result {
                 Ok(text) => (text, 0),

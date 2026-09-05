@@ -65,10 +65,132 @@ pub async fn read_stdin() -> Result<String, AccountError> {
         Err(AccountError::Unsupported)
     }
 }
+#[cfg(unix)]
+struct HiddenEcho {
+    file: std::fs::File,
+    original: libc::termios,
+}
+#[cfg(unix)]
+impl HiddenEcho {
+    fn new(file: &std::fs::File) -> Result<Self, AccountError> {
+        use std::os::fd::AsRawFd;
+        let file = file.try_clone().map_err(|_| AccountError::Input)?;
+        let fd = file.as_raw_fd();
+        let mut original = std::mem::MaybeUninit::uninit();
+        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
+            return Err(AccountError::Input);
+        }
+        let original = unsafe { original.assume_init() };
+        let mut hidden = original;
+        hidden.c_lflag &= !(libc::ECHO | libc::ECHONL);
+        // Keep Ctrl-C active, but prevent job-control suspension from leaving
+        // the user's terminal with echo disabled while this prompt is paused.
+        hidden.c_cc[libc::VSUSP] = libc::_POSIX_VDISABLE as libc::cc_t;
+        hidden.c_cc[libc::VQUIT] = libc::_POSIX_VDISABLE as libc::cc_t;
+        #[cfg(target_os = "macos")]
+        {
+            hidden.c_cc[libc::VDSUSP] = libc::_POSIX_VDISABLE as libc::cc_t;
+        }
+        if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &hidden) } != 0 {
+            return Err(AccountError::Input);
+        }
+        Ok(Self { file, original })
+    }
+}
+#[cfg(unix)]
+impl Drop for HiddenEcho {
+    fn drop(&mut self) {
+        use std::{io::Write, os::fd::AsRawFd};
+        // Flush unread pasted input before returning control to the shell.
+        unsafe { libc::tcsetattr(self.file.as_raw_fd(), libc::TCSAFLUSH, &self.original) };
+        let _ = writeln!(std::io::stderr());
+    }
+}
+#[cfg(unix)]
+async fn read_hidden(fd: std::os::fd::RawFd, provider: &str) -> Result<String, AccountError> {
+    use std::io::Write;
+    let input = Input::new(fd)?;
+    let _echo = HiddenEcho::new(&input.file)?;
+    let mut stderr = std::io::stderr();
+    write!(stderr, "{provider} API key (hidden): ")
+        .and_then(|_| stderr.flush())
+        .map_err(|_| AccountError::Input)?;
+    input.read().await
+}
+
+pub async fn read_api_key(provider: &str, token_stdin: bool) -> Result<String, AccountError> {
+    use std::io::IsTerminal;
+    match (token_stdin, std::io::stdin().is_terminal()) {
+        (true, false) => read_stdin().await,
+        (false, true) => {
+            #[cfg(unix)]
+            {
+                read_hidden(libc::STDIN_FILENO, provider).await
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = provider;
+                Err(AccountError::Unsupported)
+            }
+        }
+        _ => Err(AccountError::InputMode),
+    }
+}
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::fd::{AsRawFd, FromRawFd};
+    #[tokio::test]
+    async fn hidden_prompt_timeout_restores_terminal_state() {
+        let mut fds = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut fds[0],
+                    &mut fds[1],
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let _master = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let slave = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        for fd in fds {
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
+        let mut before = std::mem::MaybeUninit::uninit();
+        assert_eq!(
+            unsafe { libc::tcgetattr(slave.as_raw_fd(), before.as_mut_ptr()) },
+            0
+        );
+        let before = unsafe { before.assume_init() };
+        let flags = unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) };
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(40),
+                read_hidden(slave.as_raw_fd(), "Test")
+            )
+            .await
+            .is_err()
+        );
+        let mut after = std::mem::MaybeUninit::uninit();
+        assert_eq!(
+            unsafe { libc::tcgetattr(slave.as_raw_fd(), after.as_mut_ptr()) },
+            0
+        );
+        let after = unsafe { after.assume_init() };
+        assert_eq!(before.c_lflag, after.c_lflag);
+        assert_eq!(before.c_cc, after.c_cc);
+        assert_eq!(
+            unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) },
+            flags
+        );
+    }
     #[tokio::test]
     async fn stalled_pipe_is_cancellable_and_flags_are_restored() {
         let mut fds = [0; 2];

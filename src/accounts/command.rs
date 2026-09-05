@@ -4,7 +4,6 @@ use crate::{
     providers::ProviderContext,
 };
 use clap::ValueEnum;
-use std::io::IsTerminal;
 
 pub async fn run(
     command: AccountCommand,
@@ -78,11 +77,13 @@ pub async fn run(
                 Provider::Codex if !token_stdin => {
                     super::oauth::login(context, !no_browser).await?
                 }
-                Provider::Amp | Provider::Factory if token_stdin && !no_browser => {
-                    if std::io::stdin().is_terminal() {
-                        return Err(AccountError::Input);
-                    }
-                    let token = super::input::read_stdin().await?;
+                Provider::Amp | Provider::Factory if !no_browser => {
+                    let name = if provider == Provider::Amp {
+                        "Amp"
+                    } else {
+                        "Factory"
+                    };
+                    let token = super::input::read_api_key(name, token_stdin).await?;
                     let token = token.trim();
                     if token.is_empty()
                         || token.len() > 16384

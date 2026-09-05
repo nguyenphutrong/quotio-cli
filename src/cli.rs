@@ -103,7 +103,7 @@ pub enum AccountCommand {
         /// Override the default email or masked API-key label
         #[arg(long)]
         label: Option<String>,
-        /// Read an Amp or Factory API key from a pipe; never put secrets in arguments
+        /// Read an Amp or Factory API key from a pipe instead of the hidden terminal prompt
         #[arg(long)]
         token_stdin: bool,
         /// Print the Codex sign-in URL without opening a browser

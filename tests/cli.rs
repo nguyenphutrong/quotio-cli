@@ -334,3 +334,186 @@ fn authorize_help_is_available_without_accessing_keychain() {
             .contains("--provider")
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn api_key_prompt_hides_input_and_restores_terminal_on_error_or_ctrl_c() {
+    use std::{
+        io::{Read, Write},
+        os::fd::{AsRawFd, FromRawFd},
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    struct Terminal {
+        child: std::process::Child,
+        master: std::fs::File,
+        slave: std::fs::File,
+    }
+    impl Drop for Terminal {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+    fn attributes(file: &std::fs::File) -> libc::termios {
+        let mut value = std::mem::MaybeUninit::uninit();
+        assert_eq!(
+            unsafe { libc::tcgetattr(file.as_raw_fd(), value.as_mut_ptr()) },
+            0
+        );
+        unsafe { value.assume_init() }
+    }
+    for (provider, cancel) in [("amp", false), ("amp", true), ("factory", false)] {
+        let mut fds = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut fds[0],
+                    &mut fds[1],
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let master = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let slave = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        for fd in fds {
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
+        assert_eq!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+            0
+        );
+        let before = attributes(&slave);
+        let flags = unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) };
+        let child = Command::new(env!("CARGO_BIN_EXE_quotio"))
+            .args(["accounts", "add", "--provider", provider])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        let mut terminal = Terminal {
+            child,
+            master,
+            slave,
+        };
+        let mut output = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut buffer = [0; 1024];
+            match terminal.master.read(&mut buffer) {
+                Ok(n) => output.extend_from_slice(&buffer[..n]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (),
+                result => panic!("PTY read failed: {result:?}"),
+            }
+            if String::from_utf8_lossy(&output).contains("API key (hidden):") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "prompt missing: {}",
+                String::from_utf8_lossy(&output)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let during_flags = unsafe { libc::fcntl(terminal.slave.as_raw_fd(), libc::F_GETFL) };
+        let during = attributes(&terminal.slave);
+        assert_eq!(during.c_lflag & (libc::ECHO | libc::ECHONL), 0);
+        assert_eq!(
+            during.c_cc[libc::VQUIT],
+            libc::_POSIX_VDISABLE as libc::cc_t
+        );
+        assert_eq!(
+            during.c_cc[libc::VSUSP],
+            libc::_POSIX_VDISABLE as libc::cc_t
+        );
+        if cancel {
+            terminal.master.write_all(b"synthetic-hidden").unwrap();
+            assert_eq!(
+                unsafe { libc::kill(terminal.child.id() as i32, libc::SIGINT) },
+                0
+            );
+        } else {
+            // Internal tab makes this synthetic key invalid before network/Keychain.
+            terminal
+                .master
+                .write_all(b"synthetic-hidden\tkey\n")
+                .unwrap();
+        }
+        let exit = loop {
+            if let Some(status) = terminal.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "command did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        loop {
+            let mut buffer = [0; 1024];
+            match terminal.master.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => output.extend_from_slice(&buffer[..n]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                result => panic!("PTY read failed: {result:?}"),
+            }
+        }
+        assert_eq!(exit.code(), Some(2));
+        let after = attributes(&terminal.slave);
+        assert_eq!(after.c_lflag, before.c_lflag);
+        assert_eq!(after.c_cc, before.c_cc);
+        assert_eq!(
+            unsafe { libc::fcntl(terminal.slave.as_raw_fd(), libc::F_GETFL) },
+            // Process startup can add unrelated flags before the prompt begins.
+            (during_flags & !libc::O_NONBLOCK) | (flags & libc::O_NONBLOCK)
+        );
+        let text = String::from_utf8_lossy(&output);
+        assert!(!text.contains("synthetic-hidden"));
+        assert!(
+            text.contains(if cancel {
+                "cancelled"
+            } else {
+                "credential input"
+            }),
+            "{text}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn api_key_pipe_requires_flag_and_preserves_validation() {
+    use std::{io::Write, process::Stdio};
+    for token_stdin in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_quotio"));
+        command.args(["accounts", "add", "--provider", "amp"]);
+        if token_stdin {
+            command.arg("--token-stdin");
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _ = child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"synthetic-hidden\tkey\n");
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let message = String::from_utf8(output.stderr).unwrap();
+        assert!(!message.contains("synthetic-hidden"));
+        assert!(message.contains(if token_stdin {
+            "credential input"
+        } else {
+            "--token-stdin"
+        }));
+    }
+}

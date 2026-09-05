@@ -105,7 +105,11 @@ never printed or logged.
 # Codex opens the official sign-in page. No Codex CLI is required.
 cargo run -- accounts add --provider codex
 
-# Keys come from your existing secret-manager environment, never command arguments.
+# Amp and Factory prompt for a hidden API key in a terminal.
+cargo run -- accounts add --provider amp
+cargo run -- accounts add --provider factory
+
+# Scripts can pipe keys from an existing secret-manager environment.
 printenv AMP_API_KEY | cargo run -- accounts add --provider amp --token-stdin
 printenv FACTORY_API_KEY | cargo run -- accounts add --provider factory --token-stdin
 
@@ -127,8 +131,11 @@ Login uses PKCE, state and nonce validation, then reads quota before saving. It 
 a 180-second budget and supports Ctrl-C. No browser cookies are read.
 
 For Factory, `--region global|eu` and `--organization <id>` may be supplied during
-Add account. Amp/Factory accept one key line from a pipe, not an interactive visible
-prompt. A failed validation or save does not create an account.
+Add account. Amp/Factory prompt for a hidden key when stdin is a terminal. Press
+Enter to submit or Ctrl-C to cancel. Terminal echo is restored on completion,
+cancellation or timeout. Scripts must pass `--token-stdin` to read one key line
+from a pipe. Keys are never accepted as command arguments. A failed validation or
+save does not create an account.
 
 The first saved account for each provider becomes active. Additional accounts are
 saved without changing the selection; use `accounts use` to select them. Removing
