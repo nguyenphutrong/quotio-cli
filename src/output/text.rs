@@ -49,10 +49,18 @@ pub fn render(report: &UsageReport) -> String {
                 } => format!("used {used_percent:.1}%; remaining {remaining_percent:.1}%"),
                 Quota::Exhausted { .. } => "exhausted; used 100.0%; remaining 0.0%".into(),
             };
-            let reset = if balance_only && window.resets_at.is_none() {
+            let reset = if window.resets_at.is_some() {
+                format!("; reset {}", timestamp(window.resets_at))
+            } else if let Some(description) = window
+                .reset_description
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+            {
+                format!("; reset {}", safe(description))
+            } else if balance_only {
                 String::new()
             } else {
-                format!("; reset {}", timestamp(window.resets_at))
+                "; reset unknown".into()
             };
             let _ = writeln!(
                 text,

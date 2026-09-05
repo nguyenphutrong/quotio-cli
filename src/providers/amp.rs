@@ -48,8 +48,10 @@ fn window(
     quota: Quota,
     amounts: Option<QuotaAmounts>,
     now: OffsetDateTime,
+    reset_description: Option<String>,
 ) -> QuotaWindow {
     QuotaWindow {
+        reset_description,
         label: label.into(),
         provenance: Provenance {
             source: "amp_cli_usage".into(),
@@ -64,6 +66,46 @@ fn window(
         resets_at: None,
         fetched_at: now,
     }
+}
+fn reset_description(text: &str) -> Option<String> {
+    if text.contains("(resets daily)") {
+        return Some("daily".into());
+    }
+    if let Some((_, rest)) = text.split_once("resets upon renewal in ") {
+        let mut words = rest.split_whitespace();
+        if let (Some(count), Some(unit)) = (words.next(), words.next()) {
+            let unit = unit.trim_end_matches([',', '.']);
+            if count.bytes().all(|c| c.is_ascii_digit())
+                && count.parse::<u32>().is_ok()
+                && matches!(
+                    unit,
+                    "minute"
+                        | "minutes"
+                        | "hour"
+                        | "hours"
+                        | "day"
+                        | "days"
+                        | "week"
+                        | "weeks"
+                        | "month"
+                        | "months"
+                        | "year"
+                        | "years"
+                )
+            {
+                return Some(format!("upon renewal in {count} {unit}"));
+            }
+        }
+    }
+    let (_, period) = text.split_once(" - period ")?;
+    let (_, end) = period.split_once(" to ")?;
+    let date = end.split_whitespace().next()?.trim_end_matches(',');
+    time::Date::parse(
+        date,
+        time::macros::format_description!("[year]-[month]-[day]"),
+    )
+    .ok()?;
+    Some(format!("billing period ends {date} (timezone unspecified)"))
 }
 fn balance(input: &str, unit: &str) -> Result<QuotaAmounts, ProviderError> {
     let (remaining, rest) = input.split_once(unit).ok_or(ProviderError::InvalidData)?;
@@ -126,6 +168,7 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
                 Quota::from_remaining(Some(percent(rest)?)),
                 None,
                 now,
+                reset_description(rest),
             ));
         } else if let Some(rest) = line.strip_prefix("Amp Megawatt Subscription: agent usage ") {
             let amounts = dollars(rest)?;
@@ -134,6 +177,7 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
                 quota(&amounts),
                 Some(amounts),
                 now,
+                reset_description(rest),
             ));
             if let Some((_, rest)) = rest.split_once(", orb usage ") {
                 let amounts = balance(rest, "h")?;
@@ -142,6 +186,7 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
                     quota(&amounts),
                     Some(amounts),
                     now,
+                    reset_description(rest),
                 ));
             }
         } else if let Some(rest) = line.strip_prefix("Individual credits: ") {
@@ -151,6 +196,7 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
                 Quota::Unknown,
                 Some(amounts),
                 now,
+                None,
             ));
         } else if let Some(rest) = line.strip_prefix("Workspace ") {
             let (name, rest) = rest.split_once(": ").ok_or(ProviderError::InvalidData)?;
@@ -160,6 +206,7 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
                 Quota::Unknown,
                 Some(amounts),
                 now,
+                None,
             ));
         } else if raw_line.starts_with("**") || line.starts_with("Amp ") && !line.trim().is_empty()
         {
@@ -465,5 +512,59 @@ mod tests {
         assert!(local_key(&path).is_err());
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(directory).unwrap();
+    }
+    #[test]
+    fn reset_descriptions_are_preserved_without_fabricating_timestamps() {
+        for text in [FIXTURE.to_owned(), FIXTURE.replace("**", "")] {
+            let usage = parse(&text, OffsetDateTime::UNIX_EPOCH).unwrap();
+            assert_eq!(usage.windows[0].reset_description.as_deref(), Some("daily"));
+            for window in &usage.windows[1..3] {
+                assert_eq!(
+                    window.reset_description.as_deref(),
+                    Some("upon renewal in 13 days")
+                );
+            }
+            assert!(usage.windows.iter().all(|w| w.resets_at.is_none()));
+            assert!(
+                usage.windows[3..]
+                    .iter()
+                    .all(|w| w.reset_description.is_none())
+            );
+            let value = serde_json::to_value(&usage).unwrap();
+            assert!(value["windows"][1]["resets_at"].is_null());
+            assert_eq!(
+                value["windows"][1]["reset_description"],
+                "upon renewal in 13 days"
+            );
+            let rendered = crate::output::text::render(&UsageReport {
+                schema_version: 1,
+                generated_at: OffsetDateTime::UNIX_EPOCH,
+                providers: vec![usage],
+                failures: vec![],
+            });
+            assert!(rendered.contains("reset daily"));
+            assert!(rendered.contains("reset upon renewal in 13 days"));
+            assert!(!rendered.contains("reset unknown"));
+        }
+    }
+    #[test]
+    fn reset_description_uses_date_only_fallback_and_keeps_missing_unknown() {
+        assert_eq!(
+            reset_description("remaining - period 2026-01-01 to 2026-02-01"),
+            Some("billing period ends 2026-02-01 (timezone unspecified)".into())
+        );
+        assert!(reset_description("remaining - period 2026-01-01 to 2026-02-31").is_none());
+        assert!(reset_description("remaining").is_none());
+        assert!(reset_description("resets upon renewal in many days").is_none());
+        let mut usage = parse(FIXTURE, OffsetDateTime::UNIX_EPOCH).unwrap();
+        usage.windows[0].resets_at = Some(OffsetDateTime::UNIX_EPOCH);
+        let rendered = crate::output::text::render(&UsageReport {
+            schema_version: 1,
+            generated_at: OffsetDateTime::UNIX_EPOCH,
+            providers: vec![usage],
+            failures: vec![],
+        });
+        assert!(rendered.contains("reset 1970-01-01T00:00:00Z"));
+        assert!(!rendered.contains("reset daily"));
     }
 }

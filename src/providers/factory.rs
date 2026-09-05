@@ -89,6 +89,7 @@ fn parse(
                 Confidence::Exact
             };
             windows.push(QuotaWindow {
+                reset_description: None,
                 label: format!("{name} {label}"),
                 quota,
                 amounts: None,
@@ -106,6 +107,7 @@ fn parse(
             return Err(ProviderError::InvalidData);
         }
         windows.push(QuotaWindow {
+            reset_description: None,
             label: "Extra usage credits".into(),
             quota: Quota::Unknown,
             amounts: Some(QuotaAmounts {

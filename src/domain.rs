@@ -97,6 +97,9 @@ pub struct QuotaWindow {
     pub amounts: Option<QuotaAmounts>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub resets_at: Option<OffsetDateTime>,
+    /// Source-provided reset information when an exact timestamp is unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_description: Option<String>,
     pub provenance: Provenance,
     #[serde(with = "time::serde::rfc3339")]
     pub fetched_at: OffsetDateTime,

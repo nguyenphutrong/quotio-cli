@@ -232,6 +232,12 @@ USD credit balances with no limit retain unknown percentage in JSON, including a
 zero balance. Text renders those as balances rather than missing usage. Amp
 subscription dollar/hour allowances are separate windows with used/remaining amounts.
 
+Optional `reset_description` preserves source wording such as `daily` or
+`upon renewal in 13 days` when an exact reset timestamp is unavailable. Text uses
+that description instead of `reset unknown`; `resets_at` remains null. An exact
+timestamp takes precedence when present. Date-only billing ends are labeled with
+`timezone unspecified`. Relative descriptions refer to the observation time.
+
 The mock's fixed observation date is January 1, 2026. It is demo data, not fresh
 account usage. The report generation time uses the injected clock.
 

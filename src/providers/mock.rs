@@ -27,6 +27,7 @@ impl ProviderAdapter for MockProvider {
                 ]
                 .into_iter()
                 .map(|(label, used)| QuotaWindow {
+                    reset_description: None,
                     amounts: None,
                     label: label.into(),
                     quota: Quota::from_used(used),
