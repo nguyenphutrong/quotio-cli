@@ -15,6 +15,8 @@ pub enum Command {
     Accounts(AccountsArgs),
     /// Collect quota for selected or configured providers
     Usage(UsageArgs),
+    /// Serve cached usage through a local read-only HTTP API
+    Serve(ServeArgs),
 }
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 pub enum Format {
@@ -238,4 +240,26 @@ pub enum AccountCommand {
     Use { id: String },
     /// Remove a Quotio-managed account; other apps remain signed in
     Remove { id: String },
+}
+
+#[derive(Debug, Args)]
+pub struct ServeArgs {
+    /// Listen on a loopback address; port 0 selects an available port
+    #[arg(long, default_value = "127.0.0.1:8317")]
+    pub listen: std::net::SocketAddr,
+    /// Enable a provider; repeat to enable more than one
+    #[arg(long, value_enum)]
+    pub provider: Vec<Provider>,
+    /// Read this TOML config instead of the platform default
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    /// Seconds between completed refresh cycles
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=86400))]
+    pub refresh_interval: u64,
+    /// Total seconds allowed for each provider, including retries
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    pub timeout: u64,
+    /// Use environment/local sources without reading saved accounts
+    #[arg(long)]
+    pub no_saved_accounts: bool,
 }

@@ -6,3 +6,4 @@ pub mod error;
 pub mod fetch;
 pub mod output;
 pub mod providers;
+pub mod server;

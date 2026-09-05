@@ -53,6 +53,15 @@ async fn run() -> ExitCode {
         }
     };
     let (text, code) = match cli.command {
+        Command::Serve(args) => {
+            return match quotio::server::run(args).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::from(error.exit_code())
+                }
+            };
+        }
         Command::Providers => (
             Provider::value_variants()
                 .iter()
