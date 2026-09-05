@@ -35,6 +35,40 @@ an integer from 1 to 3600 seconds, default 10, applied separately to each provid
 Text output is always plain, so `--no-color` is accepted without changing it.
 `--verbose` sends logs to stderr. Reports go to stdout.
 
+## Developer-signed macOS builds
+
+On macOS, `cargo run` now signs the Quotio binary before launching it. The runner
+uses a fixed identifier, `app.quotio.cli`, and a developer certificate from the
+login Keychain. It never falls back to ad-hoc signing. Run Cargo from this repository
+so its `.cargo/config.toml` is loaded.
+
+```sh
+cargo run -- usage --provider codex --format text
+./scripts/build-signed.sh --offline
+./scripts/build-signed.sh --release --offline
+```
+
+The build script produces `target/debug/quotio` or `target/release/quotio`. Plain
+`cargo build` alone has no post-link signing hook; use the script for a guaranteed
+signed build, or let `cargo run` sign the result. Cargo test harnesses are passed
+through unchanged and do not acquire the product's signing identity.
+
+The scripts select the sole installed Developer ID Application identity. If none
+exists, they accept a sole Apple Development/Mac Developer identity for local use.
+If selection is ambiguous, set `QUOTIO_SIGNING_IDENTITY` to the full certificate
+name or SHA-1 listed by `security find-identity -v -p codesigning`.
+
+Signing happens on a temporary copy, verifies strictly, then atomically replaces
+the binary. A signing failure prevents execution. No private key is exported.
+This workflow uses hardened runtime with no added entitlements and no timestamp
+server request. It is for local use; notarization/distribution is a separate step.
+
+Existing vault authorization may need one explicit update because the identity
+changed from the old ad-hoc binary. Run `cargo run -- accounts list` and authorize
+the developer-signed build when macOS asks. The new designated requirement stays
+stable across builds under the same identifier and developer team. The workflow
+does not rewrite or weaken the vault's ACL.
+
 ## Config
 
 ```toml
@@ -133,9 +167,9 @@ is reported separately; available local Codex data is preserved.
 `usage` requests noninteractive Keychain access. If macOS requires authorization,
 the saved-account read fails with `credential_storage` instead of repeatedly asking
 for permission. Run `accounts list` explicitly to authorize access for this build.
-Choosing Allow can authorize only the current request; rebuilding an ad-hoc-signed
-Cargo binary may trigger authorization again. Stable signed releases are needed
-for durable application identity across builds. No ACLs are weakened by the CLI.
+Choosing Allow can authorize only the current request. Use the developer-signed
+workflow above for stable application identity across builds. No ACLs are weakened
+by the CLI.
 Native Keychain calls cannot be cancelled at the OS boundary; command exit no longer
 waits indefinitely after a timeout. If an account write times out, inspect the saved
 accounts before retrying because the OS write outcome may be uncertain.
