@@ -19,6 +19,8 @@ pub enum ProviderError {
     RateLimited,
     #[error("required local tool or service is unavailable")]
     Unavailable,
+    #[error("saved account storage is unavailable or invalid; check Keychain access")]
+    CredentialStorage,
     #[error("provider task failed")]
     Internal,
 }

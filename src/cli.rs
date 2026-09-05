@@ -11,6 +11,8 @@ pub struct Cli {
 pub enum Command {
     /// List supported providers
     Providers,
+    /// Add, select, list or remove accounts managed by Quotio
+    Accounts(AccountsArgs),
     /// Collect quota for selected or configured providers
     Usage(UsageArgs),
 }
@@ -49,16 +51,19 @@ pub struct UsageArgs {
     /// Write diagnostic logs to stderr
     #[arg(long)]
     pub verbose: bool,
+    /// Use environment/local CLI sources without reading saved accounts
+    #[arg(long)]
+    pub no_saved_accounts: bool,
 }
 
 impl Provider {
     pub fn description(self) -> &'static str {
         match self {
             Self::Mock => "Deterministic demo data; no live requests",
-            Self::Codex => "ChatGPT quota through installed Codex CLI",
-            Self::Amp => "Quota and balances through installed Amp CLI",
+            Self::Codex => "ChatGPT quota via saved OAuth or installed Codex CLI",
+            Self::Amp => "Quota and balances via saved API key or installed Amp CLI",
             Self::Antigravity => "Google quota API; existing Antigravity OAuth token",
-            Self::Factory => "Factory Droid billing limits API; FACTORY_API_KEY",
+            Self::Factory => "Factory Droid quota via saved API key or FACTORY_API_KEY",
         }
     }
     pub fn adapter(self) -> std::sync::Arc<dyn crate::providers::ProviderAdapter> {
@@ -74,4 +79,39 @@ impl Provider {
             Self::Factory => std::sync::Arc::new(FactoryProvider),
         }
     }
+}
+
+#[derive(Debug, Args)]
+pub struct AccountsArgs {
+    #[command(subcommand)]
+    pub command: AccountCommand,
+}
+#[derive(Debug, Subcommand)]
+pub enum AccountCommand {
+    /// Validate and save a new account in the OS credential store
+    Add {
+        #[arg(long, value_enum)]
+        provider: Provider,
+        #[arg(long)]
+        label: String,
+        /// Read an Amp or Factory API key from a pipe; never put secrets in arguments
+        #[arg(long)]
+        token_stdin: bool,
+        /// Print the Codex sign-in URL without opening a browser
+        #[arg(long)]
+        no_browser: bool,
+        #[arg(long,value_parser=["global","eu"])]
+        region: Option<String>,
+        #[arg(long)]
+        organization: Option<String>,
+    },
+    /// List saved account metadata without credentials
+    List {
+        #[arg(long, value_enum, default_value = "text")]
+        format: Format,
+    },
+    /// Select the active account for its provider
+    Use { id: String },
+    /// Remove a Quotio-managed account; other apps remain signed in
+    Remove { id: String },
 }

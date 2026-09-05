@@ -160,6 +160,21 @@ fn parse(
         windows,
     })
 }
+pub(crate) fn parse_direct(
+    email: &str,
+    value: Value,
+    now: OffsetDateTime,
+) -> Result<ProviderUsage, ProviderError> {
+    parse(
+        Account {
+            kind: "chatgpt".into(),
+            email: Some(email.into()),
+            plan_type: None,
+        },
+        value,
+        now,
+    )
+}
 async fn rpc(
     reader: &mut BufReader<tokio::process::ChildStdout>,
     writer: &mut tokio::process::ChildStdin,

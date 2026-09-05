@@ -1,6 +1,7 @@
 pub mod amp;
 pub mod antigravity;
 pub mod codex;
+pub mod codex_api;
 pub mod factory;
 pub(crate) mod http;
 pub mod mock;

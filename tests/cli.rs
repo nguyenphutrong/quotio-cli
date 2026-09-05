@@ -29,6 +29,7 @@ impl Drop for ConfigFile {
 fn run(args: &[&str], config: &ConfigFile) -> Output {
     Command::new(env!("CARGO_BIN_EXE_quotio"))
         .args(args)
+        .arg("--no-saved-accounts")
         .arg("--config")
         .arg(&config.0)
         .output()
@@ -191,6 +192,7 @@ fn real_provider_selection_and_mixed_missing_auth() {
             "mock",
             "--provider",
             "factory",
+            "--no-saved-accounts",
             "--format",
             "json",
             "--verbose",
@@ -205,4 +207,54 @@ fn real_provider_selection_and_mixed_missing_auth() {
     assert_eq!(value["providers"][0]["provider"], "mock");
     assert_eq!(value["failures"][0]["provider"], "factory");
     assert_eq!(value["failures"][0]["code"], "authentication");
+}
+
+#[test]
+fn account_commands_are_explicit_and_help_exposes_no_secret_argument() {
+    for args in [
+        vec![
+            "quotio",
+            "accounts",
+            "add",
+            "--provider",
+            "codex",
+            "--label",
+            "Personal",
+        ],
+        vec![
+            "quotio",
+            "accounts",
+            "add",
+            "--provider",
+            "amp",
+            "--label",
+            "Work",
+            "--token-stdin",
+        ],
+        vec!["quotio", "accounts", "list", "--format", "json"],
+        vec!["quotio", "accounts", "use", "id"],
+        vec!["quotio", "accounts", "remove", "id"],
+    ] {
+        assert!(Cli::try_parse_from(args).is_ok());
+    }
+    assert!(
+        Cli::try_parse_from([
+            "quotio",
+            "accounts",
+            "add",
+            "--provider",
+            "amp",
+            "--label",
+            "Work",
+            "--token",
+            "secret"
+        ])
+        .is_err()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_quotio"))
+        .args(["accounts", "add", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
 }

@@ -53,6 +53,34 @@ async fn main() -> ExitCode {
                 .collect(),
             0,
         ),
+        Command::Accounts(args) => {
+            let http = match reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+            {
+                Ok(h) => h,
+                Err(_) => {
+                    eprintln!("Could not initialize HTTP client.");
+                    return ExitCode::from(3);
+                }
+            };
+            let context = ProviderContext {
+                http,
+                clock: Arc::new(SystemClock),
+                credentials: Arc::new(EnvironmentCredentials),
+            };
+            let result = tokio::select! {
+                result=tokio::time::timeout(Duration::from_secs(180),quotio::accounts::command::run(args.command,&context))=>result.unwrap_or(Err(quotio::accounts::AccountError::Cancelled)),
+                _=tokio::signal::ctrl_c()=>Err(quotio::accounts::AccountError::Cancelled),
+            };
+            match result {
+                Ok(text) => (text, 0),
+                Err(error) => {
+                    eprintln!("{error}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
         Command::Usage(args) => {
             let level = if args.verbose {
                 tracing::Level::DEBUG
@@ -92,7 +120,10 @@ async fn main() -> ExitCode {
                     unique.push(provider);
                 }
             }
-            let providers: Vec<_> = unique.into_iter().map(Provider::adapter).collect();
+            let providers = tokio::select! {
+                providers=quotio::accounts::service::adapters(unique, !args.no_saved_accounts, Duration::from_secs(args.timeout))=>providers,
+                _=tokio::signal::ctrl_c()=>{eprintln!("Account discovery cancelled.");return ExitCode::from(3)},
+            };
             if providers.is_empty() {
                 eprintln!(
                     "No providers selected. Use --provider mock or set enabled_providers in config."

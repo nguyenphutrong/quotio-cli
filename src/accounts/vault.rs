@@ -77,11 +77,18 @@ impl Vault {
             use std::os::unix::fs::OpenOptionsExt;
             options
                 .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
         }
         let lock = options
             .open(&self.lock_path)
             .map_err(|_| AccountError::Storage)?;
+        if !lock
+            .metadata()
+            .map_err(|_| AccountError::Storage)?
+            .is_file()
+        {
+            return Err(AccountError::Storage);
+        }
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
@@ -215,5 +222,34 @@ pub(crate) mod tests {
         drop(tx);
         std::fs::remove_file(dir.join("lock")).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "explicit native Keychain smoke; synthetic isolated item only"]
+    fn native_keychain_round_trip() {
+        use security_framework::passwords::{
+            delete_generic_password, get_generic_password, set_generic_password,
+        };
+        let service = format!("app.quotio.cli.verification.{}", random_string().unwrap());
+        assert!(get_generic_password(&service, "test").is_err());
+        set_generic_password(&service, "test", b"synthetic-first").unwrap();
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = delete_generic_password(&self.0, "test");
+            }
+        }
+        let _cleanup = Cleanup(service.clone());
+        assert_eq!(
+            get_generic_password(&service, "test").unwrap(),
+            b"synthetic-first"
+        );
+        set_generic_password(&service, "test", b"synthetic-updated").unwrap();
+        assert_eq!(
+            get_generic_password(&service, "test").unwrap(),
+            b"synthetic-updated"
+        );
+        delete_generic_password(&service, "test").unwrap();
+        assert!(get_generic_password(&service, "test").is_err());
     }
 }

@@ -1,3 +1,7 @@
+pub mod command;
+mod input;
+pub mod oauth;
+pub mod service;
 pub mod vault;
 use crate::{cli::Provider, error::ProviderError};
 use serde::{Deserialize, Serialize};
@@ -25,6 +29,8 @@ pub enum AccountError {
     Provider(#[from] ProviderError),
     #[error("login timed out or was cancelled")]
     Cancelled,
+    #[error("cannot listen on localhost:1455; close another Codex login and retry")]
+    CallbackPort,
     #[error("OAuth callback or token response is invalid")]
     OAuth,
 }
