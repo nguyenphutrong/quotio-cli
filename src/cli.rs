@@ -20,7 +20,8 @@ pub enum Format {
     Text,
     Json,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Provider {
     Mock,
     Codex,
