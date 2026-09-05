@@ -157,6 +157,79 @@ pub async fn remove(vault: Vault, id: String) -> Result<(), AccountError> {
     tx.document.remove(&id)?;
     commit(tx).await
 }
+pub async fn get(vault: Vault, id: String) -> Result<Account, AccountError> {
+    begin(vault)
+        .await?
+        .document
+        .accounts
+        .into_iter()
+        .find(|account| account.id == id)
+        .ok_or(AccountError::NotFound)
+}
+pub async fn rename(vault: Vault, id: String, label: String) -> Result<(), AccountError> {
+    let mut tx = begin(vault).await?;
+    tx.document.rename(&id, &label)?;
+    commit(tx).await
+}
+pub fn provider_settings(
+    provider: Provider,
+    mut values: std::collections::BTreeMap<String, String>,
+    context: &ProviderContext,
+) -> Result<std::collections::BTreeMap<String, String>, AccountError> {
+    let Some(definition) = provider.catalog() else {
+        return if values.is_empty() {
+            Ok(values)
+        } else {
+            Err(AccountError::Settings)
+        };
+    };
+    for (name, value) in &values {
+        if !definition
+            .settings
+            .iter()
+            .any(|setting| setting.name == name)
+            || value.is_empty()
+            || value.len() > 2048
+            || value.chars().any(char::is_control)
+        {
+            return Err(AccountError::Settings);
+        }
+    }
+    for setting in definition.settings {
+        if !values.contains_key(setting.name)
+            && let Some(value) = context.credentials.get(setting.env)
+        {
+            if value.0.is_empty() || value.0.len() > 2048 || value.0.chars().any(char::is_control) {
+                return Err(AccountError::Settings);
+            }
+            values.insert(setting.name.into(), value.0);
+        }
+        if setting.required && !values.contains_key(setting.name) {
+            return Err(AccountError::Settings);
+        }
+    }
+    Ok(values)
+}
+pub fn default_label(
+    explicit: Option<&str>,
+    credential: &Credential,
+) -> Result<String, AccountError> {
+    if let Some(label) = explicit {
+        return super::validate_label(label);
+    }
+    match credential {
+        Credential::CodexOAuth { email, .. } => super::validate_label(email),
+        Credential::ApiKey { token, .. } | Credential::CatalogKey { token, .. } => {
+            let suffix =
+                if token.len() > 8 && token.is_ascii() && !token.chars().any(char::is_control) {
+                    &token[token.len() - 4..]
+                } else {
+                    ""
+                };
+            Ok(format!("API key ****{suffix}"))
+        }
+    }
+}
 
 type OperationFuture<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, AccountError>> + Send + 'a>>;

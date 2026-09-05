@@ -1,9 +1,17 @@
-use super::{AccountError, Credential, random_string};
+use super::{AccountError, Credential, random_string, service, vault::Vault};
 use crate::providers::{ProviderContext, http};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::digest::{SHA256, digest};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
@@ -124,6 +132,303 @@ fn callback_code(target: &str, state: &str) -> Result<String, AccountError> {
     }
     Ok(codes[0].1.to_string())
 }
+pub struct Authorization {
+    state: String,
+    verifier: String,
+    nonce: String,
+    pub url: String,
+}
+pub fn begin_authorization() -> Result<Authorization, AccountError> {
+    let state = random_string()?;
+    let verifier = random_string()?;
+    let nonce = random_string()?;
+    let mut url = reqwest::Url::parse("https://auth.openai.com/oauth/authorize")
+        .map_err(|_| AccountError::OAuth)?;
+    url.query_pairs_mut().extend_pairs([
+        ("client_id", CLIENT_ID),
+        ("redirect_uri", REDIRECT),
+        ("response_type", "code"),
+        ("scope", "openid profile email offline_access"),
+        ("state", &state),
+        ("nonce", &nonce),
+        ("code_challenge", &challenge(&verifier)),
+        ("code_challenge_method", "S256"),
+        ("codex_cli_simplified_flow", "true"),
+        ("id_token_add_organizations", "true"),
+        ("originator", "codex_cli_rs"),
+    ]);
+    Ok(Authorization {
+        state,
+        verifier,
+        nonce,
+        url: url.into(),
+    })
+}
+async fn exchange_code(
+    context: &ProviderContext,
+    authorization: Authorization,
+    code: &str,
+) -> Result<Credential, AccountError> {
+    let tokens: Tokens = http::json(
+        context.http.post(TOKEN_URL).form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", CLIENT_ID),
+            ("code", code),
+            ("redirect_uri", REDIRECT),
+            ("code_verifier", &authorization.verifier),
+        ]),
+        context.clock.now(),
+    )
+    .await?;
+    credential(
+        tokens,
+        Some(&authorization.nonce),
+        None,
+        context.clock.now().unix_timestamp(),
+    )
+}
+pub async fn exchange(
+    context: &ProviderContext,
+    authorization: Authorization,
+    full_url: &str,
+) -> Result<Credential, AccountError> {
+    let callback = reqwest::Url::parse(full_url).map_err(|_| AccountError::OAuth)?;
+    if callback.scheme() != "http"
+        || callback.host_str() != Some("localhost")
+        || callback.port() != Some(1455)
+        || callback.path() != "/auth/callback"
+    {
+        return Err(AccountError::OAuth);
+    }
+    let target = match callback.query() {
+        Some(query) => format!("/auth/callback?{query}"),
+        None => return Err(AccountError::OAuth),
+    };
+    let code = callback_code(&target, &authorization.state)?;
+    exchange_code(context, authorization, &code).await
+}
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthMode {
+    Relay,
+    Loopback,
+}
+#[derive(Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    Waiting,
+    Processing,
+    Completed,
+    Failed,
+    Cancelled,
+    Expired,
+}
+#[derive(Clone, Serialize)]
+pub struct SessionDto {
+    pub id: String,
+    pub url: String,
+    pub expires_at: i64,
+    pub status: SessionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+}
+struct PendingSession {
+    authorization: Option<Authorization>,
+    url: String,
+    label: Option<String>,
+    expires_at: i64,
+    created: Instant,
+    status: SessionStatus,
+    account_id: Option<String>,
+}
+struct Sessions {
+    sessions: HashMap<String, PendingSession>,
+}
+pub struct OAuthSessionManager {
+    context: ProviderContext,
+    vault: Vault,
+    sessions: Arc<tokio::sync::Mutex<Sessions>>,
+    commit_guard: Arc<tokio::sync::Mutex<()>>,
+    generation: Arc<AtomicU64>,
+}
+impl OAuthSessionManager {
+    pub fn new(
+        context: ProviderContext,
+        vault: Vault,
+        commit_guard: Arc<tokio::sync::Mutex<()>>,
+        generation: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            context,
+            vault,
+            sessions: Arc::new(tokio::sync::Mutex::new(Sessions {
+                sessions: HashMap::new(),
+            })),
+            commit_guard,
+            generation,
+        }
+    }
+    fn dto(id: String, session: &PendingSession) -> SessionDto {
+        SessionDto {
+            id,
+            url: session.url.clone(),
+            expires_at: session.expires_at,
+            status: session.status,
+            account_id: session.account_id.clone(),
+        }
+    }
+    fn prune(sessions: &mut Sessions) {
+        let now = Instant::now();
+        for session in sessions.sessions.values_mut() {
+            if session.status == SessionStatus::Waiting
+                && now.duration_since(session.created) > Duration::from_secs(180)
+            {
+                session.status = SessionStatus::Expired;
+                session.authorization = None;
+            }
+        }
+        sessions
+            .sessions
+            .retain(|_, session| now.duration_since(session.created) <= Duration::from_secs(900));
+        if sessions.sessions.len() > 128 {
+            let mut ids: Vec<_> = sessions
+                .sessions
+                .iter()
+                .filter(|(_, s)| {
+                    s.status != SessionStatus::Waiting && s.status != SessionStatus::Processing
+                })
+                .map(|(id, s)| (id.clone(), s.created))
+                .collect();
+            ids.sort_by_key(|(_, created)| *created);
+            for (id, _) in ids
+                .into_iter()
+                .take(sessions.sessions.len().saturating_sub(128))
+            {
+                sessions.sessions.remove(&id);
+            }
+        }
+    }
+    pub async fn begin(
+        &self,
+        label: Option<String>,
+        _mode: OAuthMode,
+    ) -> Result<SessionDto, AccountError> {
+        if let Some(label) = &label {
+            super::validate_label(label)?;
+        }
+        let authorization = begin_authorization()?;
+        let id = random_string()?;
+        let expires_at = self
+            .context
+            .clock
+            .now()
+            .unix_timestamp()
+            .checked_add(180)
+            .ok_or(AccountError::OAuth)?;
+        let mut sessions = self.sessions.lock().await;
+        Self::prune(&mut sessions);
+        let url = authorization.url.clone();
+        sessions.sessions.insert(
+            id.clone(),
+            PendingSession {
+                authorization: Some(authorization),
+                url,
+                label,
+                expires_at,
+                created: Instant::now(),
+                status: SessionStatus::Waiting,
+                account_id: None,
+            },
+        );
+        Ok(Self::dto(
+            id.clone(),
+            sessions.sessions.get(&id).expect("inserted"),
+        ))
+    }
+    pub async fn get(&self, id: &str) -> Result<SessionDto, AccountError> {
+        let mut sessions = self.sessions.lock().await;
+        Self::prune(&mut sessions);
+        let session = sessions
+            .sessions
+            .get_mut(id)
+            .ok_or(AccountError::NotFound)?;
+        if session.status == SessionStatus::Waiting
+            && Instant::now().duration_since(session.created) > Duration::from_secs(180)
+        {
+            session.status = SessionStatus::Expired;
+        }
+        Ok(Self::dto(id.into(), session))
+    }
+    pub async fn cancel(&self, id: &str) -> Result<SessionDto, AccountError> {
+        let mut sessions = self.sessions.lock().await;
+        Self::prune(&mut sessions);
+        let session = sessions
+            .sessions
+            .get_mut(id)
+            .ok_or(AccountError::NotFound)?;
+        if session.status != SessionStatus::Waiting {
+            return Err(AccountError::Busy);
+        }
+        session.status = SessionStatus::Cancelled;
+        Ok(Self::dto(id.into(), session))
+    }
+    pub async fn callback(&self, id: &str, full_url: &str) -> Result<SessionDto, AccountError> {
+        let (authorization, label) = {
+            let mut sessions = self.sessions.lock().await;
+            Self::prune(&mut sessions);
+            let session = sessions
+                .sessions
+                .get_mut(id)
+                .ok_or(AccountError::NotFound)?;
+            if session.status != SessionStatus::Waiting {
+                return Err(AccountError::Busy);
+            }
+            if Instant::now().duration_since(session.created) > Duration::from_secs(180) {
+                session.status = SessionStatus::Expired;
+                return Err(AccountError::Cancelled);
+            }
+            session.status = SessionStatus::Processing;
+            (
+                session.authorization.take().ok_or(AccountError::Busy)?,
+                session.label.clone(),
+            )
+        };
+        let result = async {
+            let credential = exchange(&self.context, authorization, full_url).await?;
+            let usage =
+                service::validate(&self.context, crate::cli::Provider::Codex, &credential).await?;
+            let label = service::default_label(label.as_deref(), &credential)?;
+            let _guard = self.commit_guard.lock().await;
+            let account_id = service::add(
+                self.vault.clone(),
+                crate::cli::Provider::Codex,
+                label,
+                credential,
+                usage.account.id,
+            )
+            .await?;
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, AccountError>(account_id)
+        }
+        .await;
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .sessions
+            .get_mut(id)
+            .ok_or(AccountError::NotFound)?;
+        match result {
+            Ok(account_id) => {
+                session.status = SessionStatus::Completed;
+                session.account_id = Some(account_id);
+                Ok(Self::dto(id.into(), session))
+            }
+            Err(error) => {
+                session.status = SessionStatus::Failed;
+                Err(error)
+            }
+        }
+    }
+}
 async fn callback(listener: TcpListener, state: &str) -> Result<String, AccountError> {
     loop {
         let (socket, peer) = listener.accept().await.map_err(|_| AccountError::OAuth)?;
@@ -175,30 +480,13 @@ pub async fn login(
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 1455))
         .await
         .map_err(|_| AccountError::CallbackPort)?;
-    let state = random_string()?;
-    let verifier = random_string()?;
-    let nonce = random_string()?;
-    let mut url = reqwest::Url::parse("https://auth.openai.com/oauth/authorize")
-        .map_err(|_| AccountError::OAuth)?;
-    url.query_pairs_mut().extend_pairs([
-        ("client_id", CLIENT_ID),
-        ("redirect_uri", REDIRECT),
-        ("response_type", "code"),
-        ("scope", "openid profile email offline_access"),
-        ("state", &state),
-        ("nonce", &nonce),
-        ("code_challenge", &challenge(&verifier)),
-        ("code_challenge_method", "S256"),
-        ("codex_cli_simplified_flow", "true"),
-        ("id_token_add_organizations", "true"),
-        ("originator", "codex_cli_rs"),
-    ]);
-    eprintln!("Open this URL to sign in to Codex:\n{url}");
+    let authorization = begin_authorization()?;
+    eprintln!("Open this URL to sign in to Codex:\n{}", authorization.url);
     if open_browser {
         #[cfg(target_os = "macos")]
         {
             let _ = tokio::process::Command::new("/usr/bin/open")
-                .arg(url.as_str())
+                .arg(&authorization.url)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .kill_on_drop(true)
@@ -206,24 +494,8 @@ pub async fn login(
                 .await;
         }
     }
-    let code = callback(listener, &state).await?;
-    let tokens: Tokens = http::json(
-        context.http.post(TOKEN_URL).form(&[
-            ("grant_type", "authorization_code"),
-            ("client_id", CLIENT_ID),
-            ("code", &code),
-            ("redirect_uri", REDIRECT),
-            ("code_verifier", &verifier),
-        ]),
-        context.clock.now(),
-    )
-    .await?;
-    credential(
-        tokens,
-        Some(&nonce),
-        None,
-        context.clock.now().unix_timestamp(),
-    )
+    let code = callback(listener, &authorization.state).await?;
+    exchange_code(context, authorization, &code).await
 }
 pub async fn refresh(
     context: &ProviderContext,

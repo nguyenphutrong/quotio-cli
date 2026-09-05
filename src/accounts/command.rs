@@ -69,7 +69,7 @@ pub async fn run(
             settings,
         } => {
             if let Some(label) = &label {
-                validate_label(label)?;
+                super::validate_label(label)?;
             }
             let region_valid = matches!(
                 (provider, region.as_deref()),
@@ -85,7 +85,7 @@ pub async fn run(
             {
                 return Err(AccountError::NativeOAuth(definition.key_env));
             }
-            let metadata = provider_settings(provider, &settings, context)?;
+            let metadata = parse_settings(provider, &settings, context)?;
             let credential = match provider {
                 Provider::Codex if !token_stdin => {
                     super::oauth::login(context, !no_browser).await?
@@ -122,76 +122,26 @@ pub async fn run(
                 _ => return Err(AccountError::Unsupported),
             };
             let usage = service::validate(context, provider, &credential).await?;
-            let label = resolve_label(label.as_deref(), &credential)?;
+            let label = service::default_label(label.as_deref(), &credential)?;
             let id = service::add(vault, provider, label, credential, usage.account.id).await?;
             Ok(format!("Account validated and saved: {id}\n"))
         }
     }
 }
 
-fn provider_settings(
+fn parse_settings(
     provider: Provider,
     args: &[String],
     context: &ProviderContext,
 ) -> Result<std::collections::BTreeMap<String, String>, AccountError> {
-    let Some(definition) = provider.catalog() else {
-        return if args.is_empty() {
-            Ok(Default::default())
-        } else {
-            Err(AccountError::Settings)
-        };
-    };
     let mut values = std::collections::BTreeMap::new();
     for arg in args {
         let (name, value) = arg.split_once('=').ok_or(AccountError::Settings)?;
-        if !definition.settings.iter().any(|s| s.name == name)
-            || value.is_empty()
-            || value.len() > 2048
-            || value.chars().any(char::is_control)
-            || values.insert(name.to_owned(), value.to_owned()).is_some()
-        {
+        if values.insert(name.to_owned(), value.to_owned()).is_some() {
             return Err(AccountError::Settings);
         }
     }
-    for setting in definition.settings {
-        if !values.contains_key(setting.name)
-            && let Some(value) = context.credentials.get(setting.env)
-        {
-            if value.0.is_empty() || value.0.len() > 2048 || value.0.chars().any(char::is_control) {
-                return Err(AccountError::Settings);
-            }
-            values.insert(setting.name.into(), value.0);
-        }
-        if setting.required && !values.contains_key(setting.name) {
-            return Err(AccountError::Settings);
-        }
-    }
-    Ok(values)
-}
-fn validate_label(label: &str) -> Result<String, AccountError> {
-    let label = label.trim();
-    if label.is_empty() || label.chars().count() > 80 || label.chars().any(char::is_control) {
-        return Err(AccountError::Label);
-    }
-    Ok(label.to_owned())
-}
-fn resolve_label(explicit: Option<&str>, credential: &Credential) -> Result<String, AccountError> {
-    if let Some(label) = explicit {
-        return validate_label(label);
-    }
-    match credential {
-        Credential::CodexOAuth { email, .. } => validate_label(email),
-        Credential::ApiKey { token, .. } | Credential::CatalogKey { token, .. } => {
-            // Never reveal a short key in full or expose arbitrary Unicode/control text.
-            let suffix =
-                if token.len() > 8 && token.is_ascii() && !token.chars().any(char::is_control) {
-                    &token[token.len() - 4..]
-                } else {
-                    ""
-                };
-            Ok(format!("API key ****{suffix}"))
-        }
-    }
+    service::provider_settings(provider, values, context)
 }
 #[cfg(test)]
 mod tests {
@@ -213,22 +163,31 @@ mod tests {
             email: "demo@example.com".into(),
             expires_at: 0,
         };
-        assert_eq!(resolve_label(None, &oauth).unwrap(), "demo@example.com");
         assert_eq!(
-            resolve_label(None, &key("synthetic-key-ABCD")).unwrap(),
+            service::default_label(None, &oauth).unwrap(),
+            "demo@example.com"
+        );
+        assert_eq!(
+            service::default_label(None, &key("synthetic-key-ABCD")).unwrap(),
             "API key ****ABCD"
         );
-        assert_eq!(resolve_label(Some(" Work "), &oauth).unwrap(), "Work");
         assert_eq!(
-            resolve_label(Some(" Work "), &key("synthetic-key-ABCD")).unwrap(),
+            service::default_label(Some(" Work "), &oauth).unwrap(),
             "Work"
         );
-        assert!(resolve_label(Some(" "), &oauth).is_err());
+        assert_eq!(
+            service::default_label(Some(" Work "), &key("synthetic-key-ABCD")).unwrap(),
+            "Work"
+        );
+        assert!(service::default_label(Some(" "), &oauth).is_err());
     }
     #[test]
     fn short_and_non_ascii_keys_are_fully_masked() {
         for token in ["abcd", "12345678", "ééééééééé", "secret\nvalue"] {
-            assert_eq!(resolve_label(None, &key(token)).unwrap(), "API key ****");
+            assert_eq!(
+                service::default_label(None, &key(token)).unwrap(),
+                "API key ****"
+            );
         }
     }
 }
@@ -242,7 +201,7 @@ mod catalog_setting_tests {
         for definition in crate::providers::catalog::definitions() {
             let provider = Provider::Catalog(definition.id);
             assert!(matches!(
-                provider_settings(provider, &["unknown=never-echo-this".into()], &context),
+                parse_settings(provider, &["unknown=never-echo-this".into()], &context),
                 Err(AccountError::Settings)
             ));
             let args: Vec<_> = definition
@@ -250,17 +209,17 @@ mod catalog_setting_tests {
                 .iter()
                 .map(|s| format!("{}=example-value", s.name))
                 .collect();
-            let parsed = provider_settings(provider, &args, &context).unwrap();
+            let parsed = parse_settings(provider, &args, &context).unwrap();
             assert_eq!(parsed.len(), definition.settings.len());
             if definition.settings.iter().any(|s| s.required) {
                 assert!(matches!(
-                    provider_settings(provider, &[], &context),
+                    parse_settings(provider, &[], &context),
                     Err(AccountError::Settings)
                 ));
             }
             if let Some(setting) = definition.settings.first() {
                 assert!(
-                    provider_settings(
+                    parse_settings(
                         provider,
                         &[
                             format!("{}=first", setting.name),

@@ -1,3 +1,4 @@
+pub mod api;
 pub mod command;
 mod input;
 pub mod oauth;
@@ -108,10 +109,7 @@ impl Document {
         identity: String,
         credential: Credential,
     ) -> Result<String, AccountError> {
-        let label = label.trim();
-        if label.is_empty() || label.chars().count() > 80 || label.chars().any(char::is_control) {
-            return Err(AccountError::Label);
-        }
+        let label = validate_label(label)?;
         if self
             .accounts
             .iter()
@@ -127,7 +125,7 @@ impl Document {
         self.accounts.push(Account {
             id: id.clone(),
             provider,
-            label: label.into(),
+            label,
             identity,
             active,
             credential,
@@ -165,6 +163,33 @@ impl Document {
         }
         Ok(())
     }
+    pub fn rename(&mut self, id: &str, label: &str) -> Result<(), AccountError> {
+        let label = validate_label(label)?;
+        let provider = self
+            .accounts
+            .iter()
+            .find(|account| account.id == id)
+            .ok_or(AccountError::NotFound)?
+            .provider;
+        if self.accounts.iter().any(|candidate| {
+            candidate.id != id && candidate.provider == provider && candidate.label == label
+        }) {
+            return Err(AccountError::Duplicate);
+        }
+        self.accounts
+            .iter_mut()
+            .find(|account| account.id == id)
+            .expect("account was checked")
+            .label = label;
+        Ok(())
+    }
+}
+pub fn validate_label(label: &str) -> Result<String, AccountError> {
+    let label = label.trim();
+    if label.is_empty() || label.chars().count() > 80 || label.chars().any(char::is_control) {
+        return Err(AccountError::Label);
+    }
+    Ok(label.to_owned())
 }
 pub(crate) fn random_string() -> Result<String, AccountError> {
     use base64::Engine;
