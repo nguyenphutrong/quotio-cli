@@ -15,6 +15,7 @@ impl Config {
 impl Drop for Config {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_dir_all(self.0.with_extension("cache"));
     }
 }
 
@@ -83,6 +84,7 @@ async fn http_snapshots_security_and_process_shutdown() {
         ])
         .arg(&config.0)
         .env("QUOTIO_SERVER_TOKEN", token)
+        .env("QUOTIO_CACHE_DIR", config.0.with_extension("cache"))
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)

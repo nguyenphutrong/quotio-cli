@@ -196,7 +196,9 @@ async fn run() -> ExitCode {
                 timeout: Duration::from_secs(args.timeout),
                 cancellation: cancellation.clone(),
             };
-            let collection = collector.collect(request);
+            let cache =
+                quotio::cache::UsageCache::platform(Duration::from_secs(config.cache_ttl_seconds));
+            let collection = cache.collect(&collector, request, args.force);
             tokio::pin!(collection);
             let report = tokio::select! {
                 report = &mut collection => report,

@@ -53,27 +53,8 @@ struct Snapshot {
     report: Option<UsageReport>,
 }
 impl Snapshot {
-    fn update(&mut self, mut next: UsageReport) {
-        if let Some(previous) = self.report.take() {
-            for usage in previous.providers {
-                // Retain only accounts which failed this cycle. Accounts removed from
-                // the vault disappear after a successful discovery/refresh cycle.
-                let failed = next.failures.iter().any(|failure| {
-                    failure.provider == usage.provider
-                        && (failure.account_ref.is_none()
-                            || failure.account_ref.as_ref().map(|a| &a.id)
-                                == usage.account_ref.as_ref().map(|a| &a.id))
-                });
-                let replaced = next.providers.iter().any(|fresh| {
-                    fresh.provider == usage.provider
-                        && fresh.account_ref.as_ref().map(|a| &a.id)
-                            == usage.account_ref.as_ref().map(|a| &a.id)
-                });
-                if failed && !replaced {
-                    next.providers.push(usage);
-                }
-            }
-        }
+    fn update(&mut self, next: UsageReport) {
+        // Retention and login checks belong to the shared usage service.
         self.report = Some(next);
     }
 }
@@ -217,7 +198,12 @@ async fn usage_response(state: &ApiState, provider: Option<&str>) -> Response {
     Json(value).into_response()
 }
 
-async fn refresh(state: &ApiState, args: &ServeArgs, collector: &Collector) {
+async fn refresh(
+    state: &ApiState,
+    args: &ServeArgs,
+    collector: &Collector,
+    cache: &crate::cache::UsageCache,
+) {
     let timeout = Duration::from_secs(args.timeout);
     let adapters = crate::accounts::service::adapters(
         state.enabled.clone(),
@@ -228,12 +214,16 @@ async fn refresh(state: &ApiState, args: &ServeArgs, collector: &Collector) {
     .await;
     let report = match adapters {
         Ok(providers) => {
-            collector
-                .collect(CollectRequest {
-                    providers,
-                    timeout,
-                    cancellation: Cancellation::default(),
-                })
+            cache
+                .collect(
+                    collector,
+                    CollectRequest {
+                        providers,
+                        timeout,
+                        cancellation: Cancellation::default(),
+                    },
+                    false,
+                )
                 .await
         }
         Err(_) => UsageReport {
@@ -291,6 +281,7 @@ pub async fn run(args: ServeArgs) -> Result<(), ServerError> {
             credentials: Arc::new(EnvironmentCredentials),
         },
     };
+    let cache = crate::cache::UsageCache::platform(Duration::from_secs(config.cache_ttl_seconds));
     let listener = TcpListener::bind(args.listen)
         .await
         .map_err(|_| ServerError::Bind)?;
@@ -306,7 +297,7 @@ pub async fn run(args: ServeArgs) -> Result<(), ServerError> {
     let refresh_state = state.clone();
     let mut worker = tokio::spawn(async move {
         loop {
-            refresh(&refresh_state, &args, &collector).await;
+            refresh(&refresh_state, &args, &collector, &cache).await;
             tokio::time::sleep(Duration::from_secs(args.refresh_interval)).await;
         }
     });
@@ -391,25 +382,13 @@ mod tests {
     }
 
     #[test]
-    fn cache_keeps_failed_accounts_but_removes_deleted_accounts() {
+    fn transport_does_not_restore_snapshots_from_a_previous_login() {
         let mut snapshot = Snapshot::default();
-        snapshot.update(report(&["local", "saved", "deleted"], &[]));
-        snapshot.update(report(&["local"], &[Some("saved")]));
-        let current = snapshot.report.as_ref().unwrap();
-        assert_eq!(
-            current
-                .providers
-                .iter()
-                .map(|p| p.account.id.as_str())
-                .collect::<Vec<_>>(),
-            ["local", "saved"]
-        );
-        assert_eq!(current.failures.len(), 1);
+        snapshot.update(report(&["old-local", "removed"], &[]));
         snapshot.update(report(&[], &[None]));
-        assert_eq!(snapshot.report.as_ref().unwrap().providers.len(), 2);
-        snapshot.update(report(&["saved"], &[]));
+        assert!(snapshot.report.as_ref().unwrap().providers.is_empty());
+        snapshot.update(report(&["new-local"], &[]));
         assert_eq!(snapshot.report.as_ref().unwrap().providers.len(), 1);
-        assert!(snapshot.report.as_ref().unwrap().failures.is_empty());
     }
 
     #[tokio::test]
@@ -434,7 +413,7 @@ mod tests {
             .snapshot
             .write()
             .await
-            .update(report(&["local"], &[Some("saved")]));
+            .update(report(&["local", "saved"], &[Some("saved")]));
         let response = usage_response(&state, Some("mock")).await;
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), 65536)

@@ -24,11 +24,13 @@ impl ConfigFile {
 impl Drop for ConfigFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_dir_all(self.0.with_extension("cache"));
     }
 }
 fn run(args: &[&str], config: &ConfigFile) -> Output {
     Command::new(env!("CARGO_BIN_EXE_quotio"))
         .args(args)
+        .env("QUOTIO_CACHE_DIR", config.0.with_extension("cache"))
         .arg("--no-saved-accounts")
         .arg("--config")
         .arg(&config.0)
@@ -548,5 +550,43 @@ fn new_key_providers_reach_key_validation_without_network() {
                 .contains("credential input")
         );
         assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn force_and_cache_ttl_contract() {
+    for args in [
+        vec!["quotio", "usage", "--force"],
+        vec!["quotio", "usage", "--provider", "codex", "--force"],
+    ] {
+        let CliCommand::Usage(args) = Cli::try_parse_from(args).unwrap().command else {
+            panic!()
+        };
+        assert!(args.force);
+    }
+    assert_eq!(Config::default().cache_ttl_seconds, 300);
+    assert_eq!(
+        Config::parse("enabled_providers = []")
+            .unwrap()
+            .cache_ttl_seconds,
+        300
+    );
+    assert_eq!(
+        Config::parse("cache_ttl_seconds = 30")
+            .unwrap()
+            .cache_ttl_seconds,
+        30
+    );
+    assert_eq!(
+        Config::parse("cache_ttl_seconds = 0")
+            .unwrap()
+            .cache_ttl_seconds,
+        0
+    );
+    for invalid in [
+        "cache_ttl_seconds = -1",
+        "cache_ttl_seconds = 'secret-sentinel'",
+    ] {
+        assert!(Config::parse(invalid).is_err());
     }
 }

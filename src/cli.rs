@@ -104,6 +104,9 @@ impl<'de> serde::Deserialize<'de> for Provider {
 }
 #[derive(Debug, Args)]
 pub struct UsageArgs {
+    /// Fetch selected accounts even when their cached usage is fresh
+    #[arg(long)]
+    pub force: bool,
     /// Select a provider; repeat to select more than one
     #[arg(long, value_enum)]
     pub provider: Vec<Provider>,

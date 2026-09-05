@@ -15,11 +15,25 @@ pub enum ConfigError {
     #[error("config contains an unsupported provider; run quotio providers")]
     Unsupported,
 }
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub enabled_providers: Vec<String>,
+    /// Maximum cache age in seconds; zero refreshes every time.
+    #[serde(default = "default_cache_ttl")]
+    pub cache_ttl_seconds: u64,
+}
+fn default_cache_ttl() -> u64 {
+    300
+}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            enabled_providers: vec![],
+            cache_ttl_seconds: default_cache_ttl(),
+        }
+    }
 }
 impl Config {
     pub fn default_path() -> Option<PathBuf> {
