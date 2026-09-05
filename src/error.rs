@@ -15,6 +15,8 @@ pub enum ProviderError {
     Authentication,
     #[error("provider returned invalid usage")]
     InvalidData,
+    #[error("required local tool or service is unavailable")]
+    Unavailable,
     #[error("provider task failed")]
     Internal,
 }
