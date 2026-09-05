@@ -26,10 +26,10 @@ fn number(input: &str) -> Result<f64, ProviderError> {
 }
 fn percent(input: &str) -> Result<f64, ProviderError> {
     let prefix = input.split_once('%').ok_or(ProviderError::InvalidData)?.0;
-    let numeric = prefix
-        .rsplit(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .next()
-        .ok_or(ProviderError::InvalidData)?;
+    let numeric = prefix.trim();
+    if numeric.is_empty() || !numeric.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return Err(ProviderError::InvalidData);
+    }
     let value = number(numeric)?;
     if value > 100.0 {
         return Err(ProviderError::InvalidData);
@@ -214,5 +214,14 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn reject_malformed_percentage_tokens() {
+        for token in ["-5%", "1e2%", "1,2%", "105%"] {
+            assert!(
+                parse(&FIXTURE.replace("75%", token), OffsetDateTime::UNIX_EPOCH).is_err(),
+                "accepted malformed percentage"
+            );
+        }
     }
 }
