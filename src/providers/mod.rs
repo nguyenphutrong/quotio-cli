@@ -2,6 +2,7 @@ pub mod amp;
 pub mod antigravity;
 pub(crate) mod antigravity_auth;
 mod antigravity_local;
+pub mod capabilities;
 pub mod catalog;
 pub mod codex;
 pub mod codex_api;

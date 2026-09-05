@@ -1,6 +1,9 @@
 //! HTTP management and snapshot transport; provider work uses the shared usage cache.
+mod management;
 mod operations;
 mod security;
+#[cfg(test)]
+mod tests;
 use crate::{
     cli::{Provider, ServeArgs},
     config::Config,
@@ -103,16 +106,26 @@ struct ApiState {
     pending: Mutex<HashMap<String, String>>,
     wake: Notify,
     operations: Mutex<Operations>,
-    jobs: Mutex<Vec<tokio::task::AbortHandle>>,
+    jobs: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
     status: Mutex<RefreshStatus>,
     context: ProviderContext,
     no_saved_accounts: bool,
+    manage: bool,
+    vault: Option<crate::accounts::vault::Vault>,
+    oauth: Option<crate::accounts::oauth::OAuthSessionManager>,
 }
 impl ApiState {
-    async fn spawn(&self, work: impl std::future::Future<Output = ()> + Send + 'static) {
-        let mut jobs = self.jobs.lock().await;
+    fn spawn(
+        &self,
+        work: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<(), ApiError> {
+        let mut jobs = self.jobs.lock().expect("job tracker");
         jobs.retain(|h| !h.is_finished());
+        if jobs.len() >= 128 {
+            return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_busy"));
+        }
         jobs.push(tokio::spawn(work).abort_handle());
+        Ok(())
     }
     async fn invalidate(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
@@ -128,6 +141,26 @@ fn router(state: Arc<ApiState>, policy: Arc<security::Policy>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/status", get(status))
+        .route(
+            "/v1/accounts",
+            get(management::list).post(management::create),
+        )
+        .route(
+            "/v1/accounts/{id}",
+            get(management::get_account)
+                .patch(management::patch)
+                .delete(management::remove),
+        )
+        .route("/v1/accounts/{id}/usage", get(management::usage))
+        .route("/v1/auth/sessions", post(management::begin))
+        .route(
+            "/v1/auth/sessions/{id}",
+            get(management::session).delete(management::cancel),
+        )
+        .route(
+            "/v1/auth/sessions/{id}/callback",
+            post(management::callback),
+        )
         .route("/v1/providers", get(providers))
         .route("/v1/providers/{id}", get(provider))
         .route("/v1/usage", get(usage))
@@ -149,11 +182,11 @@ async fn status(State(state): State<Arc<ApiState>>) -> Json<Value> {
     let settings = state.settings.read().await;
     let status = state.status.lock().await;
     Json(
-        json!({"schema_version":1,"ready":state.snapshot.read().await.as_ref().is_some_and(|(g,_)|*g==state.generation.load(Ordering::SeqCst)),"refreshing":status.refreshing,"last_completed_at":status.last_completed_at,"next_refresh_at":status.next_refresh_at,"settings_revision":settings.revision}),
+        json!({"schema_version":1,"ready":state.snapshot.read().await.as_ref().is_some_and(|(g,_)|*g==state.generation.load(Ordering::SeqCst)),"refreshing":status.refreshing,"last_completed_at":status.last_completed_at,"next_refresh_at":status.next_refresh_at,"settings_revision":settings.revision,"access_mode":if state.manage {"manage"} else {"read_only"},"account_storage_enabled":state.vault.is_some(),"api_version":1,"server_version":env!("CARGO_PKG_VERSION")}),
     )
 }
 fn provider_value(p: Provider, enabled: &[Provider]) -> Value {
-    json!({"id":p.id(),"description":p.description(),"enabled":enabled.contains(&p)})
+    json!({"id":p.id(),"description":p.description(),"enabled":enabled.contains(&p),"capabilities":crate::providers::capabilities::capability(p)})
 }
 async fn providers(State(state): State<Arc<ApiState>>) -> Json<Value> {
     let enabled = state
@@ -210,6 +243,7 @@ async fn usage_response(
         return error(StatusCode::SERVICE_UNAVAILABLE, "not_ready");
     };
     if *generation != state.generation.load(Ordering::SeqCst) {
+        state.wake.notify_one();
         return error(StatusCode::SERVICE_UNAVAILABLE, "not_ready");
     }
     let mut value = match serde_json::to_value(report) {
@@ -224,8 +258,18 @@ async fn usage_response(
     }
     Json(value).into_response()
 }
-async fn settings(State(state): State<Arc<ApiState>>) -> Json<SettingsView> {
-    Json(state.settings.read().await.clone())
+async fn settings(State(state): State<Arc<ApiState>>) -> Result<Json<SettingsView>, ApiError> {
+    let _guard = state.commit_guard.lock().await;
+    let store = state.store.clone();
+    let view = tokio::task::spawn_blocking(move || store.load())
+        .await
+        .map_err(|_| settings_error(SettingsError::Storage))?
+        .map_err(settings_error)?;
+    if state.settings.read().await.revision != view.revision {
+        *state.settings.write().await = view.clone();
+        state.invalidate().await;
+    }
+    Ok(Json(view))
 }
 fn settings_error(e: SettingsError) -> ApiError {
     match e {
@@ -246,20 +290,18 @@ async fn patch_settings(
     // Once started, a config transaction completes even if the HTTP client leaves.
     let (send, receive) = tokio::sync::oneshot::channel();
     let work = state.clone();
-    state
-        .spawn(async move {
-            let _guard = work.commit_guard.lock().await;
-            let store = work.store.clone();
-            let result = tokio::task::spawn_blocking(move || store.patch(patch))
-                .await
-                .unwrap_or(Err(SettingsError::Storage));
-            if let Ok(view) = &result {
-                *work.settings.write().await = view.clone();
-                work.invalidate().await;
-            }
-            let _ = send.send(result);
-        })
-        .await;
+    state.spawn(async move {
+        let _guard = work.commit_guard.lock().await;
+        let store = work.store.clone();
+        let result = tokio::task::spawn_blocking(move || store.patch(patch))
+            .await
+            .unwrap_or(Err(SettingsError::Storage));
+        if let Ok(view) = &result {
+            *work.settings.write().await = view.clone();
+            work.invalidate().await;
+        }
+        let _ = send.send(result);
+    })?;
     receive
         .await
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?
@@ -299,6 +341,9 @@ async fn manual_refresh(
     {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_refresh_scope"));
     }
+    if let Some(id) = &request.account_id {
+        management::validate_refresh_account(&state, request.providers[0], id).await?;
+    }
     let key = serde_json::to_string(&request)
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
     let mut pending = state.pending.lock().await;
@@ -317,13 +362,21 @@ async fn manual_refresh(
     drop(pending);
     let work = state.clone();
     let id = op.id.clone();
-    state
-        .spawn(async move {
-            let result = refresh(&work, Some(request)).await;
-            work.operations.lock().await.finish(&id, result);
-            work.pending.lock().await.remove(&key);
-        })
-        .await;
+    let pending_key = key.clone();
+    let spawn_result = state.spawn(async move {
+        let result = refresh(&work, Some(request)).await;
+        work.operations.lock().await.finish(&id, result);
+        work.pending.lock().await.remove(&key);
+    });
+    if let Err(e) = spawn_result {
+        state.pending.lock().await.remove(&pending_key);
+        state
+            .operations
+            .lock()
+            .await
+            .finish(&op.id, Err("server_busy"));
+        return Err(e);
+    }
     Ok((StatusCode::ACCEPTED, Json(op)))
 }
 fn operation_error(code: &'static str) -> ApiError {
@@ -489,25 +542,44 @@ pub async fn run(args: ServeArgs) -> Result<(), ServerError> {
     let context = ProviderContext {
         http: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(30))
             .build()
             .map_err(|_| ServerError::Initialize)?,
         clock: Arc::new(SystemClock),
         credentials: Arc::new(EnvironmentCredentials),
     };
+    let generation = Arc::new(AtomicU64::new(0));
+    let commit_guard = Arc::new(Mutex::new(()));
+    let vault = if args.no_saved_accounts {
+        None
+    } else {
+        crate::accounts::vault::Vault::for_usage().ok()
+    };
+    let oauth = vault.clone().map(|v| {
+        crate::accounts::oauth::OAuthSessionManager::new(
+            context.clone(),
+            v,
+            commit_guard.clone(),
+            generation.clone(),
+        )
+    });
     let state = Arc::new(ApiState {
         settings: RwLock::new(view),
         store,
         snapshot: RwLock::new(None),
-        generation: Arc::new(AtomicU64::new(0)),
-        commit_guard: Arc::new(Mutex::new(())),
+        generation,
+        commit_guard,
         refresh_lock: Mutex::new(()),
         pending: Mutex::new(HashMap::new()),
         wake: Notify::new(),
         operations: Mutex::new(Operations::default()),
-        jobs: Mutex::new(Vec::new()),
+        jobs: std::sync::Mutex::new(Vec::new()),
         status: Mutex::new(RefreshStatus::default()),
         context,
         no_saved_accounts: args.no_saved_accounts,
+        manage: args.manage,
+        vault,
+        oauth,
     });
     let worker_state = state.clone();
     let mut worker = tokio::spawn(async move {
@@ -532,7 +604,7 @@ pub async fn run(args: ServeArgs) -> Result<(), ServerError> {
     };
     stop.send_replace(true);
     worker.abort();
-    for job in state.jobs.lock().await.iter() {
+    for job in state.jobs.lock().expect("job tracker").iter() {
         job.abort();
     }
     result

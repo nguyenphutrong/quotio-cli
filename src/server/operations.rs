@@ -12,6 +12,7 @@ pub struct Operation {
     pub status: &'static str,
     pub result: Option<Value>,
     pub error: Option<&'static str>,
+    pub message: Option<&'static str>,
 }
 struct Entry {
     operation: Operation,
@@ -59,6 +60,7 @@ impl Operations {
             status: "running",
             result: None,
             error: None,
+            message: None,
         };
         self.entries.insert(
             id,
@@ -81,7 +83,14 @@ impl Operations {
             };
             match result {
                 Ok(value) => e.operation.result = Some(value),
-                Err(code) => e.operation.error = Some(code),
+                Err(code) => {
+                    e.operation.error = Some(code);
+                    if code == "credential_storage_unavailable" {
+                        e.operation.message = Some(
+                            "Allow Quotio access to its account vault on the Mac server, then retry. Remote requests cannot display Keychain authorization prompts.",
+                        );
+                    }
+                }
             }
         }
     }

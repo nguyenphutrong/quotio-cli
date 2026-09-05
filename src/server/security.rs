@@ -111,7 +111,13 @@ fn authorized(request: &Request, key: Option<&hmac::Key>) -> bool {
     hmac::verify(key, b"quotio-server-auth-v1", tag.as_ref()).is_ok()
 }
 pub fn error(status: StatusCode, code: &'static str) -> Response {
-    (status, Json(json!({"error":code}))).into_response()
+    let mut body = json!({"error":code});
+    if code == "credential_storage_unavailable" {
+        body["message"] = json!(
+            "Allow Quotio access to its account vault on the Mac server, then retry. Remote requests cannot display Keychain authorization prompts."
+        );
+    }
+    (status, Json(body)).into_response()
 }
 pub async fn guard(
     axum::extract::State(policy): axum::extract::State<Arc<Policy>>,

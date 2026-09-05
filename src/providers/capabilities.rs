@@ -6,6 +6,7 @@ use serde::Serialize;
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
     ApiKey,
+    #[serde(rename = "oauth")]
     OAuth,
     Native,
 }
@@ -24,6 +25,7 @@ pub enum Operation {
     RenameAccount,
     SelectAccount,
     RemoveAccount,
+    #[serde(rename = "start_oauth")]
     StartOAuth,
 }
 #[derive(Clone, Serialize, PartialEq, Eq)]
