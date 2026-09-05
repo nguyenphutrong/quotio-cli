@@ -100,6 +100,7 @@ pub(super) fn window(
         _ => return Err(ProviderError::InvalidData),
     };
     Ok(QuotaWindow {
+        consumption: None,
         reset_description: None,
         label,
         quota: Quota::from_remaining(remaining.map(|v| v * 100.0)),

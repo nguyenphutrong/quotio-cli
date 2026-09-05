@@ -51,6 +51,7 @@ fn window(
     reset_description: Option<String>,
 ) -> QuotaWindow {
     QuotaWindow {
+        consumption: None,
         reset_description,
         label: label.into(),
         provenance: Provenance {

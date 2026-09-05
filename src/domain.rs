@@ -89,8 +89,15 @@ pub struct QuotaAmounts {
     pub limit: Option<f64>,
     pub unit: String,
 }
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct Consumption {
+    pub used: f64,
+    pub unit: String,
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct QuotaWindow {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumption: Option<Consumption>,
     pub label: String,
     pub quota: Quota,
     #[serde(skip_serializing_if = "Option::is_none")]

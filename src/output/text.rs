@@ -33,7 +33,14 @@ pub fn render(report: &UsageReport) -> String {
         for window in &usage.windows {
             let balance_only = window.quota == Quota::Unknown
                 && window.amounts.as_ref().is_some_and(|a| a.limit.is_none());
+            let consumption_only = window.quota == Quota::Unknown
+                && window.consumption.is_some()
+                && window.amounts.is_none();
             let quota = match window.quota {
+                Quota::Unknown if consumption_only => {
+                    let amount = window.consumption.as_ref().expect("consumption amount");
+                    format!("used {:.2} {}", amount.used, safe(&amount.unit))
+                }
                 Quota::Unknown if balance_only => {
                     let amounts = window.amounts.as_ref().expect("balance amount");
                     format!(
@@ -57,7 +64,7 @@ pub fn render(report: &UsageReport) -> String {
                 .filter(|s| !s.trim().is_empty())
             {
                 format!("; reset {}", safe(description))
-            } else if balance_only {
+            } else if balance_only || consumption_only {
                 String::new()
             } else {
                 "; reset unknown".into()
@@ -79,7 +86,10 @@ pub fn render(report: &UsageReport) -> String {
                     let _ = writeln!(
                         text,
                         "    used {:.2} of {limit} {}; remaining {:.2} {}",
-                        limit - amounts.remaining,
+                        window
+                            .consumption
+                            .as_ref()
+                            .map_or(limit - amounts.remaining, |c| c.used),
                         safe(&amounts.unit),
                         amounts.remaining,
                         safe(&amounts.unit)

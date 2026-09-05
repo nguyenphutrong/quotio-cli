@@ -80,7 +80,12 @@ impl Collector {
             let result = result.and_then(|usage| {
                 if usage.provider != ids[index]
                     || usage.windows.is_empty()
-                    || usage.windows.iter().any(|window| !window.quota.is_valid())
+                    || usage.windows.iter().any(|window| {
+                        !window.quota.is_valid()
+                            || window.consumption.as_ref().is_some_and(|c| {
+                                !c.used.is_finite() || c.used < 0.0 || c.unit.trim().is_empty()
+                            })
+                    })
                 {
                     Err(ProviderError::InvalidData)
                 } else {
@@ -137,6 +142,7 @@ fn reconcile_accounts(providers: &mut Vec<ProviderUsage>) {
                         a.label == b.label
                             && a.quota == b.quota
                             && a.amounts == b.amounts
+                            && a.consumption == b.consumption
                             && a.resets_at == b.resets_at
                             && a.reset_description == b.reset_description
                     })

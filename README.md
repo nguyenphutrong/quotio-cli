@@ -272,6 +272,8 @@ Arrays preserve request order within successes and failures. Each provider conta
 
 Each window contains `label`, `quota`, nullable `resets_at`, `provenance` with
 `source` and `confidence`, and RFC 3339 `fetched_at`. Timestamps include an offset.
+Optional `consumption` records `used` and `unit` independently of any cap or balance,
+for example OpenRouter USD spend. It is omitted from existing provider reports.
 Optional `amounts` records a balance as `remaining`, nullable `limit`, and `unit`.
 USD credit balances with no limit retain unknown percentage in JSON, including a
 zero balance. Text renders those as balances rather than missing usage. Amp

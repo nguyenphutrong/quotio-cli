@@ -152,7 +152,7 @@ async fn success_and_empty_exit_codes() {
     assert_eq!(collector().collect(request(vec![])).await.exit_code(), 3);
 }
 
-struct InvalidProvider;
+struct InvalidProvider(Option<Consumption>);
 impl ProviderAdapter for InvalidProvider {
     fn id(&self) -> ProviderId {
         ProviderId("mock".into())
@@ -160,10 +160,14 @@ impl ProviderAdapter for InvalidProvider {
     fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
         Box::pin(async move {
             let mut usage = MockProvider.fetch(context).await?;
-            usage.windows[0].quota = Quota::Available {
-                used_percent: f64::NAN,
-                remaining_percent: 50.0,
-            };
+            if let Some(consumption) = &self.0 {
+                usage.windows[0].consumption = Some(consumption.clone());
+            } else {
+                usage.windows[0].quota = Quota::Available {
+                    used_percent: f64::NAN,
+                    remaining_percent: 50.0,
+                };
+            }
             Ok(usage)
         })
     }
@@ -171,7 +175,7 @@ impl ProviderAdapter for InvalidProvider {
 #[tokio::test]
 async fn invalid_adapter_data_is_a_provider_failure() {
     let report = collector()
-        .collect(request(vec![Arc::new(InvalidProvider)]))
+        .collect(request(vec![Arc::new(InvalidProvider(None))]))
         .await;
     assert_eq!(report.exit_code(), 3);
     assert_eq!(report.failures[0].code, ProviderError::InvalidData);
@@ -532,4 +536,20 @@ async fn amp_local_failure_keeps_saved_usage_and_failure_identity() {
         report.providers[0].account_ref.as_ref().unwrap().id,
         "saved"
     );
+}
+
+#[tokio::test]
+async fn invalid_consumption_cannot_enter_json_reports() {
+    for (used, unit) in [(f64::NAN, "USD"), (-1.0, "USD"), (1.0, "")] {
+        let report = collector()
+            .collect(request(vec![Arc::new(InvalidProvider(Some(
+                Consumption {
+                    used,
+                    unit: unit.into(),
+                },
+            )))]))
+            .await;
+        assert_eq!(report.exit_code(), 3);
+        assert_eq!(report.failures[0].code, ProviderError::InvalidData);
+    }
 }
