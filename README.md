@@ -100,12 +100,46 @@ Quotio's saved record; it does not revoke remote tokens or log other apps out.
 
 All account metadata and tokens live in one protected Keychain item:
 service `app.quotio.cli.accounts.v1`, account `vault`. No plaintext credential files
-are created. A local empty lock file coordinates processes. Failed atomic writes
+are created. Empty local lock files coordinate short vault transactions and per-account refresh. Failed atomic writes
 preserve the previous document. Listing prints metadata only.
 
-Saved active accounts take precedence over environment/local CLI sources. Use
-`usage --no-saved-accounts` to explicitly skip the vault. A locked/denied vault
-returns a provider failure rather than silently selecting another account.
+For Codex, `usage --provider codex` reads the installed local Codex account and
+all saved Codex accounts, including inactive ones. Other providers retain their
+active-account selection. Use these commands to narrow Codex output:
+
+```sh
+cargo run -- usage --provider codex --account local
+cargo run -- accounts list
+cargo run -- usage --provider codex --account <saved-account-id>
+```
+
+`--account` requires exactly one explicit provider and conflicts with
+`--no-saved-accounts`. An unknown or wrong-provider account ID is an argument error.
+When Codex is not installed, saved accounts still work without a local failure.
+With no installed or saved account, the requested provider reports unavailable.
+
+Duplicate successful Codex results prefer the saved account. Matching uses provider
+account ID, or a unique personal-plan email when the local API has no account ID.
+Business/workspace or unknown plans are never merged by email alone; ambiguous
+identities stay separate. Failures are not hidden by deduplication.
+
+JSON successes and failures may include `account_ref` with the selector ID and
+label. The authenticated provider identity remains in `account`; optional `plan`
+is supplied when known. Text output shows the selector alongside each account.
+Timeout/cancellation applies to each account, and refresh locks are per account.
+
+Use `usage --no-saved-accounts` to explicitly skip the vault. A locked/denied vault
+is reported separately; available local Codex data is preserved.
+`usage` requests noninteractive Keychain access. If macOS requires authorization,
+the saved-account read fails with `credential_storage` instead of repeatedly asking
+for permission. Run `accounts list` explicitly to authorize access for this build.
+Choosing Allow can authorize only the current request; rebuilding an ad-hoc-signed
+Cargo binary may trigger authorization again. Stable signed releases are needed
+for durable application identity across builds. No ACLs are weakened by the CLI.
+Native Keychain calls cannot be cancelled at the OS boundary; command exit no longer
+waits indefinitely after a timeout. If an account write times out, inspect the saved
+accounts before retrying because the OS write outcome may be uncertain.
+
 Managed storage currently supports macOS only; other platforms retain the previous
 environment/CLI usage routes. There is no plaintext storage fallback.
 
@@ -268,7 +302,7 @@ symlinks or submodules. Build and runtime do not need the reference checkout.
 - Antigravity/Factory internal endpoints and Amp text output can change. Unknown
   formats fail explicitly instead of fabricating usage.
 - Codex token refresh is implemented for saved accounts. Antigravity refresh,
-  multi-account fan-out, cache, automatic polling and TUI remain future work.
+  multi-account fan-out for other providers, cache, automatic polling and TUI remain future work.
 - Dates without a timezone in Amp output have no invented reset instant.
 - Factory windows whose end is in the past remain unknown until replaced by fresh data.
 - The main Quotio repository was consulted read-only for Antigravity API behavior.
