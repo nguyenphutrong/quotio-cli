@@ -41,6 +41,19 @@ pub fn render(report: &UsageReport) -> String {
                 window.provenance.confidence,
                 timestamp(Some(window.fetched_at))
             );
+            if let Some(amounts) = &window.amounts {
+                let limit = amounts
+                    .limit
+                    .map(|v| format!(" of {v}"))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    text,
+                    "    balance {}{} {} remaining",
+                    amounts.remaining,
+                    limit,
+                    safe(&amounts.unit)
+                );
+            }
         }
     }
     for failure in &report.failures {

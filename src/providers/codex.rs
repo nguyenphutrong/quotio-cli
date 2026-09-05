@@ -108,6 +108,7 @@ fn parse(
                 Confidence::Exact
             };
             windows.push(QuotaWindow {
+                amounts: None,
                 label,
                 quota,
                 resets_at: reset,

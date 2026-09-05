@@ -82,9 +82,17 @@ pub struct Provenance {
     pub confidence: Confidence,
 }
 #[derive(Clone, Debug, Serialize)]
+pub struct QuotaAmounts {
+    pub remaining: f64,
+    pub limit: Option<f64>,
+    pub unit: String,
+}
+#[derive(Clone, Debug, Serialize)]
 pub struct QuotaWindow {
     pub label: String,
     pub quota: Quota,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amounts: Option<QuotaAmounts>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub resets_at: Option<OffsetDateTime>,
     pub provenance: Provenance,

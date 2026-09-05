@@ -1,3 +1,4 @@
+pub mod amp;
 pub mod codex;
 pub mod mock;
 pub(crate) mod process;

@@ -25,6 +25,7 @@ impl ProviderAdapter for MockProvider {
                 ]
                 .into_iter()
                 .map(|(label, used)| QuotaWindow {
+                    amounts: None,
                     label: label.into(),
                     quota: Quota::from_used(used),
                     resets_at: used.map(|_| datetime!(2026-01-08 0:00 UTC)),
