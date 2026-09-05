@@ -55,6 +55,13 @@ pub trait ProviderAdapter: Send + Sync {
     fn account_ref(&self) -> Option<crate::domain::AccountRef> {
         None
     }
+    /// Opaque login/scope identity. None disables caching when identity cannot be verified.
+    fn cache_identity<'a>(
+        &'a self,
+        context: &'a ProviderContext,
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(async move { crate::cache::environment_identity(&self.id().0, context) })
+    }
     fn idempotent(&self) -> bool {
         false
     }

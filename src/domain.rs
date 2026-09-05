@@ -1,12 +1,12 @@
 use crate::error::ProviderError;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct ProviderId(pub String);
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AccountIdentity {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
@@ -14,7 +14,7 @@ pub struct AccountIdentity {
     pub label: String,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Quota {
     Unknown,
@@ -71,30 +71,30 @@ impl Quota {
         Self::from_used(remaining.map(|v| 100.0 - v))
     }
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Confidence {
     Exact,
     Estimated,
     Unknown,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Provenance {
     pub source: String,
     pub confidence: Confidence,
 }
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct QuotaAmounts {
     pub remaining: f64,
     pub limit: Option<f64>,
     pub unit: String,
 }
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Consumption {
     pub used: f64,
     pub unit: String,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct QuotaWindow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consumption: Option<Consumption>,
@@ -111,12 +111,12 @@ pub struct QuotaWindow {
     #[serde(with = "time::serde::rfc3339")]
     pub fetched_at: OffsetDateTime,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AccountRef {
     pub id: String,
     pub label: String,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_ref: Option<AccountRef>,

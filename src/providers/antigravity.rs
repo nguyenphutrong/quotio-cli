@@ -408,6 +408,16 @@ impl AntigravityProvider {
     }
 }
 impl ProviderAdapter for AntigravityProvider {
+    fn cache_identity<'a>(
+        &'a self,
+        context: &'a ProviderContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let token = self.token(context).ok()?;
+            Some(crate::cache::fingerprint(&["antigravity", &token.0]))
+        })
+    }
+
     fn id(&self) -> ProviderId {
         ProviderId("antigravity".into())
     }

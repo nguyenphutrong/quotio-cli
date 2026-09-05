@@ -13,7 +13,7 @@ impl Cancellation {
     pub fn cancel(&self) {
         self.0.send_replace(true);
     }
-    async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         let mut receiver = self.0.subscribe();
         let _ = receiver.wait_for(|value| *value).await;
     }
@@ -112,7 +112,7 @@ impl Collector {
 
 // Prefer a managed snapshot only when it identifies the same account. Email-only
 // local identity is sufficient for a unique personal account, never a workspace.
-fn reconcile_accounts(providers: &mut Vec<ProviderUsage>) {
+pub(crate) fn reconcile_accounts(providers: &mut Vec<ProviderUsage>) {
     let personal = |usage: &ProviderUsage| {
         matches!(
             usage.account.plan.as_deref(),

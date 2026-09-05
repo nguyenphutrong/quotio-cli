@@ -265,6 +265,29 @@ impl ManagedProvider {
     }
 }
 impl ProviderAdapter for ManagedProvider {
+    fn cache_identity<'a>(
+        &'a self,
+        _: &'a ProviderContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let tx = begin(self.vault.clone()).await.ok()?;
+            let account = tx
+                .document
+                .accounts
+                .iter()
+                .find(|a| a.id == self.id && a.provider == self.provider)?;
+            let scope = match &account.credential {
+                Credential::CodexOAuth { account_id, .. } => account_id.clone(),
+                credential => serde_json::to_string(credential).ok()?,
+            };
+            Some(crate::cache::fingerprint(&[
+                &account.id,
+                &account.identity,
+                &scope,
+            ]))
+        })
+    }
+
     fn account_ref(&self) -> Option<crate::domain::AccountRef> {
         Some(crate::domain::AccountRef {
             id: self.id.clone(),

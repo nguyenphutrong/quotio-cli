@@ -367,6 +367,16 @@ impl AmpProvider {
     }
 }
 impl ProviderAdapter for AmpProvider {
+    fn cache_identity<'a>(
+        &'a self,
+        context: &'a ProviderContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let context = self.api_context(context).await.ok()??;
+            crate::cache::environment_identity("amp", &context)
+        })
+    }
+
     fn account_ref(&self) -> Option<AccountRef> {
         Some(AccountRef {
             id: "local".into(),

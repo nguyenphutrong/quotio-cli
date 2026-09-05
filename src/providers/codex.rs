@@ -208,7 +208,64 @@ async fn rpc(
     }
     Err(ProviderError::InvalidData)
 }
+impl CodexProvider {
+    async fn connect(
+        &self,
+    ) -> Result<
+        (
+            tokio::process::Child,
+            tokio::process::ChildStdin,
+            BufReader<tokio::process::ChildStdout>,
+        ),
+        ProviderError,
+    > {
+        let mut child = process::spawn(&self.executable, &["app-server", "--stdio"])?;
+        let mut writer = child.stdin.take().ok_or(ProviderError::Internal)?;
+        let mut reader = BufReader::new(child.stdout.take().ok_or(ProviderError::Internal)?);
+        rpc(&mut reader, &mut writer, 1, "initialize", json!({"clientInfo":{"name":"quotio","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":false}})).await?;
+        writer
+            .write_all(b"{\"method\":\"initialized\"}\n")
+            .await
+            .map_err(|_| ProviderError::Unavailable)?;
+        Ok((child, writer, reader))
+    }
+}
 impl ProviderAdapter for CodexProvider {
+    fn cache_identity<'a>(
+        &'a self,
+        _: &'a ProviderContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let (mut child, mut writer, mut reader) = self.connect().await.ok()?;
+            let identity = account(
+                rpc(
+                    &mut reader,
+                    &mut writer,
+                    2,
+                    "account/read",
+                    json!({"refreshToken":false}),
+                )
+                .await
+                .ok()?,
+            )
+            .ok()?;
+            child.kill().await.ok()?;
+            // The native protocol exposes email and plan, but no workspace ID.
+            // An email identifies a personal login only; workspaces must fetch.
+            if !matches!(
+                identity.plan_type.as_deref(),
+                Some("free" | "plus" | "pro" | "go")
+            ) {
+                return None;
+            }
+            Some(crate::cache::fingerprint(&[
+                "codex-personal",
+                &identity.email?.to_ascii_lowercase(),
+                identity.plan_type.as_deref()?,
+            ]))
+        })
+    }
+
     fn account_ref(&self) -> Option<AccountRef> {
         Some(AccountRef {
             id: "local".into(),
@@ -220,14 +277,7 @@ impl ProviderAdapter for CodexProvider {
     }
     fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
         Box::pin(async move {
-            let mut child = process::spawn(&self.executable, &["app-server", "--stdio"])?;
-            let mut writer = child.stdin.take().ok_or(ProviderError::Internal)?;
-            let mut reader = BufReader::new(child.stdout.take().ok_or(ProviderError::Internal)?);
-            rpc(&mut reader, &mut writer, 1, "initialize", json!({"clientInfo":{"name":"quotio","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":false}})).await?;
-            writer
-                .write_all(b"{\"method\":\"initialized\"}\n")
-                .await
-                .map_err(|_| ProviderError::Unavailable)?;
+            let (mut child, mut writer, mut reader) = self.connect().await?;
             let before = account(
                 rpc(
                     &mut reader,
