@@ -83,7 +83,7 @@ pub struct Provenance {
     pub source: String,
     pub confidence: Confidence,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct QuotaAmounts {
     pub remaining: f64,
     pub limit: Option<f64>,

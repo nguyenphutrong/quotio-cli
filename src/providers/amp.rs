@@ -333,6 +333,11 @@ fn local_key(path: &Path) -> Result<Option<String>, ProviderError> {
     }
 }
 impl AmpProvider {
+    pub(crate) fn has_local_key(&self) -> Result<bool, ProviderError> {
+        self.credential_path
+            .as_ref()
+            .map_or(Ok(false), |path| local_key(path).map(|key| key.is_some()))
+    }
     async fn api_context(
         &self,
         context: &ProviderContext,
@@ -361,6 +366,12 @@ impl AmpProvider {
     }
 }
 impl ProviderAdapter for AmpProvider {
+    fn account_ref(&self) -> Option<AccountRef> {
+        Some(AccountRef {
+            id: "local".into(),
+            label: "Local Amp account".into(),
+        })
+    }
     fn id(&self) -> ProviderId {
         ProviderId("amp".into())
     }
@@ -379,6 +390,28 @@ impl ProviderAdapter for AmpProvider {
 mod tests {
     use super::*;
     const FIXTURE: &str = "Signed in as demo@example.com (demo)\n**Amp Free:** 75% remaining today (resets daily) - https://ampcode.com/settings#amp-free\n**Amp Megawatt Subscription:** agent usage $12 of $20 remaining (60%), orb usage 500.5h of 750h a1.small orb hours remaining (67%) - period 2026-08-19 to 2026-09-19, resets upon renewal in 13 days\n**Individual credits:** $10.25 remaining (set up auto-reload to avoid running out) - https://ampcode.com/settings\n**Workspace Example:** $0 remaining - https://ampcode.com/workspaces/example\n";
+    #[test]
+    fn local_discovery_requires_a_public_host_key() {
+        let path =
+            std::env::temp_dir().join(format!("quotio-amp-discovery-{}.json", std::process::id()));
+        let provider = AmpProvider {
+            executable: "missing-amp".into(),
+            credential_path: Some(path.clone()),
+        };
+        for contents in [
+            r#"{}"#,
+            r#"{"apiKey@https://custom.example.invalid/":"synthetic"}"#,
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            assert!(!provider.has_local_key().unwrap());
+        }
+        std::fs::write(&path, r#"{"apiKey@https://ampcode.com/":"synthetic"}"#).unwrap();
+        assert!(provider.has_local_key().unwrap());
+        std::fs::write(&path, "invalid-json").unwrap();
+        assert!(provider.has_local_key().is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(!provider.has_local_key().unwrap());
+    }
     #[test]
     fn parse_all_categories_without_inventing_credit_quota() {
         let usage = parse(FIXTURE, OffsetDateTime::UNIX_EPOCH).unwrap();

@@ -100,14 +100,14 @@ impl Collector {
                 }),
             }
         }
-        reconcile_codex(&mut report.providers);
+        reconcile_accounts(&mut report.providers);
         report
     }
 }
 
 // Prefer a managed snapshot only when it identifies the same account. Email-only
 // local identity is sufficient for a unique personal account, never a workspace.
-fn reconcile_codex(providers: &mut Vec<ProviderUsage>) {
+fn reconcile_accounts(providers: &mut Vec<ProviderUsage>) {
     let personal = |usage: &ProviderUsage| {
         matches!(
             usage.account.plan.as_deref(),
@@ -116,7 +116,8 @@ fn reconcile_codex(providers: &mut Vec<ProviderUsage>) {
     };
     let mut remove = Vec::new();
     for (index, local) in providers.iter().enumerate() {
-        if local.provider.0 != "codex" || local.account_ref.as_ref().is_none_or(|a| a.id != "local")
+        if !matches!(local.provider.0.as_str(), "codex" | "amp")
+            || local.account_ref.as_ref().is_none_or(|a| a.id != "local")
         {
             continue;
         }
@@ -127,6 +128,24 @@ fn reconcile_codex(providers: &mut Vec<ProviderUsage>) {
                     && p.account_ref.as_ref().is_some_and(|a| a.id != "local")
             })
             .collect();
+        if local.provider.0 == "amp" {
+            let duplicate = managed.iter().any(|saved| {
+                !local.account.id.is_empty()
+                    && local.account.id.eq_ignore_ascii_case(&saved.account.id)
+                    && local.windows.len() == saved.windows.len()
+                    && local.windows.iter().zip(&saved.windows).all(|(a, b)| {
+                        a.label == b.label
+                            && a.quota == b.quota
+                            && a.amounts == b.amounts
+                            && a.resets_at == b.resets_at
+                            && a.reset_description == b.reset_description
+                    })
+            });
+            if duplicate {
+                remove.push(index);
+            }
+            continue;
+        }
         let exact = managed
             .iter()
             .any(|p| !local.account.id.is_empty() && p.account.id == local.account.id);

@@ -285,10 +285,14 @@ async fn discover(
         .await
         .unwrap_or(Err(AccountError::Busy))
 }
-fn local_codex_available() -> bool {
+fn executable_available(name: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|path| {
         std::env::split_paths(&path).any(|dir| {
-            let path = dir.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+            let path = dir.join(if cfg!(windows) {
+                format!("{name}.exe")
+            } else {
+                name.into()
+            });
             path.metadata().is_ok_and(|m| {
                 if !m.is_file() {
                     return false;
@@ -306,6 +310,45 @@ fn local_codex_available() -> bool {
         })
     })
 }
+async fn local_sources(requested: &[Provider], timeout: std::time::Duration) -> Vec<Provider> {
+    let mut sources = Vec::new();
+    if requested.contains(&Provider::Codex) && executable_available("codex") {
+        sources.push(Provider::Codex);
+    }
+    if !requested.contains(&Provider::Amp) {
+        return sources;
+    }
+    if executable_available("amp") {
+        sources.push(Provider::Amp);
+        return sources;
+    }
+    let public_amp = std::env::var("AMP_URL").map_or(true, |url| {
+        url.trim_end_matches('/') == "https://ampcode.com"
+    });
+    if public_amp {
+        let has_key = if std::env::var_os("AMP_API_KEY").is_some() {
+            true
+        } else {
+            // Reuse the bounded parser so unrelated custom-host keys do not create
+            // a local account. Unreadable/malformed credentials remain visible errors.
+            tokio::time::timeout(
+                timeout,
+                tokio::task::spawn_blocking(|| {
+                    crate::providers::amp::AmpProvider::default().has_local_key()
+                }),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .and_then(Result::ok)
+            .unwrap_or(true)
+        };
+        if has_key {
+            sources.push(Provider::Amp);
+        }
+    }
+    sources
+}
 fn managed(vault: &Vault, account: &Account) -> Arc<dyn ProviderAdapter> {
     Arc::new(ManagedProvider {
         label: account.label.clone(),
@@ -321,7 +364,7 @@ fn choose(
     filter: Option<&str>,
     accounts: Result<Vec<Account>, AccountError>,
     vault: &Vault,
-    has_local_codex: bool,
+    local_sources: &[Provider],
 ) -> Result<Vec<Arc<dyn ProviderAdapter>>, AccountError> {
     if let Some(id) = filter {
         let accounts = accounts?;
@@ -344,10 +387,13 @@ fn choose(
             Ok(accounts) => {
                 let matching: Vec<_> = accounts
                     .iter()
-                    .filter(|a| a.provider == provider && (provider == Provider::Codex || a.active))
+                    .filter(|a| {
+                        a.provider == provider
+                            && (matches!(provider, Provider::Codex | Provider::Amp) || a.active)
+                    })
                     .collect();
-                if provider == Provider::Codex {
-                    if has_local_codex || matching.is_empty() {
+                if matches!(provider, Provider::Codex | Provider::Amp) {
+                    if local_sources.contains(&provider) || matching.is_empty() {
                         selected.push(provider.adapter());
                     }
                     selected.extend(matching.into_iter().map(|a| managed(vault, a)));
@@ -358,7 +404,7 @@ fn choose(
                 }
             }
             Err(_) => {
-                if provider == Provider::Codex && has_local_codex {
+                if local_sources.contains(&provider) {
                     selected.push(provider.adapter());
                 }
                 selected.push(Arc::new(FailedProvider {
@@ -401,8 +447,14 @@ pub async fn adapters(
         return Ok(providers.into_iter().map(Provider::adapter).collect());
     }
     let vault = Vault::for_usage()?;
-    let accounts = discover(vault.clone(), timeout).await;
-    choose(providers, filter, accounts, &vault, local_codex_available())
+    let (accounts, local_sources) = tokio::join!(discover(vault.clone(), timeout), async {
+        if filter.is_none() {
+            local_sources(&providers, timeout).await
+        } else {
+            Vec::new()
+        }
+    });
+    choose(providers, filter, accounts, &vault, &local_sources)
 }
 
 #[cfg(test)]
@@ -638,6 +690,80 @@ mod tests {
         cleanup(path);
     }
     #[test]
+    fn amp_selection_keeps_local_and_all_saved_accounts() {
+        let (vault, _, _, first, path) = setup(3600, false, false, false);
+        let mut tx = vault.begin().unwrap();
+        let second = tx
+            .document
+            .add(
+                Provider::Amp,
+                "Second Amp",
+                "second@example.invalid".into(),
+                Credential::ApiKey {
+                    token: "synthetic-second".into(),
+                    region: None,
+                    organization: None,
+                },
+            )
+            .unwrap();
+        let accounts = tx.document.accounts.clone();
+        drop(tx);
+        let selected = choose(
+            vec![Provider::Amp],
+            None,
+            Ok(accounts.clone()),
+            &vault,
+            &[Provider::Amp],
+        )
+        .unwrap();
+        let refs: Vec<_> = selected
+            .iter()
+            .map(|p| p.account_ref().map(|a| a.id))
+            .collect();
+        assert_eq!(
+            refs,
+            vec![
+                Some("local".into()),
+                Some(first.clone()),
+                Some(second.clone())
+            ]
+        );
+        let only_saved =
+            choose(vec![Provider::Amp], None, Ok(accounts.clone()), &vault, &[]).unwrap();
+        assert_eq!(only_saved.len(), 2);
+        assert!(
+            only_saved
+                .iter()
+                .all(|p| p.account_ref().unwrap().id != "local")
+        );
+        let filtered = choose(
+            vec![Provider::Amp],
+            Some(&second),
+            Ok(accounts),
+            &vault,
+            &[Provider::Amp],
+        )
+        .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].account_ref().unwrap().id, second);
+        let denied = choose(
+            vec![Provider::Amp],
+            None,
+            Err(AccountError::Storage),
+            &vault,
+            &[Provider::Amp],
+        )
+        .unwrap();
+        assert_eq!(
+            denied
+                .iter()
+                .map(|p| p.account_ref().unwrap().id)
+                .collect::<Vec<_>>(),
+            vec!["local", "saved"]
+        );
+        cleanup(path);
+    }
+    #[test]
     fn codex_selection_includes_inactive_accounts_and_filters_by_id() {
         let (vault, _, first, amp, path) = setup(3600, false, false, false);
         let mut tx = vault.begin().unwrap();
@@ -669,7 +795,7 @@ mod tests {
                     None,
                     Ok(accounts.clone()),
                     &vault,
-                    true
+                    &[Provider::Codex]
                 )
                 .unwrap()
             ),
@@ -682,7 +808,7 @@ mod tests {
                     None,
                     Ok(accounts.clone()),
                     &vault,
-                    false
+                    &[]
                 )
                 .unwrap()
             ),
@@ -695,7 +821,7 @@ mod tests {
                     Some(&second),
                     Ok(accounts.clone()),
                     &vault,
-                    true
+                    &[Provider::Codex]
                 )
                 .unwrap()
             ),
@@ -707,7 +833,7 @@ mod tests {
                 Some(&amp),
                 Ok(accounts.clone()),
                 &vault,
-                true
+                &[Provider::Codex]
             ),
             Err(AccountError::NotFound)
         ));
@@ -717,7 +843,7 @@ mod tests {
                 Some("missing"),
                 Ok(accounts),
                 &vault,
-                true
+                &[Provider::Codex]
             ),
             Err(AccountError::NotFound)
         ));
@@ -728,7 +854,7 @@ mod tests {
                     None,
                     Err(AccountError::Storage),
                     &vault,
-                    true
+                    &[Provider::Codex]
                 )
                 .unwrap()
             ),

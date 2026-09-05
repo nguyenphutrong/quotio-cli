@@ -418,3 +418,118 @@ async fn account_timeout_preserves_other_accounts_and_identifies_the_failure() {
     assert_eq!(value["failures"][0]["account_ref"]["id"], "saved-slow");
     assert!(quotio::output::text::render(&report).contains("saved-slow"));
 }
+
+struct AmpCandidate {
+    selector: &'static str,
+    email: &'static str,
+    balance: f64,
+    fail: bool,
+}
+impl ProviderAdapter for AmpCandidate {
+    fn id(&self) -> ProviderId {
+        ProviderId("amp".into())
+    }
+    fn account_ref(&self) -> Option<AccountRef> {
+        Some(AccountRef {
+            id: self.selector.into(),
+            label: self.selector.into(),
+        })
+    }
+    fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
+        Box::pin(async move {
+            if self.fail {
+                return Err(ProviderError::Authentication);
+            }
+            let mut usage = MockProvider.fetch(context).await?;
+            usage.provider = self.id();
+            usage.account.id = self.email.into();
+            usage.account.label = self.email.into();
+            usage.windows[0].amounts = Some(QuotaAmounts {
+                remaining: self.balance,
+                limit: None,
+                unit: "USD".into(),
+            });
+            if self.selector == "local" {
+                usage.windows[0].fetched_at += time::Duration::seconds(1);
+            }
+            Ok(usage)
+        })
+    }
+}
+#[tokio::test]
+async fn amp_dedup_requires_same_identity_and_quota_scope() {
+    for (local_email, saved_email, local_balance, saved_balance, expected) in [
+        (
+            "local@example.invalid",
+            "saved@example.invalid",
+            10.0,
+            10.0,
+            2,
+        ),
+        (
+            "same@example.invalid",
+            "same@example.invalid",
+            10.0,
+            10.0,
+            1,
+        ),
+        (
+            "same@example.invalid",
+            "same@example.invalid",
+            10.0,
+            20.0,
+            2,
+        ),
+    ] {
+        let report = collector()
+            .collect(request(vec![
+                Arc::new(AmpCandidate {
+                    selector: "local",
+                    email: local_email,
+                    balance: local_balance,
+                    fail: false,
+                }),
+                Arc::new(AmpCandidate {
+                    selector: "saved",
+                    email: saved_email,
+                    balance: saved_balance,
+                    fail: false,
+                }),
+            ]))
+            .await;
+        assert_eq!(report.providers.len(), expected);
+        assert_eq!(report.exit_code(), 0);
+        if expected == 1 {
+            assert_eq!(
+                report.providers[0].account_ref.as_ref().unwrap().id,
+                "saved"
+            );
+        }
+    }
+}
+#[tokio::test]
+async fn amp_local_failure_keeps_saved_usage_and_failure_identity() {
+    let report = collector()
+        .collect(request(vec![
+            Arc::new(AmpCandidate {
+                selector: "local",
+                email: "local@example.invalid",
+                balance: 0.0,
+                fail: true,
+            }),
+            Arc::new(AmpCandidate {
+                selector: "saved",
+                email: "saved@example.invalid",
+                balance: 10.0,
+                fail: false,
+            }),
+        ]))
+        .await;
+    assert_eq!(report.exit_code(), 1);
+    assert_eq!(report.providers.len(), 1);
+    assert_eq!(report.failures[0].account_ref.as_ref().unwrap().id, "local");
+    assert_eq!(
+        report.providers[0].account_ref.as_ref().unwrap().id,
+        "saved"
+    );
+}
