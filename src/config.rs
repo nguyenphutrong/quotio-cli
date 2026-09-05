@@ -1,0 +1,64 @@
+use crate::cli::Provider;
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("could not read config file")]
+    Read,
+    #[error(
+        "invalid TOML config at line {line}, column {column}; expected enabled_providers = [\"mock\"]"
+    )]
+    Parse { line: usize, column: usize },
+    #[error("config contains an unsupported provider; run quotio providers")]
+    Unsupported,
+}
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    #[serde(default)]
+    pub enabled_providers: Vec<String>,
+}
+impl Config {
+    pub fn default_path() -> Option<PathBuf> {
+        directories::ProjectDirs::from("", "", "quotio")
+            .map(|dirs| dirs.config_dir().join("config.toml"))
+    }
+    pub fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
+        let path = explicit.map(Path::to_path_buf).or_else(Self::default_path);
+        let Some(path) = path else {
+            return Ok(Self::default());
+        };
+        let input = match std::fs::read_to_string(path) {
+            Ok(input) => input,
+            Err(error) if explicit.is_none() && error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(_) => return Err(ConfigError::Read),
+        };
+        Self::parse(&input)
+    }
+    pub fn parse(input: &str) -> Result<Self, ConfigError> {
+        toml::from_str(input).map_err(|error: toml::de::Error| {
+            let prefix = &input[..error.span().map(|span| span.start).unwrap_or(0)];
+            ConfigError::Parse {
+                line: prefix.bytes().filter(|byte| *byte == b'\n').count() + 1,
+                column: prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1,
+            }
+        })
+    }
+    pub fn providers(&self) -> Result<Vec<Provider>, ConfigError> {
+        let mut providers = Vec::new();
+        for id in &self.enabled_providers {
+            let provider = match id.as_str() {
+                "mock" => Provider::Mock,
+                _ => return Err(ConfigError::Unsupported),
+            };
+            if !providers.contains(&provider) {
+                providers.push(provider);
+            }
+        }
+        Ok(providers)
+    }
+}
