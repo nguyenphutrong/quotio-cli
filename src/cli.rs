@@ -23,6 +23,11 @@ pub enum Format {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Provider {
     Mock,
+    Codex,
+    Amp,
+    Antigravity,
+    #[value(alias = "droid", alias = "factory-droid")]
+    Factory,
 }
 #[derive(Debug, Args)]
 pub struct UsageArgs {
@@ -43,4 +48,29 @@ pub struct UsageArgs {
     /// Write diagnostic logs to stderr
     #[arg(long)]
     pub verbose: bool,
+}
+
+impl Provider {
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Mock => "Deterministic demo data; no live requests",
+            Self::Codex => "ChatGPT quota through installed Codex CLI",
+            Self::Amp => "Quota and balances through installed Amp CLI",
+            Self::Antigravity => "Google quota API; existing Antigravity OAuth token",
+            Self::Factory => "Factory Droid billing limits API; FACTORY_API_KEY",
+        }
+    }
+    pub fn adapter(self) -> std::sync::Arc<dyn crate::providers::ProviderAdapter> {
+        use crate::providers::{
+            amp::AmpProvider, antigravity::AntigravityProvider, codex::CodexProvider,
+            factory::FactoryProvider, mock::MockProvider,
+        };
+        match self {
+            Self::Mock => std::sync::Arc::new(MockProvider),
+            Self::Codex => std::sync::Arc::new(CodexProvider::default()),
+            Self::Amp => std::sync::Arc::new(AmpProvider::default()),
+            Self::Antigravity => std::sync::Arc::new(AntigravityProvider::default()),
+            Self::Factory => std::sync::Arc::new(FactoryProvider),
+        }
+    }
 }

@@ -1,12 +1,10 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use quotio::{
     cli::{Cli, Command, Format, Provider},
     config::Config,
     fetch::{Cancellation, CollectRequest, Collector},
     output,
-    providers::{
-        EnvironmentCredentials, ProviderAdapter, ProviderContext, SystemClock, mock::MockProvider,
-    },
+    providers::{EnvironmentCredentials, ProviderContext, SystemClock},
 };
 use std::{
     io::{self, Write},
@@ -14,6 +12,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tracing_subscriber::{filter::Targets, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -39,18 +38,34 @@ async fn main() -> ExitCode {
     };
     let (text, code) = match cli.command {
         Command::Providers => (
-            "mock  Deterministic demo data; no live requests\n".to_string(),
+            Provider::value_variants()
+                .iter()
+                .map(|provider| {
+                    format!(
+                        "{}  {}\n",
+                        provider
+                            .to_possible_value()
+                            .expect("provider value")
+                            .get_name(),
+                        provider.description()
+                    )
+                })
+                .collect(),
             0,
         ),
         Command::Usage(args) => {
-            tracing_subscriber::fmt()
-                .with_max_level(if args.verbose {
-                    tracing::Level::DEBUG
-                } else {
-                    tracing::Level::WARN
-                })
-                .with_ansi(false)
-                .with_writer(io::stderr)
+            let level = if args.verbose {
+                tracing::Level::DEBUG
+            } else {
+                tracing::Level::WARN
+            };
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(io::stderr),
+                )
+                .with(Targets::new().with_target("quotio", level))
                 .init();
             let config = match Config::load(args.config.as_deref()) {
                 Ok(config) => config,
@@ -77,12 +92,7 @@ async fn main() -> ExitCode {
                     unique.push(provider);
                 }
             }
-            let providers: Vec<Arc<dyn ProviderAdapter>> = unique
-                .into_iter()
-                .map(|provider| match provider {
-                    Provider::Mock => Arc::new(MockProvider) as Arc<dyn ProviderAdapter>,
-                })
-                .collect();
+            let providers: Vec<_> = unique.into_iter().map(Provider::adapter).collect();
             if providers.is_empty() {
                 eprintln!(
                     "No providers selected. Use --provider mock or set enabled_providers in config."

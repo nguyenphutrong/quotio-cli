@@ -1,4 +1,5 @@
 use crate::cli::Provider;
+use clap::ValueEnum;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -8,7 +9,7 @@ pub enum ConfigError {
     #[error("could not read config file")]
     Read,
     #[error(
-        "invalid TOML config at line {line}, column {column}; expected enabled_providers = [\"mock\"]"
+        "invalid TOML config at line {line}, column {column}; expected enabled_providers = [\"provider-id\"]"
     )]
     Parse { line: usize, column: usize },
     #[error("config contains an unsupported provider; run quotio providers")]
@@ -51,10 +52,7 @@ impl Config {
     pub fn providers(&self) -> Result<Vec<Provider>, ConfigError> {
         let mut providers = Vec::new();
         for id in &self.enabled_providers {
-            let provider = match id.as_str() {
-                "mock" => Provider::Mock,
-                _ => return Err(ConfigError::Unsupported),
-            };
+            let provider = Provider::from_str(id, false).map_err(|_| ConfigError::Unsupported)?;
             if !providers.contains(&provider) {
                 providers.push(provider);
             }

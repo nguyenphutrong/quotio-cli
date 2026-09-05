@@ -165,3 +165,44 @@ fn missing_config_and_help() {
         assert!(result.stderr.is_empty());
     }
 }
+
+#[test]
+fn real_provider_selection_and_mixed_missing_auth() {
+    use quotio::cli::Provider;
+    let configured =
+        Config::parse("enabled_providers = ['codex','amp','antigravity','droid','factory']")
+            .unwrap()
+            .providers()
+            .unwrap();
+    assert_eq!(
+        configured,
+        vec![
+            Provider::Codex,
+            Provider::Amp,
+            Provider::Antigravity,
+            Provider::Factory
+        ]
+    );
+    let config = ConfigFile::new("enabled_providers = []");
+    let output = Command::new(env!("CARGO_BIN_EXE_quotio"))
+        .args([
+            "usage",
+            "--provider",
+            "mock",
+            "--provider",
+            "factory",
+            "--format",
+            "json",
+            "--verbose",
+            "--config",
+        ])
+        .arg(&config.0)
+        .env_remove("FACTORY_API_KEY")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["providers"][0]["provider"], "mock");
+    assert_eq!(value["failures"][0]["provider"], "factory");
+    assert_eq!(value["failures"][0]["code"], "authentication");
+}
