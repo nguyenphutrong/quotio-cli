@@ -58,10 +58,8 @@ pub async fn run(
             region,
             organization,
         } => {
-            let label = label.trim().to_owned();
-            if label.is_empty() || label.chars().count() > 80 || label.chars().any(char::is_control)
-            {
-                return Err(AccountError::Label);
+            if let Some(label) = &label {
+                validate_label(label)?;
             }
             if provider != Provider::Factory && (region.is_some() || organization.is_some()) {
                 return Err(AccountError::Unsupported);
@@ -91,8 +89,74 @@ pub async fn run(
                 _ => return Err(AccountError::Unsupported),
             };
             let usage = service::validate(context, provider, &credential).await?;
+            let label = resolve_label(label.as_deref(), &credential)?;
             let id = service::add(vault, provider, label, credential, usage.account.id).await?;
             Ok(format!("Account validated and saved: {id}\n"))
+        }
+    }
+}
+
+fn validate_label(label: &str) -> Result<String, AccountError> {
+    let label = label.trim();
+    if label.is_empty() || label.chars().count() > 80 || label.chars().any(char::is_control) {
+        return Err(AccountError::Label);
+    }
+    Ok(label.to_owned())
+}
+fn resolve_label(explicit: Option<&str>, credential: &Credential) -> Result<String, AccountError> {
+    if let Some(label) = explicit {
+        return validate_label(label);
+    }
+    match credential {
+        Credential::CodexOAuth { email, .. } => validate_label(email),
+        Credential::ApiKey { token, .. } => {
+            // Never reveal a short key in full or expose arbitrary Unicode/control text.
+            let suffix =
+                if token.len() > 8 && token.is_ascii() && !token.chars().any(char::is_control) {
+                    &token[token.len() - 4..]
+                } else {
+                    ""
+                };
+            Ok(format!("API key ****{suffix}"))
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn key(token: &str) -> Credential {
+        Credential::ApiKey {
+            token: token.into(),
+            region: None,
+            organization: None,
+        }
+    }
+    #[test]
+    fn defaults_to_email_or_masked_key_and_respects_override() {
+        let oauth = Credential::CodexOAuth {
+            access_token: "secret-access".into(),
+            refresh_token: "secret-refresh".into(),
+            id_token: "secret-id".into(),
+            account_id: "account".into(),
+            email: "demo@example.com".into(),
+            expires_at: 0,
+        };
+        assert_eq!(resolve_label(None, &oauth).unwrap(), "demo@example.com");
+        assert_eq!(
+            resolve_label(None, &key("synthetic-key-ABCD")).unwrap(),
+            "API key ****ABCD"
+        );
+        assert_eq!(resolve_label(Some(" Work "), &oauth).unwrap(), "Work");
+        assert_eq!(
+            resolve_label(Some(" Work "), &key("synthetic-key-ABCD")).unwrap(),
+            "Work"
+        );
+        assert!(resolve_label(Some(" "), &oauth).is_err());
+    }
+    #[test]
+    fn short_and_non_ascii_keys_are_fully_masked() {
+        for token in ["abcd", "12345678", "ééééééééé", "secret\nvalue"] {
+            assert_eq!(resolve_label(None, &key(token)).unwrap(), "API key ****");
         }
     }
 }

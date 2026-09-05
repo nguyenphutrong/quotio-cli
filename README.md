@@ -66,11 +66,11 @@ never printed or logged.
 
 ```sh
 # Codex opens the official sign-in page. No Codex CLI is required.
-cargo run -- accounts add --provider codex --label Personal
+cargo run -- accounts add --provider codex
 
 # Keys come from your existing secret-manager environment, never command arguments.
-printenv AMP_API_KEY | cargo run -- accounts add --provider amp --label Work --token-stdin
-printenv FACTORY_API_KEY | cargo run -- accounts add --provider factory --label Work --token-stdin
+printenv AMP_API_KEY | cargo run -- accounts add --provider amp --token-stdin
+printenv FACTORY_API_KEY | cargo run -- accounts add --provider factory --token-stdin
 
 cargo run -- accounts list
 cargo run -- accounts list --format json
@@ -78,6 +78,11 @@ cargo run -- accounts use <account-id>
 cargo run -- accounts remove <account-id>
 cargo run -- usage --provider codex --provider amp --provider factory
 ```
+
+`--label` is optional. Codex defaults to the authenticated email. API-key accounts
+default to `API key ****ABCD`, showing only the last four ASCII characters of keys
+longer than eight characters; shorter or non-ASCII keys are fully masked. An explicit
+label takes precedence. If a label already exists, supply a different `--label`.
 
 For Codex, `--no-browser` prints the login URL without opening it. Callback binds to
 `localhost:1455/auth/callback`; close another login process if that port is busy.

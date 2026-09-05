@@ -92,8 +92,9 @@ pub enum AccountCommand {
     Add {
         #[arg(long, value_enum)]
         provider: Provider,
+        /// Override the default email or masked API-key label
         #[arg(long)]
-        label: String,
+        label: Option<String>,
         /// Read an Amp or Factory API key from a pipe; never put secrets in arguments
         #[arg(long)]
         token_stdin: bool,
