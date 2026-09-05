@@ -192,11 +192,17 @@ pub async fn exchange(
     authorization: Authorization,
     full_url: &str,
 ) -> Result<Credential, AccountError> {
+    if full_url.is_empty() || full_url.len() > 8192 || full_url.chars().any(char::is_control) {
+        return Err(AccountError::OAuth);
+    }
     let callback = reqwest::Url::parse(full_url).map_err(|_| AccountError::OAuth)?;
     if callback.scheme() != "http"
         || callback.host_str() != Some("localhost")
         || callback.port() != Some(1455)
         || callback.path() != "/auth/callback"
+        || !callback.username().is_empty()
+        || callback.password().is_some()
+        || callback.fragment().is_some()
     {
         return Err(AccountError::OAuth);
     }
@@ -294,9 +300,10 @@ impl OAuthSessionManager {
                 session.cancel.notify_one();
             }
         }
-        sessions
-            .sessions
-            .retain(|_, session| now.duration_since(session.created) <= Duration::from_secs(900));
+        sessions.sessions.retain(|_, session| {
+            session.status == SessionStatus::Processing
+                || now.duration_since(session.created) <= Duration::from_secs(900)
+        });
         if sessions.sessions.len() > 128 {
             let mut ids: Vec<_> = sessions
                 .sessions
@@ -767,6 +774,25 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn aged_processing_session_survives_pruning() {
+        let manager = manager();
+        let session = manager.begin(None, OAuthMode::Relay).await.unwrap();
+        {
+            let mut sessions = manager.sessions.lock().await;
+            let pending = sessions.sessions.get_mut(&session.id).unwrap();
+            pending.status = SessionStatus::Processing;
+            pending.created = Instant::now()
+                .checked_sub(Duration::from_secs(901))
+                .unwrap();
+            pending.authorization = None;
+        }
+        assert_eq!(
+            manager.get(&session.id).await.unwrap().status,
+            SessionStatus::Processing
+        );
+    }
+
+    #[tokio::test]
     async fn relay_sessions_are_bounded() {
         let manager = manager();
         for _ in 0..128 {
@@ -776,5 +802,27 @@ mod session_tests {
             manager.begin(None, OAuthMode::Relay).await,
             Err(AccountError::Busy)
         ));
+    }
+}
+
+#[cfg(test)]
+mod callback_url_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exchange_rejects_noncanonical_callback_urls_before_network() {
+        let context = http::fixture::context();
+        for url in [
+            "http://user@localhost:1455/auth/callback?state=s&code=c",
+            "http://localhost:1455/auth/callback?state=s&code=c#fragment",
+            "http://localhost:1455/auth/callback?state=s&code=c\n",
+            &format!("http://localhost:1455/auth/callback?{}", "x".repeat(8192)),
+        ] {
+            assert!(
+                exchange(&context, begin_authorization().unwrap(), url)
+                    .await
+                    .is_err()
+            );
+        }
     }
 }
