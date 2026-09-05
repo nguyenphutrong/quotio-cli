@@ -8,3 +8,4 @@ pub mod fetch;
 pub mod output;
 pub mod providers;
 pub mod server;
+pub mod settings;

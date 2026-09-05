@@ -1,6 +1,6 @@
 use crate::cli::Provider;
 use clap::ValueEnum;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -15,7 +15,7 @@ pub enum ConfigError {
     #[error("config contains an unsupported provider; run quotio providers")]
     Unsupported,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -23,6 +23,16 @@ pub struct Config {
     /// Maximum cache age in seconds; zero refreshes every time.
     #[serde(default = "default_cache_ttl")]
     pub cache_ttl_seconds: u64,
+    #[serde(default = "default_refresh_interval")]
+    pub refresh_interval: u64,
+    #[serde(default = "default_provider_timeout")]
+    pub provider_timeout: u64,
+}
+fn default_refresh_interval() -> u64 {
+    60
+}
+fn default_provider_timeout() -> u64 {
+    10
 }
 fn default_cache_ttl() -> u64 {
     300
@@ -32,6 +42,8 @@ impl Default for Config {
         Self {
             enabled_providers: vec![],
             cache_ttl_seconds: default_cache_ttl(),
+            refresh_interval: default_refresh_interval(),
+            provider_timeout: default_provider_timeout(),
         }
     }
 }
