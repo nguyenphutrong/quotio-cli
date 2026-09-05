@@ -78,6 +78,7 @@ mod tests {
     async fn cancelling_a_subprocess_kills_it() {
         let mut child = spawn(Path::new("/bin/sh"), &["-c", "printf ready; read value"]).unwrap();
         let pid = child.id().unwrap();
+        let stdin = child.stdin.take().unwrap();
         let mut output = child.stdout.take().unwrap();
         let mut ready = [0; 5];
         output.read_exact(&mut ready).await.unwrap();
@@ -100,5 +101,6 @@ mod tests {
         })
         .await;
         assert!(gone.is_ok());
+        drop(stdin);
     }
 }
