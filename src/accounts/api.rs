@@ -214,6 +214,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_write_failure_preserves_existing_storage() {
+        use crate::accounts::vault::Backend;
+        use std::sync::{Arc, Mutex};
+        struct WriteFails(Mutex<Option<Vec<u8>>>);
+        impl Backend for WriteFails {
+            fn read(&self) -> Result<Option<Vec<u8>>, AccountError> {
+                Ok(self.0.lock().unwrap().clone())
+            }
+            fn write(&self, _: &[u8]) -> Result<(), AccountError> {
+                Err(AccountError::Storage)
+            }
+        }
+        let backend = Arc::new(WriteFails(Mutex::new(Some(
+            serde_json::to_vec(&crate::accounts::Document::empty()).unwrap(),
+        ))));
+        let path = std::env::temp_dir().join(format!(
+            "quotio-api-write-{}.lock",
+            crate::accounts::random_string().unwrap()
+        ));
+        let vault = Vault::new(backend.clone(), path);
+        let result = save(
+            vault,
+            PreparedAccount {
+                provider: Provider::Amp,
+                label: "saved".into(),
+                credential: Credential::ApiKey {
+                    token: "secret".into(),
+                    region: None,
+                    organization: None,
+                },
+                identity: "verified".into(),
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(AccountError::Storage)));
+        assert_eq!(
+            *backend.0.lock().unwrap(),
+            Some(serde_json::to_vec(&crate::accounts::Document::empty()).unwrap())
+        );
+    }
+
+    #[tokio::test]
     async fn patch_is_one_transaction_when_label_conflicts() {
         use crate::accounts::vault::tests::Memory;
         use std::sync::Arc;

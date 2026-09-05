@@ -164,13 +164,14 @@ pub fn begin_authorization() -> Result<Authorization, AccountError> {
         url: url.into(),
     })
 }
-async fn exchange_code(
+async fn exchange_code_at(
     context: &ProviderContext,
     authorization: Authorization,
     code: &str,
+    endpoint: &str,
 ) -> Result<Credential, AccountError> {
     let tokens: Tokens = http::json(
-        context.http.post(TOKEN_URL).form(&[
+        context.http.post(endpoint).form(&[
             ("grant_type", "authorization_code"),
             ("client_id", CLIENT_ID),
             ("code", code),
@@ -186,6 +187,13 @@ async fn exchange_code(
         None,
         context.clock.now().unix_timestamp(),
     )
+}
+async fn exchange_code(
+    context: &ProviderContext,
+    authorization: Authorization,
+    code: &str,
+) -> Result<Credential, AccountError> {
+    exchange_code_at(context, authorization, code, TOKEN_URL).await
 }
 pub async fn exchange(
     context: &ProviderContext,
@@ -674,6 +682,48 @@ mod tests {
             assert!(requests[0].contains("old-refresh"));
         }
     }
+    #[tokio::test]
+    async fn token_exchange_failure_is_offline_and_keeps_production_endpoint_fixed() {
+        let context = http::fixture::context();
+        let authorization = begin_authorization().unwrap();
+        let nonce = authorization.nonce.clone();
+        let token = format!("e30.{}.signature", URL_SAFE_NO_PAD.encode(json!({"iss":"https://auth.openai.com","aud":CLIENT_ID,"nonce":nonce,"exp":10000,"email":"demo@example.com","https://api.openai.com/auth":{"chatgpt_account_id":"account"}}).to_string()));
+        let (url, task) = http::fixture::server(vec![json!({"access_token":"access","refresh_token":"refresh","id_token":token,"expires_in":3600})]).await;
+        assert!(
+            exchange_code_at(&context, authorization, "opaque-code", &url)
+                .await
+                .is_ok()
+        );
+        let requests = task.await.unwrap();
+        assert!(requests[0].contains("grant_type=authorization_code"));
+        assert!(requests[0].contains("code_verifier="));
+        let (url, task) =
+            http::fixture::server_status(vec![(500, json!({"error":"unavailable"}))]).await;
+        assert!(
+            exchange_code_at(
+                &context,
+                begin_authorization().unwrap(),
+                "opaque-code",
+                &url
+            )
+            .await
+            .is_err()
+        );
+        let _ = task.await.unwrap();
+        let (url, task) = http::fixture::server(vec![json!({"access_token":"access"})]).await;
+        assert!(
+            exchange_code_at(
+                &context,
+                begin_authorization().unwrap(),
+                "opaque-code",
+                &url
+            )
+            .await
+            .is_err()
+        );
+        let _ = task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn callback_uses_loopback_and_rejects_wrong_state() {
         for state in ["expected", "wrong"] {
