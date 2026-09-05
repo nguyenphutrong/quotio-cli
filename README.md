@@ -20,7 +20,6 @@ Zen remain absent because the reviewed sources do not provide an API-key quota o
 balance route without browser state. OpenCode Go is a separate, implemented provider.
 
 Antigravity can use the running app's local service when direct API quota is unavailable.
-See [provider contracts](plans/20260905-first-live-provider/) for source evidence.
 
 ## Run
 
@@ -454,7 +453,7 @@ the same success/partial/empty exit rules. Output write errors use code 3.
 - `src/cli.rs`, `src/config.rs`, `src/main.rs`: arguments, config and executable wiring.
 - `src/output/`: independent text and JSON renderers.
 - `tests/`: offline collection and binary contract tests.
-- `plans/plan.md`, `VALIDATION.md`: implementation plan and verification evidence.
+- `VALIDATION.md`: verification evidence.
 
 The collector runs adapters concurrently with Tokio. Each provider gets a deadline
 covering fetches and retry delays. Only an idempotent adapter returning `Transient`

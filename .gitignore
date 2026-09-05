@@ -1,4 +1,5 @@
 /target/
+/plans/
 
 # Local environment and credentials; keep sanitized templates versionable.
 .env
