@@ -76,7 +76,10 @@ impl Collector {
         };
         for (index, result) in results {
             let result = result.and_then(|usage| {
-                if usage.provider != ids[index] || usage.windows.is_empty() {
+                if usage.provider != ids[index]
+                    || usage.windows.is_empty()
+                    || usage.windows.iter().any(|window| !window.quota.is_valid())
+                {
                     Err(ProviderError::InvalidData)
                 } else {
                     Ok(usage)

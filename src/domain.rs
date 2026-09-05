@@ -45,6 +45,26 @@ impl Quota {
             }
         }
     }
+    pub fn is_valid(&self) -> bool {
+        match *self {
+            Self::Unknown => true,
+            Self::Available {
+                used_percent,
+                remaining_percent,
+            } => {
+                used_percent.is_finite()
+                    && remaining_percent.is_finite()
+                    && (0.0..100.0).contains(&used_percent)
+                    && remaining_percent > 0.0
+                    && remaining_percent <= 100.0
+                    && (used_percent + remaining_percent - 100.0).abs() < 1e-9
+            }
+            Self::Exhausted {
+                used_percent,
+                remaining_percent,
+            } => used_percent == 100.0 && remaining_percent == 0.0,
+        }
+    }
     pub fn from_remaining(remaining: Option<f64>) -> Self {
         Self::from_used(remaining.map(|v| 100.0 - v))
     }

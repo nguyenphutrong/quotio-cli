@@ -151,3 +151,93 @@ async fn success_and_empty_exit_codes() {
     );
     assert_eq!(collector().collect(request(vec![])).await.exit_code(), 3);
 }
+
+struct InvalidProvider;
+impl ProviderAdapter for InvalidProvider {
+    fn id(&self) -> ProviderId {
+        ProviderId("mock".into())
+    }
+    fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
+        Box::pin(async move {
+            let mut usage = MockProvider.fetch(context).await?;
+            usage.windows[0].quota = Quota::Available {
+                used_percent: f64::NAN,
+                remaining_percent: 50.0,
+            };
+            Ok(usage)
+        })
+    }
+}
+#[tokio::test]
+async fn invalid_adapter_data_is_a_provider_failure() {
+    let report = collector()
+        .collect(request(vec![Arc::new(InvalidProvider)]))
+        .await;
+    assert_eq!(report.exit_code(), 3);
+    assert_eq!(report.failures[0].code, ProviderError::InvalidData);
+    assert!(report.providers.is_empty());
+    assert!(
+        !Quota::Exhausted {
+            used_percent: 10.0,
+            remaining_percent: 90.0
+        }
+        .is_valid()
+    );
+    assert!(
+        !Quota::Available {
+            used_percent: 50.0,
+            remaining_percent: 40.0
+        }
+        .is_valid()
+    );
+    let json = quotio::output::json::render(&report).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        value["failures"][0],
+        serde_json::json!({"provider":"mock", "code":"invalid_data", "message":"provider returned invalid usage"})
+    );
+}
+struct DropFlag(Arc<AtomicUsize>);
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+struct PendingProvider(Arc<AtomicUsize>);
+impl ProviderAdapter for PendingProvider {
+    fn id(&self) -> ProviderId {
+        ProviderId("pending".into())
+    }
+    fn fetch<'a>(&'a self, _: &'a ProviderContext) -> FetchFuture<'a> {
+        Box::pin(async move {
+            let _guard = DropFlag(self.0.clone());
+            std::future::pending().await
+        })
+    }
+}
+#[tokio::test(start_paused = true)]
+async fn cancellation_drops_inflight_work_and_keeps_success() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let req = request(vec![
+        Arc::new(MockProvider),
+        Arc::new(PendingProvider(drops.clone())),
+    ]);
+    let cancellation = req.cancellation.clone();
+    let collect = collector();
+    let (report, ()) = tokio::join!(collect.collect(req), async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancellation.cancel();
+    });
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(report.exit_code(), 1);
+    assert_eq!(report.failures[0].code, ProviderError::Cancelled);
+}
+#[tokio::test(start_paused = true)]
+async fn deadline_drops_inflight_work() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let report = collector()
+        .collect(request(vec![Arc::new(PendingProvider(drops.clone()))]))
+        .await;
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(report.failures[0].code, ProviderError::Timeout);
+}
