@@ -111,15 +111,15 @@ pub async fn prepare(
     })
 }
 pub async fn save(vault: Vault, prepared: PreparedAccount) -> Result<AccountDto, AccountError> {
-    let id = service::add(
-        vault.clone(),
+    let account = service::add_persisted(
+        vault,
         prepared.provider,
         prepared.label,
         prepared.credential,
         prepared.identity,
     )
     .await?;
-    get(vault, id).await
+    Ok(AccountDto::from(&account))
 }
 pub async fn create(
     vault: Vault,
@@ -168,6 +168,49 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn save_returns_committed_dto_without_post_write_read() {
+        use crate::accounts::vault::Backend;
+        use std::sync::{Arc, Mutex};
+        struct ReadFailsAfterWrite(Mutex<bool>);
+        impl Backend for ReadFailsAfterWrite {
+            fn read(&self) -> Result<Option<Vec<u8>>, AccountError> {
+                if *self.0.lock().unwrap() {
+                    Err(AccountError::Storage)
+                } else {
+                    Ok(None)
+                }
+            }
+            fn write(&self, _: &[u8]) -> Result<(), AccountError> {
+                *self.0.lock().unwrap() = true;
+                Ok(())
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "quotio-api-save-{}.lock",
+            crate::accounts::random_string().unwrap()
+        ));
+        let vault = Vault::new(Arc::new(ReadFailsAfterWrite(Mutex::new(false))), path);
+        let account = save(
+            vault,
+            PreparedAccount {
+                provider: Provider::Amp,
+                label: "saved".into(),
+                credential: Credential::ApiKey {
+                    token: "secret".into(),
+                    region: None,
+                    organization: None,
+                },
+                identity: "verified".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(account.provider, Provider::Amp);
+        assert_eq!(account.label, "saved");
+        assert!(account.active);
     }
 
     #[tokio::test]

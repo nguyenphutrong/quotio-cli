@@ -132,6 +132,25 @@ async fn commit(tx: Transaction) -> Result<(), AccountError> {
         .await
         .map_err(|_| AccountError::Storage)?
 }
+pub async fn add_persisted(
+    vault: Vault,
+    provider: Provider,
+    label: String,
+    credential: Credential,
+    identity: String,
+) -> Result<Account, AccountError> {
+    let mut tx = begin(vault).await?;
+    let id = tx.document.add(provider, &label, identity, credential)?;
+    let account = tx
+        .document
+        .accounts
+        .iter()
+        .find(|account| account.id == id)
+        .cloned()
+        .ok_or(AccountError::Corrupt)?;
+    commit(tx).await?;
+    Ok(account)
+}
 pub async fn add(
     vault: Vault,
     provider: Provider,
@@ -139,10 +158,9 @@ pub async fn add(
     credential: Credential,
     identity: String,
 ) -> Result<String, AccountError> {
-    let mut tx = begin(vault).await?;
-    let id = tx.document.add(provider, &label, identity, credential)?;
-    commit(tx).await?;
-    Ok(id)
+    Ok(add_persisted(vault, provider, label, credential, identity)
+        .await?
+        .id)
 }
 pub async fn list(vault: Vault) -> Result<Vec<Account>, AccountError> {
     Ok(begin(vault).await?.document.accounts.clone())
