@@ -21,6 +21,18 @@ balance route without browser state. OpenCode Go is a separate, implemented prov
 
 Antigravity can use the running app's local service when direct API quota is unavailable.
 
+## Local REST API
+
+```sh
+cargo run -- serve --provider codex --provider amp
+curl http://127.0.0.1:8317/v1/usage
+```
+
+`serve` refreshes usage in the background and exposes read-only snapshots on
+loopback. It shares the CLI's provider adapters, saved accounts, and JSON report
+schema. See [local REST API](docs/local-http-api.md) for routes, authentication,
+refresh behavior, and startup options.
+
 ## Run
 
 Use Rust stable with edition 2024 support. The package declares Rust 1.88 or newer;
