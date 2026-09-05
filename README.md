@@ -91,11 +91,69 @@ the developer-signed build when macOS asks. The new designated requirement stays
 stable across builds under the same identifier and developer team. The workflow
 does not rewrite or weaken the vault's ACL.
 
+## Usage cache
+
+`usage` and `serve` share the persistent `UsageCache` service. Each provider/account
+is checked independently. Usage is reused while every window's `fetched_at` is less
+than `cache_ttl_seconds` old. At exactly 300 seconds with the default setting, the
+entry is expired. Missing, invalid and future-dated entries are fetched again.
+
+```sh
+quotio usage --force
+quotio usage --provider codex --force
+quotio usage --provider codex --account ACCOUNT_ID --force
+```
+
+`--force` refreshes every selected account even when its cache is fresh. It does not
+refresh unselected providers or accounts. Set `cache_ttl_seconds = 0` to refresh on
+every invocation while still retaining the last good snapshot for failures.
+
+A successful fetch saves only normalized `ProviderUsage` JSON. A failed refresh
+keeps the last good snapshot for the verified login and includes the new error in
+`failures` and CLI stderr. Its `fetched_at` stays unchanged. A report with retained
+usage and failures exits with code 1. `generated_at` is the report creation time,
+not the time every account was fetched. JSON schema version 1 is unchanged.
+
+The default directory is `ProjectDirs::cache_dir()/usage-v1`, typically
+`~/Library/Caches/quotio/usage-v1` on macOS or
+`${XDG_CACHE_HOME:-~/.cache}/quotio/usage-v1` on Linux. `QUOTIO_CACHE_DIR` can select
+another directory, including an isolated directory for tests. CLI and server must
+use the same directory to share entries. Cache JSON contains public account labels
+and usage, but no credentials, API keys, access tokens or refresh tokens. Opaque
+filenames hash the provider, account reference and login/scope identity; credential
+material used for that hash stays in memory.
+
+Account identity is checked before reuse and after a fetch. Managed accounts use
+their vault ID and login scope. Local sources reuse their existing credential
+resolvers; region, organization, project and profile settings also separate entries.
+Changing login or removing an account prevents its old entry from being returned.
+Old files remain on disk until the cache directory is cleared.
+
+When identity cannot be verified, Quotio fetches directly and does not return an
+unverified old snapshot. In particular, local Codex identifies personal accounts
+through `account/read`, but its current protocol does not expose a workspace ID.
+Local Codex workspace usage, Amp CLI-only fallback and Antigravity local-service
+fallback therefore bypass usage caching. Save a Codex workspace through Quotio to
+cache it by its managed account ID. The demo `mock` provider keeps its fixed fixture
+timestamps, so old demo windows are fetched again.
+
+Cache read/write errors produce fixed diagnostics on stderr and do not replace
+provider results. On macOS/Linux, each entry has an OS file lock covering read,
+fetch and write. Waiters recheck freshness after acquiring it. Writes use a synced
+temporary file and atomic rename; crashes release the lock. Different accounts
+can refresh concurrently. Newly created cache directories and files use private
+permissions. Platforms without the implemented OS lock bypass disk caching.
+
+Identity/lock preparation shares the provider timeout budget. A final login check
+has a separate bounded timeout so a timed-out quota request can still return a
+verified stale snapshot. Cancellation interrupts identity checks and provider work.
+
 ## Config
 
 ```toml
 # config.toml
 enabled_providers = ["mock"]
+cache_ttl_seconds = 300 # optional; default is 5 minutes
 ```
 
 `--config` chooses an explicit file. Otherwise `directories::ProjectDirs` locates
@@ -109,7 +167,7 @@ Without `--provider`, selection comes from `enabled_providers`. Explicit provide
 override selection, but any loaded config must still be valid. Missing default
 config means no enabled providers, with exit code 3. A missing explicit config,
 invalid TOML, unknown fields or unsupported provider is a config error, code 2.
-The CLI does not create config or cache directories.
+The CLI does not create a config file. It creates the usage cache directory when needed.
 
 Do not put credentials in config. Unknown fields, including token fields, are
 rejected. Parse errors show a line and column without echoing input. Argument
@@ -435,7 +493,7 @@ Missing or non-finite input becomes unknown. Finite input is clamped to 0–100.
 Unknown usage has no numeric percentage fields and never means exhausted.
 Collector rejects inconsistent numeric quota values returned by an adapter.
 Confidence is `exact`, `estimated` or `unknown`. Consumers can calculate observation
-age from `fetched_at`; this milestone has no cache or automatic stale threshold.
+age from `fetched_at`; cached failures preserve this observation time.
 
 A failure contains `provider`, a fixed `code`, and a safe `message`. Codes are
 `timeout`, `cancelled`, `transient`, `authentication`, `invalid_data`, `internal`,
@@ -501,11 +559,17 @@ Antigravity tries quota summary with a project, then without a project when need
 then model quota. Optional project discovery failures do not block this fallback;
 authentication and rate-limit failures stop it. Every window records its source.
 
-A future TUI can own `Collector`, call `collect`, display the domain report and use
-`Cancellation` on refresh or exit. It must not parse the CLI text or require changes
+A future TUI can reuse `UsageCache::collect` with a `Collector`, display the domain
+report and use `Cancellation` on refresh or exit. It must not parse the CLI text or require changes
 to provider fetch logic. No UI framework is needed in this milestone.
 
 ## Verification
+
+`tests/cache.rs` uses an injected clock and fake adapters for TTL boundaries,
+force refresh, stale failures, login/scope changes, invalid files, cancellation and
+concurrent threads/processes. `tests/usage_cache_cli.rs` uses a fake Codex executable
+to verify CLI persistence and REST reuse without live credentials or provider APIs.
+
 
 ```sh
 cargo fmt --check
@@ -537,8 +601,9 @@ symlinks or submodules. Build and runtime do not need the reference checkout.
   global host; compatibility with actual subscription keys remains unverified.
 - Saved account storage is macOS-only. Factory selects the active saved account;
   the other managed providers support multiple saved accounts/keys.
-- No general usage cache, automatic polling or TUI is implemented. Native Antigravity
-  has a separate short-lived access-token cache, not a cache of quota results.
+- Usage cache and REST polling are implemented; no TUI is included. Native Antigravity
+  also has an existing, separate access-token cache in Keychain. Usage cache files
+  never contain those tokens.
 - Dates without a timezone in Amp output have no invented reset instant.
 - Factory windows whose end is in the past remain unknown until replaced by fresh data.
 - Reference projects were consulted read-only. Build/runtime require none of their

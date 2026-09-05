@@ -27,7 +27,7 @@ port, or `--listen '[::1]:8317'` for IPv6 loopback.
 | --- | --- | --- |
 | `--listen` | `127.0.0.1:8317` | Loopback IP address and port; non-loopback addresses are rejected |
 | `--provider` | Config selection | Repeat to enable multiple providers; duplicates are removed |
-| `--config` | Platform config path | Read `enabled_providers` from this TOML file |
+| `--config` | Platform config path | Read `enabled_providers` and `cache_ttl_seconds` from this TOML file |
 | `--refresh-interval` | `60` | Seconds to wait after each completed refresh, from 1 to 86400 |
 | `--timeout` | `10` | Per-provider collection deadline, including retries, from 1 to 3600 seconds |
 | `--no-saved-accounts` | Off | Skip the Quotio account vault and use environment/local sources |
@@ -69,18 +69,29 @@ accepted in HTTP paths. Query parameters are not supported.
 The first refresh starts when the server starts. HTTP reads use memory snapshots
 and never trigger another provider fetch. Refreshes run one cycle at a time, with
 the configured wait after completion. Each cycle publishes its report atomically.
+The shared `UsageCache` service reads
+persistent entries also used by `quotio usage`. Only missing or expired accounts
+are fetched; the default TTL is 300 seconds, configurable as `cache_ttl_seconds` in
+TOML. `--refresh-interval` controls how often the server checks, independently of
+that TTL. REST GET requests do not provide a force-refresh option.
 
 Until the first cycle finishes, usage routes return 503 with `not_ready`. Afterwards,
 a valid usage report returns 200 even if some or all providers failed. Inspect the
 `failures` array to determine provider health; HTTP success only means a report is
 available.
 
-A failed account refresh keeps that account's last successful snapshot alongside the
-new failure. Its original window `fetched_at` values remain unchanged. `generated_at`
+A failed account refresh keeps that verified login's last successful snapshot
+alongside the new failure. Its original window `fetched_at` values remain unchanged. `generated_at`
 is the latest report time, not proof that every account was just fetched. Clients
 should display the failure and use each window's `fetched_at` to assess age. Old
-snapshots have no automatic expiry. A successful refresh replaces them; a successfully
-discovered account removal removes them. There is no disk cache across server restarts.
+snapshots may remain available through repeated failures even after their TTL expires.
+A successful refresh replaces them. Removed accounts disappear on the next discovery
+cycle. If login identity cannot be verified, no old snapshot is restored. The HTTP
+transport does not perform its own stale-data merge.
+
+Disk entries survive server restarts. CLI and REST share the same cache directory;
+`QUOTIO_CACHE_DIR` overrides its platform default. See the README's usage cache
+section for storage, concurrency, diagnostics and native identity limitations.
 
 This follows OpenUsage's local snapshot approach, but uses Quotio's own report schema.
 It is not an implementation of OpenUsage's `/v1/limits` or legacy UI response format.
