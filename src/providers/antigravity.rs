@@ -251,14 +251,19 @@ impl AntigravityProvider {
                 .header("User-Agent", "quotio-cli/0.1.0")
                 .json(&payload)
         };
-        let subscription: Value = http::json(
+        let subscription: Result<Value, _> = http::json(
             post(
                 "loadCodeAssist",
                 json!({"metadata":{"ideType":"ANTIGRAVITY"}}),
             ),
             context.clock.now(),
         )
-        .await?;
+        .await;
+        let subscription = match subscription {
+            Ok(value) => value,
+            Err(ProviderError::Unavailable | ProviderError::InvalidData) => json!({}),
+            Err(error) => return Err(error),
+        };
         let project = subscription.get("cloudaicompanionProject");
         let project = match project {
             None | Some(Value::Null) => None,
@@ -268,24 +273,32 @@ impl AntigravityProvider {
         let payload = project
             .map(|p| json!({"project":p}))
             .unwrap_or_else(|| json!({}));
-        let result: Result<Value, _> = http::json(
-            post("retrieveUserQuotaSummary", payload.clone()),
-            context.clock.now(),
-        )
-        .await;
-        let windows = match result {
-            Ok(value) => match summary(&value, context.clock.now()) {
-                Ok(windows) => windows,
-                Err(_) => models(
-                    http::json(post("fetchAvailableModels", payload), context.clock.now()).await?,
-                    context.clock.now(),
-                )?,
-            },
-            Err(ProviderError::Unavailable | ProviderError::InvalidData) => models(
+        let attempts = if project.is_some() {
+            vec![payload.clone(), json!({})]
+        } else {
+            vec![payload.clone()]
+        };
+        let mut selected = None;
+        for body in attempts {
+            let result: Result<Value, _> =
+                http::json(post("retrieveUserQuotaSummary", body), context.clock.now()).await;
+            match result {
+                Ok(value) => {
+                    if let Ok(windows) = summary(&value, context.clock.now()) {
+                        selected = Some(windows);
+                        break;
+                    }
+                }
+                Err(ProviderError::Unavailable | ProviderError::InvalidData) => (),
+                Err(error) => return Err(error),
+            }
+        }
+        let windows = match selected {
+            Some(windows) => windows,
+            None => models(
                 http::json(post("fetchAvailableModels", payload), context.clock.now()).await?,
                 context.clock.now(),
             )?,
-            Err(error) => return Err(error),
         };
         Ok(ProviderUsage {
             provider: self.id(),
@@ -348,6 +361,7 @@ mod tests {
             json!({"id":"demo-id","email":"demo@example.com"}),
             json!({"cloudaicompanionProject":"demo-project"}),
             json!({}),
+            json!({}),
             json!({"models":{"test-model":{"quotaInfo":{"remainingFraction":0.5}}}}),
         ])
         .await;
@@ -369,6 +383,7 @@ mod tests {
         for (request, method) in requests[1..].iter().zip([
             "loadCodeAssist",
             "retrieveUserQuotaSummary",
+            "retrieveUserQuotaSummary",
             "fetchAvailableModels",
         ]) {
             assert!(request.starts_with(&format!("POST /v1internal:{method} ")));
@@ -379,6 +394,73 @@ mod tests {
                 .all(|r| r.contains("Bearer synthetic-token"))
         );
         assert!(requests[2].contains("demo-project"));
-        assert!(requests[3].contains("demo-project"));
+        assert!(requests[3].ends_with("{}"));
+        assert!(requests[4].contains("demo-project"));
+    }
+    #[tokio::test]
+    async fn optional_subscription_and_projectless_summary_are_supported() {
+        for unavailable in [false, true] {
+            let mut responses = vec![(200, json!({"id":"demo-id","email":"demo@example.com"}))];
+            if unavailable {
+                responses.push((404, json!({})));
+            } else {
+                responses.extend([
+                    (200, json!({"cloudaicompanionProject":"demo-project"})),
+                    (200, json!({})),
+                ]);
+            }
+            responses.push((200,json!({"groups":[{"name":"Gemini","buckets":[{"name":"weekly","remainingFraction":0.5}]}]})));
+            let (base, task) = http::fixture::server_status(responses).await;
+            let provider = AntigravityProvider {
+                auth_directory: None,
+            };
+            let context = http::fixture::context();
+            let usage = provider
+                .fetch_api(
+                    &context,
+                    &format!("{base}/v1internal:"),
+                    &format!("{base}/userinfo"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                usage.windows[0].provenance.source,
+                "antigravity_api_summary"
+            );
+            let requests = task.await.unwrap();
+            assert!(
+                requests
+                    .last()
+                    .unwrap()
+                    .starts_with("POST /v1internal:retrieveUserQuotaSummary ")
+            );
+            assert!(requests.last().unwrap().ends_with("{}"));
+        }
+    }
+    #[tokio::test]
+    async fn auth_and_rate_limits_do_not_trigger_source_fallback() {
+        for (status, expected) in [
+            (401, ProviderError::Authentication),
+            (429, ProviderError::RateLimited),
+        ] {
+            let (base, task) = http::fixture::server_status(vec![
+                (200, json!({"id":"demo-id","email":"demo@example.com"})),
+                (status, json!({})),
+            ])
+            .await;
+            let context = http::fixture::context();
+            let provider = AntigravityProvider {
+                auth_directory: None,
+            };
+            let result = provider
+                .fetch_api(
+                    &context,
+                    &format!("{base}/v1internal:"),
+                    &format!("{base}/userinfo"),
+                )
+                .await;
+            assert_eq!(result.unwrap_err(), expected);
+            assert_eq!(task.await.unwrap().len(), 2);
+        }
     }
 }
