@@ -17,6 +17,7 @@ pub struct Definition {
     pub settings: &'static [Setting],
     pub fetch: for<'a> fn(&'a ProviderContext) -> FetchFuture<'a>,
 }
+pub mod azure;
 pub mod balances;
 pub mod coding;
 pub mod common;
@@ -29,6 +30,7 @@ pub mod oauth_primary;
 pub mod tools;
 pub fn definitions() -> impl Iterator<Item = &'static Definition> {
     [
+        azure::DEFINITIONS,
         doubao::DEFINITIONS,
         balances::DEFINITIONS,
         infrastructure::DEFINITIONS,
