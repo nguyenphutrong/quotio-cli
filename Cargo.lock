@@ -859,11 +859,13 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "clap",
+ "core-foundation",
  "directories",
  "libc",
  "reqwest",
  "ring",
  "security-framework",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "thiserror",

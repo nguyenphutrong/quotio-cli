@@ -400,7 +400,7 @@ pub async fn adapters(
         }
         return Ok(providers.into_iter().map(Provider::adapter).collect());
     }
-    let vault = Vault::system()?;
+    let vault = Vault::for_usage()?;
     let accounts = discover(vault.clone(), timeout).await;
     choose(providers, filter, accounts, &vault, local_codex_available())
 }

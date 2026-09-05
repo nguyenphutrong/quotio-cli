@@ -14,8 +14,24 @@ use std::{
 };
 use tracing_subscriber::{filter::Targets, layer::SubscriberExt, util::SubscriberInitExt};
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            eprintln!("Could not initialize runtime.");
+            return ExitCode::from(3);
+        }
+    };
+    let result = runtime.block_on(run());
+    // Native Keychain calls cannot be cancelled by dropping a Rust future.
+    // Do not wait for a blocked native call after the command deadline has expired.
+    runtime.shutdown_background();
+    result
+}
+async fn run() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error)

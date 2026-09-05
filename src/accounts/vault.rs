@@ -10,15 +10,40 @@ pub trait Backend: Send + Sync {
     /// Atomically replace this application's document; leave old data on failure.
     fn write(&self, bytes: &[u8]) -> Result<(), AccountError>;
 }
-pub struct Keychain;
+pub struct Keychain {
+    interactive: bool,
+}
+#[cfg(target_os = "macos")]
+impl Keychain {
+    fn options(&self) -> security_framework::passwords::PasswordOptions {
+        let mut options = security_framework::passwords::PasswordOptions::new_generic_password(
+            "app.quotio.cli.accounts.v1",
+            "vault",
+        );
+        if !self.interactive {
+            use core_foundation::{base::TCFType, string::CFString};
+            use security_framework_sys::item::kSecUseAuthenticationUI;
+            // This public Security.framework constant is absent from the pinned sys bindings.
+            unsafe extern "C" {
+                static kSecUseAuthenticationUIFail: core_foundation::string::CFStringRef;
+            }
+            // The pinned wrapper exposes no setter for this per-query native option.
+            #[allow(deprecated)]
+            unsafe {
+                options.query.push((
+                    CFString::wrap_under_get_rule(kSecUseAuthenticationUI),
+                    CFString::wrap_under_get_rule(kSecUseAuthenticationUIFail).into_CFType(),
+                ));
+            }
+        }
+        options
+    }
+}
 impl Backend for Keychain {
     fn read(&self) -> Result<Option<Vec<u8>>, AccountError> {
         #[cfg(target_os = "macos")]
         {
-            match security_framework::passwords::get_generic_password(
-                "app.quotio.cli.accounts.v1",
-                "vault",
-            ) {
+            match security_framework::passwords::generic_password(self.options()) {
                 Ok(bytes) => Ok(Some(bytes)),
                 Err(e) if e.code() == -25300 => Ok(None),
                 Err(_) => Err(AccountError::Storage),
@@ -32,12 +57,8 @@ impl Backend for Keychain {
     fn write(&self, bytes: &[u8]) -> Result<(), AccountError> {
         #[cfg(target_os = "macos")]
         {
-            security_framework::passwords::set_generic_password(
-                "app.quotio.cli.accounts.v1",
-                "vault",
-                bytes,
-            )
-            .map_err(|_| AccountError::Storage)
+            security_framework::passwords::set_generic_password_options(bytes, self.options())
+                .map_err(|_| AccountError::Storage)
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -58,9 +79,15 @@ pub struct Transaction {
 }
 impl Vault {
     pub fn system() -> Result<Self, AccountError> {
+        Self::system_with_interaction(true)
+    }
+    pub fn for_usage() -> Result<Self, AccountError> {
+        Self::system_with_interaction(false)
+    }
+    fn system_with_interaction(interactive: bool) -> Result<Self, AccountError> {
         let dirs = directories::ProjectDirs::from("", "", "quotio").ok_or(AccountError::Storage)?;
         Ok(Self::new(
-            Arc::new(Keychain),
+            Arc::new(Keychain { interactive }),
             dirs.data_local_dir().join("accounts.lock"),
         ))
     }
@@ -235,6 +262,24 @@ pub(crate) mod tests {
         drop(tx);
         std::fs::remove_file(dir.join("lock")).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn usage_keychain_queries_fail_instead_of_prompting() {
+        use core_foundation::{base::TCFType, string::CFString};
+        use security_framework_sys::item::kSecUseAuthenticationUI;
+        unsafe extern "C" {
+            static kSecUseAuthenticationUIFail: core_foundation::string::CFStringRef;
+        }
+        let key = unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationUI) };
+        let fail =
+            unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationUIFail).into_CFType() };
+        #[allow(deprecated)]
+        let noninteractive = Keychain { interactive: false }.options().query;
+        #[allow(deprecated)]
+        let interactive = Keychain { interactive: true }.options().query;
+        assert!(noninteractive.iter().any(|(k, v)| k == &key && v == &fail));
+        assert!(!interactive.iter().any(|(k, _)| k == &key));
     }
     #[cfg(target_os = "macos")]
     #[test]
