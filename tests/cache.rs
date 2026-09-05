@@ -386,3 +386,64 @@ async fn fifo_cache_is_rejected_without_waiting_for_a_writer() {
     assert!(report.failures.is_empty());
     assert_eq!(a.calls.load(Ordering::SeqCst), 2);
 }
+
+#[tokio::test]
+async fn environment_key_and_scope_changes_invalidate_without_persisting_secrets() {
+    struct Keys {
+        key: String,
+        org: String,
+    }
+    impl CredentialStore for Keys {
+        fn get(&self, name: &str) -> Option<Secret> {
+            match name {
+                "FACTORY_API_KEY" => Some(Secret(self.key.clone())),
+                "FACTORY_ORG_ID" => Some(Secret(self.org.clone())),
+                _ => None,
+            }
+        }
+    }
+    struct EnvAdapter(AtomicUsize);
+    impl ProviderAdapter for EnvAdapter {
+        fn id(&self) -> ProviderId {
+            ProviderId("factory".into())
+        }
+        fn fetch<'a>(&'a self, c: &'a ProviderContext) -> FetchFuture<'a> {
+            Box::pin(async {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let mut usage = MockProvider.fetch(c).await?;
+                usage.provider = self.id();
+                for w in &mut usage.windows {
+                    w.fetched_at = c.clock.now();
+                }
+                Ok(usage)
+            })
+        }
+    }
+    let mut f = Fixture::new();
+    let a = Arc::new(EnvAdapter(AtomicUsize::new(0)));
+    for (key, org) in [
+        ("secret-sentinel-one", "org-a"),
+        ("secret-sentinel-one", "org-b"),
+        ("secret-sentinel-two", "org-b"),
+    ] {
+        f.collector.context.credentials = Arc::new(Keys {
+            key: key.into(),
+            org: org.into(),
+        });
+        f.collect(vec![a.clone()], false).await;
+        f.collect(vec![a.clone()], false).await;
+    }
+    assert_eq!(a.0.load(Ordering::SeqCst), 3);
+    for entry in std::fs::read_dir(&f.dir).unwrap() {
+        let path = entry.unwrap().path();
+        assert!(
+            !path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("secret-sentinel")
+        );
+        let bytes = std::fs::read(path).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("secret-sentinel"));
+    }
+}

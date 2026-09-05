@@ -62,6 +62,10 @@ pub trait ProviderAdapter: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
         Box::pin(async move { crate::cache::environment_identity(&self.id().0, context) })
     }
+    /// Whether this result belongs to the login verified by cache_identity.
+    fn cacheable(&self, _: &ProviderUsage) -> bool {
+        true
+    }
     fn idempotent(&self) -> bool {
         false
     }

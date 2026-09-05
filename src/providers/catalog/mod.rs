@@ -50,6 +50,44 @@ pub fn find(id: &str) -> Option<&'static Definition> {
 
 pub struct CatalogProvider(pub &'static str);
 impl crate::providers::ProviderAdapter for CatalogProvider {
+    fn cache_identity<'a>(
+        &'a self,
+        context: &'a ProviderContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let definition = find(self.0)?;
+            // Cloud project scope can come from native config even with an explicit token.
+            if matches!(self.0, "kiro" | "vertexai") {
+                return oauth_cloud::cache_identity(self.0, context).await;
+            }
+            if definition.auth == AuthKind::ApiKey
+                || context.credentials.get(definition.key_env).is_some()
+            {
+                return crate::cache::environment_identity(self.0, context);
+            }
+            let token = match self.0 {
+                "claude" | "gemini" | "copilot" => {
+                    oauth_primary::cache_token(self.0, context).await
+                }
+                "cursor" | "grok" => oauth_editors::cache_token(self.0, context).await,
+                _ => None,
+            }?;
+            let mut parts = vec![self.0.to_owned(), token.0];
+            for setting in definition.settings {
+                parts.push(
+                    context
+                        .credentials
+                        .get(setting.env)
+                        .map(|v| v.0)
+                        .unwrap_or_default(),
+                );
+            }
+            Some(crate::cache::fingerprint(
+                &parts.iter().map(String::as_str).collect::<Vec<_>>(),
+            ))
+        })
+    }
+
     fn id(&self) -> crate::domain::ProviderId {
         crate::domain::ProviderId(self.0.into())
     }

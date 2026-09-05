@@ -1166,6 +1166,48 @@ async fn fetch_vertex_at(
     Ok(result)
 }
 
+// Hash native credential material in memory; do not refresh OAuth during a cache lookup.
+pub(super) async fn cache_identity(id: &str, context: &ProviderContext) -> Option<String> {
+    let parts = match id {
+        "kiro" => {
+            if let Some(token) = context.credentials.get("KIRO_ACCESS_TOKEN") {
+                let (region, profile) = kiro_metadata(context, None, None).ok()?;
+                vec![token.0, region, profile.unwrap_or_default()]
+            } else {
+                let source = read_native_json(kiro_auth_path().ok()?).await.ok()??;
+                let credential = parse_kiro_native(&source).ok()?;
+                let (region, profile) = kiro_metadata(
+                    context,
+                    credential.region.as_deref(),
+                    credential.profile_arn.as_deref(),
+                )
+                .ok()?;
+                vec![
+                    serde_json::to_string(&source).ok()?,
+                    region,
+                    profile.unwrap_or_default(),
+                ]
+            }
+        }
+        "vertexai" => {
+            let project = vertex_project(context).await.ok()?;
+            if let Some(token) = context.credentials.get("VERTEXAI_ACCESS_TOKEN") {
+                vec![token.0, project]
+            } else {
+                let source = read_native_json(vertex_adc_path(context).ok()?)
+                    .await
+                    .ok()??;
+                parse_vertex_adc(&source).ok()?;
+                vec![serde_json::to_string(&source).ok()?, project]
+            }
+        }
+        _ => return None,
+    };
+    Some(crate::cache::fingerprint(
+        &parts.iter().map(String::as_str).collect::<Vec<_>>(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1187,6 +1229,67 @@ mod tests {
             std::process::id(),
             NEXT_FILE.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[tokio::test]
+    async fn native_cache_identity_tracks_credentials_and_project_without_refreshing() {
+        struct Keys(std::collections::HashMap<String, String>);
+        impl crate::providers::CredentialStore for Keys {
+            fn get(&self, name: &str) -> Option<Secret> {
+                self.0.get(name).cloned().map(Secret)
+            }
+        }
+        let path = temp_file("cache-identity");
+        let write = |token: &str| {
+            fs::write(&path, serde_json::to_vec(&json!({
+            "type": "authorized_user", "client_id": "fixture-client", "client_secret": "fixture-secret", "refresh_token": token
+        })).unwrap()).unwrap()
+        };
+        let context = |project: &str| {
+            let mut context = fixture::context();
+            context.credentials = std::sync::Arc::new(Keys(
+                [
+                    (
+                        "GOOGLE_APPLICATION_CREDENTIALS".into(),
+                        path.to_string_lossy().into_owned(),
+                    ),
+                    ("VERTEXAI_PROJECT_ID".into(), project.into()),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+            context
+        };
+        write("fixture-refresh-a");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let first = cache_identity("vertexai", &context("project-one"))
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            cache_identity("vertexai", &context("project-one"))
+                .await
+                .unwrap()
+        );
+        assert_ne!(
+            first,
+            cache_identity("vertexai", &context("project-two"))
+                .await
+                .unwrap()
+        );
+        write("fixture-refresh-b");
+        assert_ne!(
+            first,
+            cache_identity("vertexai", &context("project-one"))
+                .await
+                .unwrap()
+        );
+        assert!(!first.contains("fixture"));
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

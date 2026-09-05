@@ -197,6 +197,7 @@ impl UsageCache {
                         && usage.account_ref.as_ref().map(|a| &a.id)
                             == adapter.account_ref().as_ref().map(|a| &a.id)
                         && valid(usage)
+                        && adapter.cacheable(usage)
                 }),
                 _ => {
                     diagnostic("could not read usage cache; fetching usage");
@@ -250,6 +251,9 @@ impl UsageCache {
                 == identity;
         if same_identity {
             if let Some(usage) = report.providers.first() {
+                if !adapter.cacheable(usage) {
+                    return report;
+                }
                 if let Some(entry) = entry {
                     let usage = usage.clone();
                     if !matches!(

@@ -955,6 +955,16 @@ async fn fetch_copilot_at(
     Ok(usage)
 }
 
+// Resolve the existing login without sending a quota request or refreshing tokens.
+pub(super) async fn cache_token(id: &str, context: &ProviderContext) -> Option<Secret> {
+    match id {
+        "claude" => claude_token(context).await.ok(),
+        "gemini" => gemini_token(context).await.ok(),
+        "copilot" => copilot_token(context).await.ok(),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

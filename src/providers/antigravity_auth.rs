@@ -479,6 +479,16 @@ impl Session {
     }
 }
 
+pub(crate) async fn usage_cache_identity() -> Option<String> {
+    keychain_task(|| {
+        NativeStore
+            .credential()
+            .map(|credential| credential.fingerprint())
+    })
+    .await
+    .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

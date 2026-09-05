@@ -689,6 +689,14 @@ fn secret_from_text(value: &str) -> Result<Secret, ProviderError> {
     Ok(Secret(value.into()))
 }
 
+pub(super) async fn cache_token(id: &str, context: &ProviderContext) -> Option<Secret> {
+    match id {
+        "cursor" => cursor_token(context).await.ok(),
+        "grok" => grok_token(context).await.ok(),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

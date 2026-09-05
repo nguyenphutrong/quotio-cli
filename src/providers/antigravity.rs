@@ -408,13 +408,30 @@ impl AntigravityProvider {
     }
 }
 impl ProviderAdapter for AntigravityProvider {
+    fn cacheable(&self, usage: &ProviderUsage) -> bool {
+        // A local-service fallback may use a different login from Keychain.
+        usage
+            .windows
+            .iter()
+            .all(|w| w.provenance.source != "antigravity_local_service")
+    }
+
     fn cache_identity<'a>(
         &'a self,
         context: &'a ProviderContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
         Box::pin(async move {
-            let token = self.token(context).ok()?;
-            Some(crate::cache::fingerprint(&["antigravity", &token.0]))
+            if context
+                .credentials
+                .get("ANTIGRAVITY_ACCESS_TOKEN")
+                .is_some()
+                || context.credentials.get("ANTIGRAVITY_AUTH_FILE").is_some()
+            {
+                let token = self.token(context).ok()?;
+                Some(crate::cache::fingerprint(&["antigravity", &token.0]))
+            } else {
+                super::antigravity_auth::usage_cache_identity().await
+            }
         })
     }
 
