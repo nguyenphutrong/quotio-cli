@@ -153,6 +153,7 @@ impl UsageCache {
         cancellation: crate::fetch::Cancellation,
         force: bool,
     ) -> UsageReport {
+        let deadline = tokio::time::Instant::now() + timeout;
         let prepare = async {
             let identity = adapter.cache_identity(&context).await?;
             let key = fingerprint(&[
@@ -181,7 +182,7 @@ impl UsageCache {
         let prepared = tokio::select! {
             biased;
             _ = cancellation.cancelled() => None,
-            result = tokio::time::timeout(timeout, prepare) => result.unwrap_or_else(|_| { diagnostic("usage cache identity or lock timed out; fetching usage"); None }),
+            result = tokio::time::timeout_at(deadline, prepare) => result.unwrap_or_else(|_| { diagnostic("usage cache identity or lock timed out; fetching usage"); None }),
         };
         let (identity, entry) = match prepared {
             Some((id, entry)) => (Some(id), Some(entry)),
@@ -208,15 +209,12 @@ impl UsageCache {
         }
         // Recheck after waiting for another process and before serving a snapshot.
         let same_identity = identity.is_some()
-            && tokio::time::timeout(timeout, adapter.cache_identity(&context))
-                .await
-                .ok()
-                .flatten()
-                == identity;
+            && checked_identity(&*adapter, &context, deadline, &cancellation).await == identity;
         if !same_identity {
             snapshot = None;
         }
         if !force
+            && tokio::time::Instant::now() < deadline
             && snapshot
                 .as_ref()
                 .is_some_and(|usage| self.fresh(usage, context.clock.now()))
@@ -236,16 +234,19 @@ impl UsageCache {
         let mut report = collector
             .collect(CollectRequest {
                 providers: vec![adapter.clone()],
-                timeout,
-                cancellation,
+                timeout: deadline.saturating_duration_since(tokio::time::Instant::now()),
+                cancellation: cancellation.clone(),
             })
             .await;
         // A login change during fetch must never populate the previous login's entry.
         let same_identity = same_identity
-            && tokio::time::timeout(timeout, adapter.cache_identity(&context))
-                .await
-                .ok()
-                .flatten()
+            && checked_identity(
+                &*adapter,
+                &context,
+                tokio::time::Instant::now() + timeout,
+                &cancellation,
+            )
+            .await
                 == identity;
         if same_identity {
             if let Some(usage) = report.providers.first() {
@@ -273,6 +274,18 @@ impl UsageCache {
             })
     }
 }
+async fn checked_identity(
+    adapter: &dyn ProviderAdapter,
+    context: &ProviderContext,
+    deadline: tokio::time::Instant,
+    cancellation: &crate::fetch::Cancellation,
+) -> Option<String> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        result = tokio::time::timeout_at(deadline, adapter.cache_identity(context)) => result.ok().flatten(),
+    }
+}
 fn diagnostic(message: &str) {
     eprintln!("quotio: {message}");
 }
@@ -289,11 +302,21 @@ fn valid(usage: &ProviderUsage) -> bool {
         })
 }
 fn read(path: &Path) -> io::Result<Option<ProviderUsage>> {
-    let file = match File::open(path) {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
+    if !file.metadata()?.is_file() {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
     let mut bytes = Vec::new();
     file.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
     if bytes.len() > 4 * 1024 * 1024 {
@@ -309,7 +332,14 @@ struct LockedEntry {
 }
 impl LockedEntry {
     fn open(directory: &Path, key: &str) -> io::Result<Self> {
-        std::fs::create_dir_all(directory)?;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(directory)?;
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]

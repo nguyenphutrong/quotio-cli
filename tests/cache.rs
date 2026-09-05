@@ -32,6 +32,9 @@ impl CredentialStore for NoCredentials {
 }
 struct Adapter {
     account: String,
+    provider: String,
+    stall: AtomicBool,
+    switch_during_fetch: AtomicBool,
     login: Mutex<String>,
     calls: AtomicUsize,
     fails: AtomicBool,
@@ -40,6 +43,9 @@ impl Adapter {
     fn new(account: &str) -> Arc<Self> {
         Arc::new(Self {
             account: account.into(),
+            provider: "mock".into(),
+            stall: AtomicBool::new(false),
+            switch_during_fetch: AtomicBool::new(false),
             login: Mutex::new(account.into()),
             calls: AtomicUsize::new(0),
             fails: AtomicBool::new(false),
@@ -48,7 +54,7 @@ impl Adapter {
 }
 impl ProviderAdapter for Adapter {
     fn id(&self) -> ProviderId {
-        ProviderId("mock".into())
+        ProviderId(self.provider.clone())
     }
     fn account_ref(&self) -> Option<AccountRef> {
         Some(AccountRef {
@@ -65,10 +71,18 @@ impl ProviderAdapter for Adapter {
     fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
         Box::pin(async {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.stall.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if self.switch_during_fetch.load(Ordering::SeqCst) {
+                *self.login.lock().unwrap() = "changed-during-fetch".into();
+            }
+
             if self.fails.load(Ordering::SeqCst) {
                 return Err(ProviderError::Unavailable);
             }
             let mut usage = MockProvider.fetch(context).await?;
+            usage.provider = self.id();
             usage.account.id = self.login.lock().unwrap().clone();
             for window in &mut usage.windows {
                 window.fetched_at = context.clock.now();
@@ -289,4 +303,86 @@ fn concurrent_process_writes_leave_a_complete_normalized_snapshot() {
             .unwrap()
             .all(|p| p.unwrap().path().extension().unwrap() != "tmp")
     );
+}
+
+#[tokio::test]
+async fn provider_names_isolate_identical_account_ids() {
+    let f = Fixture::new();
+    let a = Adapter::new("same");
+    let mut b = Adapter::new("same");
+    Arc::get_mut(&mut b).unwrap().provider = "another-provider".into();
+    let report = f.collect(vec![a.clone(), b.clone()], false).await;
+    assert_eq!(report.providers.len(), 2);
+    f.collect(vec![b.clone(), a.clone()], false).await;
+    assert_eq!(a.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+}
+#[tokio::test]
+async fn timeout_retains_stale_snapshot_and_cancellation_releases_lock() {
+    let f = Fixture::new();
+    let a = Adapter::new("a");
+    let first = f.collect(vec![a.clone()], false).await;
+    a.stall.store(true, Ordering::SeqCst);
+    let report = f
+        .cache
+        .collect(
+            &f.collector,
+            CollectRequest {
+                providers: vec![a.clone()],
+                timeout: Duration::from_millis(100),
+                cancellation: Cancellation::default(),
+            },
+            true,
+        )
+        .await;
+    assert_eq!(report.failures[0].code, ProviderError::Timeout);
+    assert_eq!(
+        report.providers[0].windows[0].fetched_at,
+        first.providers[0].windows[0].fetched_at
+    );
+    let cancellation = Cancellation::default();
+    cancellation.cancel();
+    let cancelled = f
+        .cache
+        .collect(
+            &f.collector,
+            CollectRequest {
+                providers: vec![a.clone()],
+                timeout: Duration::from_secs(3),
+                cancellation,
+            },
+            false,
+        )
+        .await;
+    assert_eq!(cancelled.failures[0].code, ProviderError::Cancelled);
+    a.stall.store(false, Ordering::SeqCst);
+    assert!(f.collect(vec![a.clone()], true).await.failures.is_empty());
+}
+#[tokio::test]
+async fn login_change_during_failed_refresh_cannot_restore_old_usage() {
+    let f = Fixture::new();
+    let a = Adapter::new("local");
+    f.collect(vec![a.clone()], false).await;
+    a.switch_during_fetch.store(true, Ordering::SeqCst);
+    a.fails.store(true, Ordering::SeqCst);
+    let report = f.collect(vec![a.clone()], true).await;
+    assert!(report.providers.is_empty());
+    assert_eq!(report.failures.len(), 1);
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn fifo_cache_is_rejected_without_waiting_for_a_writer() {
+    let f = Fixture::new();
+    let a = Adapter::new("a");
+    f.collect(vec![a.clone()], false).await;
+    let path = f.json();
+    std::fs::remove_file(&path).unwrap();
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+    let report = tokio::time::timeout(Duration::from_secs(2), f.collect(vec![a.clone()], false))
+        .await
+        .unwrap();
+    assert!(report.failures.is_empty());
+    assert_eq!(a.calls.load(Ordering::SeqCst), 2);
 }
