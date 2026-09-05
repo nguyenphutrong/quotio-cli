@@ -1,5 +1,6 @@
 //! HTTP management and snapshot transport; provider work uses the shared usage cache.
 mod management;
+mod openapi;
 mod operations;
 mod security;
 #[cfg(test)]
@@ -139,6 +140,7 @@ fn timestamp(now: time::OffsetDateTime) -> String {
 }
 fn router(state: Arc<ApiState>, policy: Arc<security::Policy>) -> Router {
     Router::new()
+        .route("/openapi.json", get(openapi::document))
         .route("/health", get(health))
         .route("/v1/status", get(status))
         .route(

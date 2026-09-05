@@ -30,8 +30,7 @@ curl http://127.0.0.1:8317/v1/usage
 
 `serve` refreshes usage in the background and exposes read-only snapshots on
 loopback. It shares the CLI's provider adapters, saved accounts, and JSON report
-schema. See [local REST API](docs/local-http-api.md) for routes, authentication,
-refresh behavior, and startup options.
+schema. Add `--manage` with `QUOTIO_SERVER_TOKEN` to enable managed account, Codex OAuth relay/loopback, settings, and refresh operations. `--public-url` records an HTTPS reverse-proxy origin and `--allow-origin` enables exact CORS origins; neither provisions TLS or changes the loopback listener. See [local REST API](docs/local-http-api.md) for routes, authentication, refresh behavior, and startup options. The complete contract is [OpenAPI 3.1](docs/openapi.json). Managed writes use idempotency keys, with up to 128 live operations retained for 15 minutes. Linux account storage still has no vault backend, and adding a provider requires its supported native login or credential path.
 
 ## Run
 

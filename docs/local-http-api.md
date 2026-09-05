@@ -28,27 +28,36 @@ port, or `--listen '[::1]:8317'` for IPv6 loopback.
 | `--listen` | `127.0.0.1:8317` | Loopback IP address and port; non-loopback addresses are rejected |
 | `--provider` | Config selection | Repeat to enable multiple providers; duplicates are removed |
 | `--config` | Platform config path | Read `enabled_providers` and `cache_ttl_seconds` from this TOML file |
-| `--refresh-interval` | `60` | Seconds to wait after each completed refresh, from 1 to 86400 |
-| `--timeout` | `10` | Per-provider collection deadline, including retries, from 1 to 3600 seconds |
+| `--refresh-interval` | Config, then `60` | Seconds to wait after each completed refresh, from 1 to 86400 |
+| `--timeout` | Config, then `10` | Per-provider collection deadline, including retries, from 1 to 3600 seconds |
 | `--no-saved-accounts` | Off | Skip the Quotio account vault and use environment/local sources |
+| `--manage` | Off | Enable account, OAuth, settings, and refresh writes; requires `QUOTIO_SERVER_TOKEN` |
+| `--public-url` | None | External HTTPS origin supplied by a reverse proxy or tunnel; requires the server token |
+| `--allow-origin` | None | Exact browser origin allowed for CORS preflight and responses; repeat for multiple origins |
 
-Without `--provider`, the server uses `enabled_providers` from the existing CLI
-configuration. An empty selection is a startup error. Config and enabled provider
-selection are read once at startup. Saved accounts are discovered again each cycle,
-so accounts added or removed through `quotio accounts` take effect on refresh.
+Without `--provider`, the server uses `enabled_providers` from the existing CLI configuration. An empty selection is allowed and serves an empty report until providers are enabled. Startup loads the configuration, while `GET /v1/settings` rechecks the file and applies external changes safely; effective changes invalidate the usage snapshot. Saved accounts are discovered again each cycle.
 
 The same adapters and collector used by `quotio usage` fetch data. Existing provider
 credential refresh behavior still applies, including managed OAuth token rotation.
-No HTTP endpoint adds accounts, changes credentials, or starts a login.
+The read-only default has no account or settings writes. `--manage` adds the managed API described in [openapi.json](openapi.json): account mutations, Codex OAuth session relay/loopback callbacks, settings updates, and asynchronous refresh. Codex OAuth sessions can create a managed Codex account through the session and callback routes; other native provider logins still happen in the supported provider CLI or application.
 
 ## Routes
 
 | Request | Response |
 | --- | --- |
 | `GET /health` | `{"status":"ok","ready":true}`; `ready` means the first refresh has completed, even if providers failed |
-| `GET /v1/providers` | `schema_version: 1` and a `providers` array with `id`, `description`, and `enabled` |
+| `GET /v1/providers` | `schema_version: 1` and a `providers` array with `id`, `description`, `enabled`, and `capabilities` |
 | `GET /v1/usage` | Latest report for all enabled providers and their accounts |
 | `GET /v1/usage/{provider}` | The same report shape filtered to one enabled, canonical provider ID |
+| `GET /openapi.json` | OpenAPI 3.1 contract for all routes |
+| `GET /v1/status` | Refresh state and current settings revision |
+| `GET /v1/accounts` and `/v1/accounts/{id}` | Managed account metadata; available in read-only mode when account storage is enabled |
+| `POST/PATCH/DELETE /v1/accounts...` | Asynchronous managed account mutations; require `Idempotency-Key` (1–128 visible ASCII characters) |
+| `POST /v1/auth/sessions` and callback routes | Codex OAuth relay or loopback session lifecycle (requires `--manage`) |
+| `GET /v1/settings` | Current settings and revision; available in read-only mode |
+| `PATCH /v1/settings` | Optimistic revision patch; requires `--manage` |
+| `POST /v1/refresh` | Asynchronous refresh request (requires `--manage`) |
+| `GET /v1/operations/{id}` | Operation status; completed entries are retained for 15 minutes |
 
 Usage responses use Quotio's existing `schema_version: 1` JSON contract, matching
 `quotio usage --format json`: `generated_at`, `providers`, and `failures`. Each usage
@@ -61,8 +70,26 @@ accounts after the collector's normal deduplication. Disabled and unknown provid
 return 404. Route IDs are canonical IDs from `/v1/providers`; CLI aliases are not
 accepted in HTTP paths. Query parameters are not supported.
 
-`HEAD` is supported with no response body. Other methods, including `OPTIONS`, return
-405 unless rejected earlier by host, origin, or authentication checks.
+`HEAD` is supported with no response body. `OPTIONS` returns 204 for an allowed CORS preflight when `--allow-origin` matches; unsupported methods return 405. Read routes remain available without `--manage`; write routes are rejected as read-only unless management mode is enabled.
+
+## Managed request examples
+
+Create an API-key account with a synthetic credential and poll the returned operation:
+
+```sh
+curl -X POST http://127.0.0.1:8317/v1/accounts \
+  -H "Authorization: Bearer $QUOTIO_SERVER_TOKEN" \
+  -H "Idempotency-Key: demo-account-1" -H 'Content-Type: application/json' \
+  -d '{"provider":"synthetic","api_key":"synthetic-example-key","settings":{},"region":null,"organization":null}'
+curl -H "Authorization: Bearer $QUOTIO_SERVER_TOKEN" http://127.0.0.1:8317/v1/operations/OPERATION_ID
+```
+
+Settings patches include the current `revision`; a stale revision returns 409
+`revision_conflict`, so read `GET /v1/settings` and retry. `POST /v1/refresh` returns
+202 with an operation ID. OAuth begins with `POST /v1/auth/sessions` using
+`callback_mode` `relay` or `loopback`; open the returned URL, paste the redirect URL
+into the callback endpoint for relay mode, then poll the session with `GET` or cancel
+it with `DELETE`.
 
 ## Refresh and failures
 
@@ -115,7 +142,7 @@ Responses include `Cache-Control: no-store` and `X-Content-Type-Options: nosniff
 Account labels, email addresses, usage, and balances can appear just as in CLI JSON;
 provider credentials and server tokens are not serialized. There is no request/header
 logging. Up to 16 HTTP handlers can run at once; this is a handler limit, not a TCP
-connection limit. This server does not provide TLS or remote network access.
+connection limit. `--public-url` declares the HTTPS origin of a separately operated reverse proxy; it does not provision TLS or open a remote listener. Quotio itself remains loopback-only.
 
 ## Error codes
 
@@ -130,6 +157,8 @@ API errors use `{"error":"code"}`. Provider failures remain inside a usage repor
 | 405 | `method_not_allowed` |
 | 503 | `not_ready`, `server_busy` |
 | 500 | `encoding_failed` |
+
+Managed routes also use `idempotency_key_required`, `invalid_idempotency_key`, `idempotency_conflict`, `operations_full`, `account_storage_disabled`, and account or OAuth-specific errors. A settings patch with a stale `revision` returns 409 `revision_conflict`; read `GET /v1/settings` and retry against the returned revision.
 
 Malformed HTTP is rejected by the HTTP stack before these API handlers. Startup
 argument/config errors exit with code 2; initialization or bind errors use code 3.
