@@ -17,10 +17,22 @@ pub struct Definition {
     pub settings: &'static [Setting],
     pub fetch: for<'a> fn(&'a ProviderContext) -> FetchFuture<'a>,
 }
+pub mod balances;
+pub mod coding;
 pub mod common;
+pub mod gateways;
+pub mod infrastructure;
 pub mod tools;
 pub fn definitions() -> impl Iterator<Item = &'static Definition> {
-    tools::DEFINITIONS.iter()
+    [
+        balances::DEFINITIONS,
+        infrastructure::DEFINITIONS,
+        coding::DEFINITIONS,
+        gateways::DEFINITIONS,
+        tools::DEFINITIONS,
+    ]
+    .into_iter()
+    .flatten()
 }
 pub fn find(id: &str) -> Option<&'static Definition> {
     definitions().find(|d| d.id == id)
