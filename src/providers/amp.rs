@@ -1,15 +1,22 @@
 use super::{FetchFuture, ProviderAdapter, ProviderContext, process};
 use crate::{domain::*, error::ProviderError};
-use std::path::PathBuf;
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use time::OffsetDateTime;
 
 pub struct AmpProvider {
     pub executable: PathBuf,
+    pub credential_path: Option<PathBuf>,
 }
 impl Default for AmpProvider {
     fn default() -> Self {
         Self {
             executable: "amp".into(),
+            credential_path: directories::BaseDirs::new()
+                .map(|dirs| dirs.home_dir().join(".local/share/amp/secrets.json")),
         }
     }
 }
@@ -46,7 +53,7 @@ fn window(
         label: label.into(),
         provenance: Provenance {
             source: "amp_cli_usage".into(),
-            confidence: if quota == Quota::Unknown {
+            confidence: if quota == Quota::Unknown && amounts.is_none() {
                 Confidence::Unknown
             } else {
                 Confidence::Estimated
@@ -110,16 +117,17 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
         .filter(|s| s.contains('@') && !s.contains(char::is_whitespace))
         .ok_or(ProviderError::InvalidData)?;
     let mut windows = Vec::new();
-    for line in input.lines() {
-        if let Some(rest) = line.strip_prefix("**Amp Free:** ") {
+    for raw_line in input.lines() {
+        let normalized = raw_line.replace("**", "");
+        let line = normalized.trim();
+        if let Some(rest) = line.strip_prefix("Amp Free: ") {
             windows.push(window(
                 "Amp Free daily",
                 Quota::from_remaining(Some(percent(rest)?)),
                 None,
                 now,
             ));
-        } else if let Some(rest) = line.strip_prefix("**Amp Megawatt Subscription:** agent usage ")
-        {
+        } else if let Some(rest) = line.strip_prefix("Amp Megawatt Subscription: agent usage ") {
             let amounts = dollars(rest)?;
             windows.push(window(
                 "Megawatt agent subscription",
@@ -136,7 +144,7 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
                     now,
                 ));
             }
-        } else if let Some(rest) = line.strip_prefix("**Individual credits:** ") {
+        } else if let Some(rest) = line.strip_prefix("Individual credits: ") {
             let amounts = dollars(rest)?;
             windows.push(window(
                 "Individual credits",
@@ -144,8 +152,8 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
                 Some(amounts),
                 now,
             ));
-        } else if let Some(rest) = line.strip_prefix("**Workspace ") {
-            let (name, rest) = rest.split_once(":** ").ok_or(ProviderError::InvalidData)?;
+        } else if let Some(rest) = line.strip_prefix("Workspace ") {
+            let (name, rest) = rest.split_once(": ").ok_or(ProviderError::InvalidData)?;
             let amounts = dollars(rest)?;
             windows.push(window(
                 &format!("Workspace {name} credits"),
@@ -153,7 +161,8 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
                 Some(amounts),
                 now,
             ));
-        } else if line.starts_with("**") && !line.trim().is_empty() {
+        } else if raw_line.starts_with("**") || line.starts_with("Amp ") && !line.trim().is_empty()
+        {
             // Do not silently omit a newly introduced quota category.
             return Err(ProviderError::InvalidData);
         }
@@ -231,12 +240,88 @@ impl ProviderAdapter for AmpApiProvider {
         ))
     }
 }
+struct ApiKey(String);
+impl super::CredentialStore for ApiKey {
+    fn get(&self, name: &str) -> Option<super::Secret> {
+        (name == "AMP_API_KEY").then(|| super::Secret(self.0.clone()))
+    }
+}
+fn local_key(path: &Path) -> Result<Option<String>, ProviderError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(ProviderError::Authentication),
+    };
+    let metadata = file.metadata().map_err(|_| ProviderError::Authentication)?;
+    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        return Err(ProviderError::InvalidData);
+    }
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ProviderError::Authentication)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(ProviderError::InvalidData);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| ProviderError::InvalidData)?;
+    let key = value
+        .get("apiKey@https://ampcode.com/")
+        .or_else(|| value.get("apiKey@https://ampcode.com"));
+    match key {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
+            .map(|s| Some(s.to_owned()))
+            .ok_or(ProviderError::Authentication),
+    }
+}
+impl AmpProvider {
+    async fn api_context(
+        &self,
+        context: &ProviderContext,
+    ) -> Result<Option<ProviderContext>, ProviderError> {
+        if context
+            .credentials
+            .get("AMP_URL")
+            .is_some_and(|url| url.0.trim_end_matches('/') != "https://ampcode.com")
+        {
+            return Ok(None);
+        }
+        if context.credentials.get("AMP_API_KEY").is_some() {
+            return Ok(Some(context.clone()));
+        }
+        let Some(path) = self.credential_path.clone() else {
+            return Ok(None);
+        };
+        let key = tokio::task::spawn_blocking(move || local_key(&path))
+            .await
+            .map_err(|_| ProviderError::Internal)??;
+        Ok(key.map(|key| ProviderContext {
+            http: context.http.clone(),
+            clock: context.clock.clone(),
+            credentials: Arc::new(ApiKey(key)),
+        }))
+    }
+}
 impl ProviderAdapter for AmpProvider {
     fn id(&self) -> ProviderId {
         ProviderId("amp".into())
     }
     fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
         Box::pin(async move {
+            if let Some(api_context) = self.api_context(context).await? {
+                return AmpApiProvider.fetch(&api_context).await;
+            }
             let bytes = process::output(&self.executable, &["usage"]).await?;
             let text = std::str::from_utf8(&bytes).map_err(|_| ProviderError::InvalidData)?;
             parse(text, context.clock.now())
@@ -295,7 +380,7 @@ mod tests {
             }
         }
         let (url, task) = super::super::http::fixture::server(vec![
-            serde_json::json!({"ok":true,"result":{"displayText":FIXTURE}}),
+            serde_json::json!({"ok":true,"result":{"displayText":FIXTURE.replace("**", "")}}),
         ])
         .await;
         let mut context = super::super::http::fixture::context();
@@ -308,5 +393,77 @@ mod tests {
         assert!(requests[0].contains("Bearer synthetic-key"));
         assert!(requests[0].contains("userDisplayBalanceInfo"));
         assert!(!requests[0].to_lowercase().contains("cookie:"));
+    }
+    #[test]
+    fn plain_api_response_preserves_subscription_usage_and_balances() {
+        let api_text = FIXTURE.replace("**", "");
+        let usage = parse(&api_text, OffsetDateTime::UNIX_EPOCH).unwrap();
+        assert_eq!(usage.windows.len(), 5);
+        assert_eq!(usage.windows[1].quota, Quota::from_used(Some(40.0)));
+        assert_eq!(usage.windows[2].amounts.as_ref().unwrap().remaining, 500.5);
+    }
+    #[test]
+    fn balance_only_text_does_not_claim_unknown_usage() {
+        let usage = parse(&FIXTURE.replace("**", ""), OffsetDateTime::UNIX_EPOCH).unwrap();
+        let text = crate::output::text::render(&UsageReport {
+            schema_version: 1,
+            generated_at: OffsetDateTime::UNIX_EPOCH,
+            providers: vec![usage],
+            failures: vec![],
+        });
+        assert!(text.contains("used 8.00 of 20 USD"));
+        let balance = text
+            .lines()
+            .find(|line| line.contains("Individual credits:"))
+            .unwrap();
+        assert!(balance.contains("balance 10.25 USD remaining"));
+        assert!(!balance.contains("unknown"));
+        assert!(text.contains("Workspace Example credits: balance 0.00 USD remaining"));
+    }
+    #[tokio::test]
+    async fn local_key_is_bounded_and_used_only_for_public_amp_host() {
+        let directory = std::env::temp_dir().join(crate::accounts::random_string().unwrap());
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("secrets.json");
+        std::fs::write(
+            &path,
+            br#"{"apiKey@https://ampcode.com/":"synthetic-local-key"}"#,
+        )
+        .unwrap();
+        let provider = AmpProvider {
+            executable: PathBuf::from("not-used"),
+            credential_path: Some(path.clone()),
+        };
+        let original = std::fs::read(&path).unwrap();
+        let api = provider
+            .api_context(&super::super::http::fixture::context())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            api.credentials.get("AMP_API_KEY").unwrap().0,
+            "synthetic-local-key"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        #[cfg(unix)]
+        {
+            let link = directory.join("link.json");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(local_key(&link).is_err());
+            std::fs::remove_file(link).unwrap();
+        }
+        struct CustomHost;
+        impl super::super::CredentialStore for CustomHost {
+            fn get(&self, name: &str) -> Option<super::super::Secret> {
+                (name == "AMP_URL").then(|| super::super::Secret("https://example.invalid".into()))
+            }
+        }
+        let mut context = super::super::http::fixture::context();
+        context.credentials = Arc::new(CustomHost);
+        assert!(provider.api_context(&context).await.unwrap().is_none());
+        std::fs::write(&path, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        assert!(local_key(&path).is_err());
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 }

@@ -31,7 +31,17 @@ pub fn render(report: &UsageReport) -> String {
             );
         }
         for window in &usage.windows {
+            let balance_only = window.quota == Quota::Unknown
+                && window.amounts.as_ref().is_some_and(|a| a.limit.is_none());
             let quota = match window.quota {
+                Quota::Unknown if balance_only => {
+                    let amounts = window.amounts.as_ref().expect("balance amount");
+                    format!(
+                        "balance {:.2} {} remaining",
+                        amounts.remaining,
+                        safe(&amounts.unit)
+                    )
+                }
                 Quota::Unknown => "usage unknown; remaining unknown".into(),
                 Quota::Available {
                     used_percent,
@@ -39,17 +49,35 @@ pub fn render(report: &UsageReport) -> String {
                 } => format!("used {used_percent:.1}%; remaining {remaining_percent:.1}%"),
                 Quota::Exhausted { .. } => "exhausted; used 100.0%; remaining 0.0%".into(),
             };
+            let reset = if balance_only && window.resets_at.is_none() {
+                String::new()
+            } else {
+                format!("; reset {}", timestamp(window.resets_at))
+            };
             let _ = writeln!(
                 text,
-                "  {}: {}; reset {}; source {} ({:?}); fetched {}",
+                "  {}: {}{}; source {} ({:?}); fetched {}",
                 safe(&window.label),
                 quota,
-                timestamp(window.resets_at),
+                reset,
                 safe(&window.provenance.source),
                 window.provenance.confidence,
                 timestamp(Some(window.fetched_at))
             );
-            if let Some(amounts) = &window.amounts {
+            if let Some(amounts) = &window.amounts
+                && !balance_only
+            {
+                if let Some(limit) = amounts.limit.filter(|limit| *limit >= amounts.remaining) {
+                    let _ = writeln!(
+                        text,
+                        "    used {:.2} of {limit} {}; remaining {:.2} {}",
+                        limit - amounts.remaining,
+                        safe(&amounts.unit),
+                        amounts.remaining,
+                        safe(&amounts.unit)
+                    );
+                    continue;
+                }
                 let limit = amounts
                     .limit
                     .map(|v| format!(" of {v}"))
