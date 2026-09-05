@@ -47,7 +47,7 @@ impl Kind {
     }
 }
 pub struct KeyApiProvider(pub Kind);
-fn number(value: Option<&Value>) -> Result<Option<f64>, ProviderError> {
+pub(crate) fn number(value: Option<&Value>) -> Result<Option<f64>, ProviderError> {
     match value {
         None | Some(Value::Null) => Ok(None),
         Some(v) => {
@@ -74,7 +74,7 @@ fn currency(value: Option<&Value>) -> Result<Option<f64>, ProviderError> {
     }
     number(value)
 }
-fn date(value: Option<&Value>) -> Result<Option<OffsetDateTime>, ProviderError> {
+pub(crate) fn date(value: Option<&Value>) -> Result<Option<OffsetDateTime>, ProviderError> {
     match value {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => OffsetDateTime::parse(s, &Rfc3339)

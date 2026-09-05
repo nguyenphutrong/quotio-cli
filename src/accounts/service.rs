@@ -25,6 +25,28 @@ fn scoped(
     credential: &Credential,
 ) -> Result<ProviderContext, AccountError> {
     let mut keys = HashMap::new();
+    if let Credential::CatalogKey { token, settings } = credential {
+        let definition = provider
+            .catalog()
+            .filter(|d| d.auth == crate::providers::catalog::AuthKind::ApiKey)
+            .ok_or(AccountError::Unsupported)?;
+        keys.insert(definition.key_env.into(), token.clone());
+        for (name, value) in settings {
+            let setting = definition
+                .settings
+                .iter()
+                .find(|s| s.name == name)
+                .ok_or(AccountError::Settings)?;
+            keys.insert(setting.env.into(), value.clone());
+        }
+        if definition
+            .settings
+            .iter()
+            .any(|s| s.required && !settings.contains_key(s.name))
+        {
+            return Err(AccountError::Settings);
+        }
+    }
     if let Credential::ApiKey {
         token,
         region,
@@ -63,7 +85,9 @@ pub async fn validate(
         Provider::Amp => AmpApiProvider.fetch(&ctx).await?,
         Provider::Factory => FactoryProvider.fetch(&ctx).await?,
         Provider::Codex => codex_api::fetch(&ctx, credential).await?,
-        provider if provider.key_api().is_some() => provider.adapter().fetch(&ctx).await?,
+        provider if provider.key_api().is_some() || provider.catalog().is_some() => {
+            provider.adapter().fetch(&ctx).await?
+        }
         _ => return Err(AccountError::Unsupported),
     };
     if usage.windows.is_empty()
@@ -317,7 +341,9 @@ async fn local_sources(requested: &[Provider], timeout: std::time::Duration) -> 
         .iter()
         .copied()
         .filter(|p| {
-            p.key_api().is_some()
+            (p.key_api().is_some()
+                || p.catalog()
+                    .is_some_and(|d| d.auth == crate::providers::catalog::AuthKind::ApiKey))
                 && p.api_key_name()
                     .is_some_and(|name| std::env::var_os(name).is_some())
         })
@@ -986,5 +1012,56 @@ mod tests {
         assert!(b.is_ok());
         assert_eq!(fake.refreshes.load(Ordering::SeqCst), 1);
         cleanup(path);
+    }
+}
+
+#[cfg(test)]
+mod catalog_credential_tests {
+    use super::*;
+    #[test]
+    fn saved_catalog_settings_are_isolated_and_roundtrip() {
+        for definition in crate::providers::catalog::definitions()
+            .filter(|d| d.auth == crate::providers::catalog::AuthKind::ApiKey)
+        {
+            let settings = definition
+                .settings
+                .iter()
+                .map(|s| (s.name.to_owned(), "scope-value".to_owned()))
+                .collect();
+            let credential = Credential::CatalogKey {
+                token: "saved-synthetic-key".into(),
+                settings,
+            };
+            let serialized = serde_json::to_string(&credential).unwrap();
+            let decoded: Credential = serde_json::from_str(&serialized).unwrap();
+            assert!(decoded == credential);
+            let context = scoped(
+                &crate::providers::http::fixture::context(),
+                Provider::Catalog(definition.id),
+                &credential,
+            )
+            .unwrap();
+            assert_eq!(
+                context.credentials.get(definition.key_env).unwrap().0,
+                "saved-synthetic-key"
+            );
+            assert!(context.credentials.get("FACTORY_API_KEY").is_none());
+            for setting in definition.settings {
+                assert_eq!(
+                    context.credentials.get(setting.env).unwrap().0,
+                    "scope-value"
+                );
+            }
+            let invalid = Credential::CatalogKey {
+                token: "saved-synthetic-key".into(),
+                settings: [("unknown".into(), "private-value".into())]
+                    .into_iter()
+                    .collect(),
+            };
+            assert!(matches!(
+                scoped(&context, Provider::Catalog(definition.id), &invalid),
+                Err(AccountError::Settings)
+            ));
+        }
     }
 }

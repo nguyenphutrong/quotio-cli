@@ -2,6 +2,7 @@ pub mod amp;
 pub mod antigravity;
 pub(crate) mod antigravity_auth;
 mod antigravity_local;
+pub mod catalog;
 pub mod codex;
 pub mod codex_api;
 pub mod factory;
@@ -44,8 +45,10 @@ pub struct ProviderContext {
 }
 pub type FetchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ProviderUsage, ProviderError>> + Send + 'a>>;
-/// Fetch must be cancellation-safe: dropping its future stops all work.
-/// Never detach tasks or return raw server diagnostics. Only public account and
+/// Dropping fetch must cancel network requests and child processes. Native OS reads
+/// may finish after cancellation; keep those closures read-only and bound their
+/// response size and caller wait. Never detach writes or return raw diagnostics.
+/// Only public account and
 /// quota metadata belongs in ProviderUsage.
 pub trait ProviderAdapter: Send + Sync {
     fn id(&self) -> ProviderId;

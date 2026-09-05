@@ -121,10 +121,13 @@ fn reconcile_accounts(providers: &mut Vec<ProviderUsage>) {
     };
     let mut remove = Vec::new();
     for (index, local) in providers.iter().enumerate() {
-        if !matches!(
+        let catalog_key = crate::providers::catalog::find(&local.provider.0)
+            .is_some_and(|d| d.auth == crate::providers::catalog::AuthKind::ApiKey);
+        if (!matches!(
             local.provider.0.as_str(),
             "codex" | "amp" | "synthetic" | "openrouter" | "zai" | "minimax"
-        ) || local.account_ref.as_ref().is_none_or(|a| a.id != "local")
+        ) && !catalog_key)
+            || local.account_ref.as_ref().is_none_or(|a| a.id != "local")
         {
             continue;
         }

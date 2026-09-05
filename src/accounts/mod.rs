@@ -27,6 +27,10 @@ pub enum AccountError {
     Input,
     #[error("enter the API key in a terminal without --token-stdin, or pipe it with --token-stdin")]
     InputMode,
+    #[error("invalid or missing provider setting; run quotio providers for required settings")]
+    Settings,
+    #[error("this provider uses a native OAuth login; sign in through its app/CLI or set {0}")]
+    NativeOAuth(&'static str),
     #[error("credential validation failed: {0}")]
     Provider(#[from] ProviderError),
     #[error("login timed out or was cancelled")]
@@ -41,6 +45,10 @@ pub enum AccountError {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Credential {
+    CatalogKey {
+        token: String,
+        settings: std::collections::BTreeMap<String, String>,
+    },
     ApiKey {
         token: String,
         region: Option<String>,

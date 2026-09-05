@@ -66,6 +66,7 @@ pub async fn run(
             no_browser,
             region,
             organization,
+            settings,
         } => {
             if let Some(label) = &label {
                 validate_label(label)?;
@@ -79,6 +80,12 @@ pub async fn run(
             if !region_valid || (provider != Provider::Factory && organization.is_some()) {
                 return Err(AccountError::Unsupported);
             }
+            if let Some(definition) = provider.catalog()
+                && definition.auth == crate::providers::catalog::AuthKind::OAuth
+            {
+                return Err(AccountError::NativeOAuth(definition.key_env));
+            }
+            let metadata = provider_settings(provider, &settings, context)?;
             let credential = match provider {
                 Provider::Codex if !token_stdin => {
                     super::oauth::login(context, !no_browser).await?
@@ -99,10 +106,17 @@ pub async fn run(
                     {
                         return Err(AccountError::Input);
                     }
-                    Credential::ApiKey {
-                        token: token.into(),
-                        region,
-                        organization,
+                    if provider.catalog().is_some() {
+                        Credential::CatalogKey {
+                            token: token.into(),
+                            settings: metadata,
+                        }
+                    } else {
+                        Credential::ApiKey {
+                            token: token.into(),
+                            region,
+                            organization,
+                        }
                     }
                 }
                 _ => return Err(AccountError::Unsupported),
@@ -115,6 +129,45 @@ pub async fn run(
     }
 }
 
+fn provider_settings(
+    provider: Provider,
+    args: &[String],
+    context: &ProviderContext,
+) -> Result<std::collections::BTreeMap<String, String>, AccountError> {
+    let Some(definition) = provider.catalog() else {
+        return if args.is_empty() {
+            Ok(Default::default())
+        } else {
+            Err(AccountError::Settings)
+        };
+    };
+    let mut values = std::collections::BTreeMap::new();
+    for arg in args {
+        let (name, value) = arg.split_once('=').ok_or(AccountError::Settings)?;
+        if !definition.settings.iter().any(|s| s.name == name)
+            || value.is_empty()
+            || value.len() > 2048
+            || value.chars().any(char::is_control)
+            || values.insert(name.to_owned(), value.to_owned()).is_some()
+        {
+            return Err(AccountError::Settings);
+        }
+    }
+    for setting in definition.settings {
+        if !values.contains_key(setting.name)
+            && let Some(value) = context.credentials.get(setting.env)
+        {
+            if value.0.is_empty() || value.0.len() > 2048 || value.0.chars().any(char::is_control) {
+                return Err(AccountError::Settings);
+            }
+            values.insert(setting.name.into(), value.0);
+        }
+        if setting.required && !values.contains_key(setting.name) {
+            return Err(AccountError::Settings);
+        }
+    }
+    Ok(values)
+}
 fn validate_label(label: &str) -> Result<String, AccountError> {
     let label = label.trim();
     if label.is_empty() || label.chars().count() > 80 || label.chars().any(char::is_control) {
@@ -128,7 +181,7 @@ fn resolve_label(explicit: Option<&str>, credential: &Credential) -> Result<Stri
     }
     match credential {
         Credential::CodexOAuth { email, .. } => validate_label(email),
-        Credential::ApiKey { token, .. } => {
+        Credential::ApiKey { token, .. } | Credential::CatalogKey { token, .. } => {
             // Never reveal a short key in full or expose arbitrary Unicode/control text.
             let suffix =
                 if token.len() > 8 && token.is_ascii() && !token.chars().any(char::is_control) {
@@ -176,6 +229,48 @@ mod tests {
     fn short_and_non_ascii_keys_are_fully_masked() {
         for token in ["abcd", "12345678", "ééééééééé", "secret\nvalue"] {
             assert_eq!(resolve_label(None, &key(token)).unwrap(), "API key ****");
+        }
+    }
+}
+
+#[cfg(test)]
+mod catalog_setting_tests {
+    use super::*;
+    #[test]
+    fn settings_are_allowlisted_and_required_before_key_input() {
+        let context = crate::providers::http::fixture::context();
+        for definition in crate::providers::catalog::definitions() {
+            let provider = Provider::Catalog(definition.id);
+            assert!(matches!(
+                provider_settings(provider, &["unknown=never-echo-this".into()], &context),
+                Err(AccountError::Settings)
+            ));
+            let args: Vec<_> = definition
+                .settings
+                .iter()
+                .map(|s| format!("{}=example-value", s.name))
+                .collect();
+            let parsed = provider_settings(provider, &args, &context).unwrap();
+            assert_eq!(parsed.len(), definition.settings.len());
+            if definition.settings.iter().any(|s| s.required) {
+                assert!(matches!(
+                    provider_settings(provider, &[], &context),
+                    Err(AccountError::Settings)
+                ));
+            }
+            if let Some(setting) = definition.settings.first() {
+                assert!(
+                    provider_settings(
+                        provider,
+                        &[
+                            format!("{}=first", setting.name),
+                            format!("{}=second", setting.name)
+                        ],
+                        &context
+                    )
+                    .is_err()
+                );
+            }
         }
     }
 }

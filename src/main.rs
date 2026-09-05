@@ -57,14 +57,23 @@ async fn run() -> ExitCode {
             Provider::value_variants()
                 .iter()
                 .map(|provider| {
-                    format!(
-                        "{}  {}\n",
-                        provider
-                            .to_possible_value()
-                            .expect("provider value")
-                            .get_name(),
-                        provider.description()
-                    )
+                    let mut line = format!("{}  {}\n", provider.id(), provider.description());
+                    if let Some(definition) = provider.catalog() {
+                        line.push_str(&format!("  Credential: {}\n", definition.key_env));
+                        for setting in definition.settings {
+                            line.push_str(&format!(
+                                "  --setting {}=VALUE  [{}; env {}]\n",
+                                setting.name,
+                                if setting.required {
+                                    "required"
+                                } else {
+                                    "optional"
+                                },
+                                setting.env
+                            ));
+                        }
+                    }
+                    line
                 })
                 .collect(),
             0,

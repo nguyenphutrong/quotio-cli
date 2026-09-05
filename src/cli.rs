@@ -22,24 +22,83 @@ pub enum Format {
     Text,
     Json,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
     Mock,
     Codex,
     Amp,
     Antigravity,
     Synthetic,
-    #[value(name = "openrouter")]
-    #[serde(rename = "openrouter")]
     OpenRouter,
-    #[value(alias = "glm")]
     Zai,
-    #[value(name = "minimax")]
-    #[serde(rename = "minimax")]
     MiniMax,
-    #[value(alias = "droid", alias = "factory-droid")]
     Factory,
+    Catalog(&'static str),
+}
+impl Provider {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Mock => "mock",
+            Self::Codex => "codex",
+            Self::Amp => "amp",
+            Self::Antigravity => "antigravity",
+            Self::Synthetic => "synthetic",
+            Self::OpenRouter => "openrouter",
+            Self::Zai => "zai",
+            Self::MiniMax => "minimax",
+            Self::Factory => "factory",
+            Self::Catalog(id) => id,
+        }
+    }
+    pub fn catalog(self) -> Option<&'static crate::providers::catalog::Definition> {
+        match self {
+            Self::Catalog(id) => crate::providers::catalog::find(id),
+            _ => None,
+        }
+    }
+}
+impl ValueEnum for Provider {
+    fn value_variants<'a>() -> &'a [Self] {
+        static VALUES: std::sync::OnceLock<Vec<Provider>> = std::sync::OnceLock::new();
+        VALUES.get_or_init(|| {
+            let mut values = vec![
+                Self::Mock,
+                Self::Codex,
+                Self::Amp,
+                Self::Antigravity,
+                Self::Synthetic,
+                Self::OpenRouter,
+                Self::Zai,
+                Self::MiniMax,
+                Self::Factory,
+            ];
+            let mut catalog: Vec<_> = crate::providers::catalog::definitions()
+                .map(|d| Self::Catalog(d.id))
+                .collect();
+            catalog.sort_by_key(|p| p.id());
+            values.extend(catalog);
+            values
+        })
+    }
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        let value = clap::builder::PossibleValue::new(self.id());
+        Some(match self {
+            Self::Zai => value.alias("glm"),
+            Self::Factory => value.alias("droid").alias("factory-droid"),
+            _ => value,
+        })
+    }
+}
+impl serde::Serialize for Provider {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.id())
+    }
+}
+impl<'de> serde::Deserialize<'de> for Provider {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let id = String::deserialize(deserializer)?;
+        Self::from_str(&id, false).map_err(|_| serde::de::Error::custom("unsupported provider"))
+    }
 }
 #[derive(Debug, Args)]
 pub struct UsageArgs {
@@ -83,6 +142,9 @@ impl Provider {
         match self {
             Self::Amp => Some("AMP_API_KEY"),
             Self::Factory => Some("FACTORY_API_KEY"),
+            Self::Catalog(id) => crate::providers::catalog::find(id)
+                .filter(|d| d.auth == crate::providers::catalog::AuthKind::ApiKey)
+                .map(|d| d.key_env),
             other => other.key_api().map(|k| k.key()),
         }
     }
@@ -92,6 +154,12 @@ impl Provider {
 
     pub fn description(self) -> &'static str {
         match self {
+            Self::Catalog(id) => match crate::providers::catalog::find(id).map(|d| d.auth) {
+                Some(crate::providers::catalog::AuthKind::ApiKey) => {
+                    "Usage via API key and provider-specific settings"
+                }
+                _ => "Usage via native OAuth login or explicit access token",
+            },
             Self::Synthetic => "Subscription, rolling and search quota via Synthetic API key",
             Self::OpenRouter => "Key spending limits and USD usage via OpenRouter API key",
             Self::Zai => "Coding Plan quota via Z.ai or BigModel API key",
@@ -104,6 +172,9 @@ impl Provider {
         }
     }
     pub fn adapter(self) -> std::sync::Arc<dyn crate::providers::ProviderAdapter> {
+        if let Self::Catalog(id) = self {
+            return std::sync::Arc::new(crate::providers::catalog::CatalogProvider(id));
+        }
         if let Some(kind) = self.key_api() {
             return std::sync::Arc::new(crate::providers::key_api::KeyApiProvider(kind));
         }
@@ -117,7 +188,7 @@ impl Provider {
             Self::Amp => std::sync::Arc::new(AmpProvider::default()),
             Self::Antigravity => std::sync::Arc::new(AntigravityProvider),
             Self::Factory => std::sync::Arc::new(FactoryProvider),
-            Self::Synthetic | Self::OpenRouter | Self::Zai | Self::MiniMax => {
+            Self::Synthetic | Self::OpenRouter | Self::Zai | Self::MiniMax | Self::Catalog(_) => {
                 unreachable!("key API provider handled above")
             }
         }
@@ -154,6 +225,9 @@ pub enum AccountCommand {
         region: Option<String>,
         #[arg(long)]
         organization: Option<String>,
+        /// Provider metadata such as project or region; repeat NAME=VALUE, never secrets
+        #[arg(long = "setting", value_name = "NAME=VALUE")]
+        settings: Vec<String>,
     },
     /// List saved account metadata without credentials
     List {
