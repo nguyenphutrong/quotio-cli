@@ -33,6 +33,8 @@ pub(crate) async fn json<T: DeserializeOwned>(
                 .headers()
                 .get(RETRY_AFTER)
                 .and_then(|h| h.to_str().ok())
+                // Valid HTTP dates are short; do not feed oversized headers to a date parser.
+                .filter(|value| value.len() <= 128)
                 .and_then(|value| {
                     value
                         .parse::<u64>()
@@ -158,6 +160,31 @@ mod tests {
             ProviderError::Unavailable
         );
         task.await.unwrap();
+    }
+    #[tokio::test]
+    async fn retry_after_rejects_oversized_and_malformed_dates() {
+        let deep = format!(
+            "{}{} Thu, 01 Jan 1970 00:00:00 GMT",
+            "(".repeat(8192),
+            ")".repeat(8192)
+        );
+        for (value, expected) in [
+            (deep, ProviderError::RateLimited),
+            ("(unclosed comment".into(), ProviderError::RateLimited),
+            (
+                "Thu, 01 Jan 1970 00:00:00 GMT".into(),
+                ProviderError::Transient,
+            ),
+        ] {
+            let (url, task) = serve(format!("HTTP/1.1 429 Too Many Requests\r\nRetry-After: {value}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")).await;
+            let result = json::<serde_json::Value>(
+                reqwest::Client::new().get(url),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await;
+            assert_eq!(result.unwrap_err(), expected);
+            task.await.unwrap();
+        }
     }
 }
 
