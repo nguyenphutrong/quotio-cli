@@ -38,7 +38,7 @@ Text output is always plain, so `--no-color` is accepted without changing it.
 ## Developer-signed macOS builds
 
 On macOS, `cargo run` now signs the Quotio binary before launching it. The runner
-uses a fixed identifier, `app.quotio.cli`, and a developer certificate from the
+uses a fixed identifier, `dev.quotio.cli`, and a developer certificate from the
 login Keychain. It never falls back to ad-hoc signing. Run Cargo from this repository
 so its `.cargo/config.toml` is loaded.
 
@@ -57,6 +57,9 @@ The scripts select the sole installed Developer ID Application identity. If none
 exists, they accept a sole Apple Development/Mac Developer identity for local use.
 If selection is ambiguous, set `QUOTIO_SIGNING_IDENTITY` to the full certificate
 name or SHA-1 listed by `security find-identity -v -p codesigning`.
+No Team ID, certificate name or fingerprint is committed as a project default.
+Each fork uses its builder's installed identity; the Team ID in the signed binary
+is derived from that certificate.
 
 Signing happens on a temporary copy, verifies strictly, then atomically replaces
 the binary. A signing failure prevents execution. No private key is exported.
@@ -64,7 +67,7 @@ This workflow uses hardened runtime with no added entitlements and no timestamp
 server request. It is for local use; notarization/distribution is a separate step.
 
 Existing vault authorization may need one explicit update because the identity
-changed from the old ad-hoc binary. Run `cargo run -- accounts list` and authorize
+changed from the previous signing identifier or an ad-hoc binary. Run `cargo run -- accounts list` and authorize
 the developer-signed build when macOS asks. The new designated requirement stays
 stable across builds under the same identifier and developer team. The workflow
 does not rewrite or weaken the vault's ACL.
@@ -133,7 +136,9 @@ an active account selects the next account for that provider. Removal affects on
 Quotio's saved record; it does not revoke remote tokens or log other apps out.
 
 All account metadata and tokens live in one protected Keychain item:
-service `app.quotio.cli.accounts.v1`, account `vault`. No plaintext credential files
+service `app.quotio.cli.accounts.v1`, account `vault`. This existing storage key is
+independent of signing identifier `dev.quotio.cli` and is retained for account
+compatibility. No plaintext credential files
 are created. Empty local lock files coordinate short vault transactions and per-account refresh. Failed atomic writes
 preserve the previous document. Listing prints metadata only.
 

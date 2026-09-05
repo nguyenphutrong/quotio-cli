@@ -1,51 +1,36 @@
 # Developer signing verification
 
-Workflow revision: e30d4bd. Verified on macOS, 2026-09-05.
+Signing identifier: `dev.quotio.cli`.
+Signing identity and Team ID are discovered from the builder's Keychain or selected
+through `QUOTIO_SIGNING_IDENTITY`. No personal certificate, Team ID or fingerprint
+is pinned in project code/configuration or recorded in this report.
 
-Identity: Developer ID Application: Developer (<selected-team>).
-Identifier: app.quotio.cli. TeamIdentifier: <selected-team>.
-The selected team also matches the main Swift Quotio local development config.
-Private keys were not exported. No account-vault credentials or ACLs were changed.
+## Validation
 
-## Checks
+The current identifier change passed these checks:
 
-- Shell syntax: PASS for all three scripts.
-- scripts/build-signed.sh --offline --locked: PASS, debug artifact signed.
-- scripts/build-signed.sh --release --offline --locked: PASS, release artifact signed.
-- codesign --verify --strict: PASS for both final artifacts.
-- Debug/release CDHashes differ; designated requirements are identical: PASS.
-- Release validated against the debug inline requirement using codesign -R: PASS.
-- cargo run --offline -- --help: PASS via signing runner.
-- cargo run mock JSON smoke: PASS, JSON stdout remains clean; signing output is stderr.
-- Invalid explicit identity: rejected before execution; input binary SHA-256 unchanged.
-- Non-product runner path preserves arguments and does not sign test harnesses: PASS.
-- cargo test --offline: 60 passed, one opt-in native Keychain test skipped.
+- Shell syntax validation for all signing scripts.
+- Signed debug and release builds using the installed developer identity.
+- Strict codesign verification of both final binaries.
+- Comparison of the two designated requirements, without persisting signer details.
+- A cargo-run help smoke test through the signing runner.
+- An audit of tracked files against locally installed signing identities and Team IDs.
 
-Cargo test may relink the product binary, so final signing verification ran after
-cargo run re-signed debug. Plain cargo build/test is not a post-link signing hook.
-The runner signs before cargo run; the build script guarantees signed build output.
+The previous workflow also passed 60 offline tests, rejected an invalid explicit
+identity without modifying/executing the input binary, and preserved clean JSON
+stdout. Runtime Rust code is unchanged by this identifier/configuration update.
 
-## Final artifacts
+## Public forks and existing accounts
 
-| Path | SHA-256 |
-| --- | --- |
-| `target/debug/quotio` | `376de2aee498830bef98b8f696fcee0640304ef4d022487d244cb10603af68c8` |
-| `target/release/quotio` | `a1e7c0c2bea5d79c97361d1d4aed4734aa1f760c92fbe0df6707cac99e7863a6` |
+Each fork builds with its own installed developer certificate. Auto-selection
+requires one Developer ID Application identity, or one development identity if no
+Developer ID identity exists. Ambiguous installations require the environment
+override. There is no ad-hoc fallback or hard-coded developer team.
 
-Shared designated requirement:
+The existing Keychain storage service `app.quotio.cli.accounts.v1` is retained to
+preserve saved accounts. It is not the code-signing identifier. The identifier
+change may require one explicit Keychain authorization for the newly signed build;
+no vault contents or ACLs are rewritten by the signing workflow.
 
-```text
-identifier "app.quotio.cli" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = <selected-team>
-```
-
-## Scope and remaining authorization
-
-This is local Developer ID signing with hardened runtime and no added entitlements.
-Timestamping/notarization/distribution were not performed. Signing selection is
-portable: use the sole Developer ID identity, otherwise a sole development identity,
-or require QUOTIO_SIGNING_IDENTITY for an ambiguous installation.
-
-The previous ad-hoc vault trust may require one explicit authorization for the new
-signed identity. Run cargo run -- accounts list when ready to grant access. This
-verification establishes stable code identity across distinct builds, not that the
-user has already approved the new identity on an existing Keychain item.
+Signing here is for local use, with hardened runtime and no added entitlements.
+Timestamping and notarization are separate distribution steps.

@@ -40,7 +40,7 @@ trap 'rm -f "$staged"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' HUP TERM
 cp -p "$binary" "$staged"
-/usr/bin/codesign --force --sign "$candidates" --identifier app.quotio.cli \
+/usr/bin/codesign --force --sign "$candidates" --identifier dev.quotio.cli \
     --options runtime --timestamp=none "$staged"
 /usr/bin/codesign --verify --strict "$staged"
 mv -f "$staged" "$binary"
