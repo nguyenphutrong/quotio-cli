@@ -1281,6 +1281,44 @@
           }
         ]
       }
+    },
+    "/v1/usage/queries": {
+      "post": {
+        "summary": "Read scoped OpenRouter usage from explicit ephemeral credentials; no account or proxy mutations",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UsageQuery"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Poll the operation; result.report contains usage and failures",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operation"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or unsupported query"
+          },
+          "405": {
+            "description": "Management mode required"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1953,7 +1991,8 @@
               "refresh",
               "account_create",
               "account_update",
-              "account_remove"
+              "account_remove",
+              "usage_query"
             ]
           },
           "status": {
@@ -1996,6 +2035,18 @@
                   "failures": {
                     "type": "integer",
                     "minimum": 0
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "report"
+                ],
+                "properties": {
+                  "report": {
+                    "$ref": "#/components/schemas/UsageReport"
                   }
                 }
               }
@@ -2387,6 +2438,41 @@
           },
           "code": {
             "type": "string"
+          }
+        }
+      },
+      "UsageQuery": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "provider",
+          "client_account_id",
+          "label",
+          "access_token"
+        ],
+        "properties": {
+          "provider": {
+            "const": "openrouter"
+          },
+          "client_account_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "access_token": {
+            "type": "string",
+            "writeOnly": true,
+            "minLength": 1,
+            "maxLength": 16384
+          },
+          "force": {
+            "type": "boolean",
+            "default": false
           }
         }
       }

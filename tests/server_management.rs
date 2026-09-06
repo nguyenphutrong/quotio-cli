@@ -325,3 +325,17 @@ async fn server_events_exclude_request_secrets() {
     assert!(!logs.contains("private-"));
     assert!(!logs.contains(TOKEN));
 }
+
+#[tokio::test]
+async fn explicit_usage_queries_require_management_and_validate_before_provider_io() {
+    for (arguments, expected) in [(vec![], 405), (vec!["--manage"], 400)] {
+        let server = Server::start(&arguments).await;
+        let response = server.request(reqwest::Method::POST, "/v1/usage/queries")
+            .json(&json!({"provider":"openrouter","client_account_id":"client","label":"work","access_token":"fixture-invalid\n"}))
+            .send().await.unwrap();
+        assert_eq!(response.status().as_u16(), expected);
+        let body = response.text().await.unwrap();
+        assert!(!body.contains("fixture-invalid"));
+        assert!(!server.logs.lock().unwrap().contains("fixture-invalid"));
+    }
+}

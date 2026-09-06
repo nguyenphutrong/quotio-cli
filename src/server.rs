@@ -6,6 +6,7 @@ mod operations;
 mod security;
 #[cfg(test)]
 mod tests;
+mod usage_queries;
 use crate::{
     cli::{Provider, ServeArgs},
     config::Config,
@@ -167,6 +168,7 @@ fn router(state: Arc<ApiState>, policy: Arc<security::Policy>) -> Router {
         .route("/v1/providers", get(providers))
         .route("/v1/providers/{id}", get(provider))
         .route("/v1/usage", get(usage))
+        .route("/v1/usage/queries", post(usage_queries::start))
         .route("/v1/usage/{id}", get(provider_usage))
         .route("/v1/settings", get(settings).patch(patch_settings))
         .route("/v1/refresh", post(manual_refresh))

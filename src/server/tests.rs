@@ -14,7 +14,7 @@ impl Backend for Memory {
         Ok(())
     }
 }
-async fn fixture() -> (Arc<ApiState>, std::path::PathBuf, String) {
+pub(super) async fn fixture() -> (Arc<ApiState>, std::path::PathBuf, String) {
     let dir = std::env::temp_dir().join(format!(
         "quotio-api-test-{}",
         accounts::random_string().unwrap()
@@ -80,7 +80,7 @@ fn key(value: &str) -> axum::http::HeaderMap {
     headers.insert("idempotency-key", value.parse().unwrap());
     headers
 }
-async fn done(state: &ApiState, id: &str) -> Operation {
+pub(super) async fn done(state: &ApiState, id: &str) -> Operation {
     for _ in 0..100 {
         let op = state.operations.lock().await.get(id).unwrap();
         if op.status != "running" {

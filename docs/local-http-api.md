@@ -247,3 +247,19 @@ identifier when some provider endpoints succeed and others fail. The report's
 preserve the diagnostics and original window timestamps. OpenRouter now combines
 account credits/balance with key limits and spend using its existing API-key source.
 No new credential input endpoint or native credential discovery is included.
+
+
+## Explicit read-only OpenRouter queries
+
+`POST /v1/usage/queries` requires management mode and accepts `provider: openrouter`,
+`client_account_id`, `label`, `access_token` and `force`. The token is an explicit
+input from the native client's existing authorized store, held only for the query.
+The operation returns `result.report` with normalized usage and failures. It does
+not create/update accounts, refresh credentials, read native credential files, or
+change CLIProxyAPI. Unknown fields and unsupported providers fail before provider I/O.
+
+Queries reuse UsageCache with client-account and credential identity isolation.
+Force bypasses freshness; key rotation cannot reuse another login's snapshot. The
+provider token is not persisted, returned, logged or passed through arguments/URLs.
+Operation history is bounded like refresh history; disconnecting a client does not
+claim a provider operation completed, and backend shutdown cancels tracked jobs.
