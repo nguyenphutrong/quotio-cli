@@ -54,7 +54,6 @@ async fn fixture() -> (Arc<ApiState>, std::path::PathBuf, String) {
     );
     (
         Arc::new(ApiState {
-            notifications: crate::notifications::Store(dir.join("notifications.json")),
             settings: RwLock::new(view),
             store,
             snapshot: RwLock::new(None),
@@ -321,48 +320,5 @@ async fn account_retry_survives_loss_of_in_memory_operations() {
         done(&state, &conflict.id).await.error,
         Some("idempotency_conflict")
     );
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
-#[tokio::test]
-async fn notification_settings_and_policy_use_backend_revision() {
-    let (state, dir, _) = fixture().await;
-    let initial = state.settings.read().await.revision.clone();
-    let preferences = crate::notifications::Preferences {
-        quota_threshold: 15.0,
-        ..Default::default()
-    };
-    let patch =
-        serde_json::from_value(json!({"revision":initial,"notifications":preferences})).unwrap();
-    let Json(saved) = patch_settings(State(state.clone()), ApiJson(patch))
-        .await
-        .unwrap_or_else(|_| panic!());
-    assert_eq!(
-        saved.values.notifications.as_ref().unwrap().quota_threshold,
-        15.0
-    );
-    let request = || {
-        serde_json::from_value(json!({"action":"observe_quota","event":"quota_low","scope":["codex","account"],"remaining":[null,-1,15,60],"authorized":true})).unwrap()
-    };
-    assert!(
-        evaluate_notification(State(state.clone()), ApiJson(request()))
-            .await
-            .unwrap_or_else(|_| panic!())
-            .0
-            .deliver
-    );
-    assert!(
-        !evaluate_notification(State(state.clone()), ApiJson(request()))
-            .await
-            .unwrap_or_else(|_| panic!())
-            .0
-            .deliver
-    );
-    let conflict =
-        serde_json::from_value(json!({"revision":initial,"notifications":preferences})).unwrap();
-    assert!(matches!(
-        patch_settings(State(state), ApiJson(conflict)).await,
-        Err(ApiError(StatusCode::CONFLICT, _))
-    ));
     std::fs::remove_dir_all(dir).unwrap();
 }

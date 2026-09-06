@@ -99,7 +99,6 @@ struct RefreshStatus {
     next_refresh_at: Option<String>,
 }
 struct ApiState {
-    notifications: crate::notifications::Store,
     settings: RwLock<SettingsView>,
     store: SettingsStore,
     snapshot: RwLock<Option<(u64, UsageReport)>>,
@@ -145,7 +144,6 @@ fn router(state: Arc<ApiState>, policy: Arc<security::Policy>) -> Router {
         .route("/openapi.json", get(openapi::document))
         .route("/health", get(health))
         .route("/v1/status", get(status))
-        .route("/v1/notifications/evaluate", post(evaluate_notification))
         .route(
             "/v1/accounts",
             get(management::list).post(management::create),
@@ -177,30 +175,6 @@ fn router(state: Arc<ApiState>, policy: Arc<security::Policy>) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(65536))
         .layer(middleware::from_fn_with_state(policy, security::guard))
         .with_state(state)
-}
-async fn evaluate_notification(
-    State(state): State<Arc<ApiState>>,
-    ApiJson(request): ApiJson<crate::notifications::Request>,
-) -> Result<Json<crate::notifications::Decision>, ApiError> {
-    let preferences = state
-        .settings
-        .read()
-        .await
-        .values
-        .notifications
-        .clone()
-        .unwrap_or_default();
-    let store = state.notifications.clone();
-    tokio::task::spawn_blocking(move || store.evaluate(&preferences, request))
-        .await
-        .map_err(|_| {
-            ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "notification_storage_unavailable",
-            )
-        })?
-        .map(Json)
-        .map_err(|code| ApiError(StatusCode::BAD_REQUEST, code))
 }
 async fn health(State(state): State<Arc<ApiState>>) -> Json<Value> {
     Json(
@@ -557,7 +531,6 @@ pub async fn run(args: ServeArgs) -> Result<(), ServerError> {
         .clone()
         .or_else(Config::default_path)
         .ok_or(ServerError::Config)?;
-    let notification_store = crate::notifications::Store(path.with_extension("notifications.json"));
     let store = SettingsStore::new(
         path,
         Overrides {
@@ -629,7 +602,6 @@ pub async fn run(args: ServeArgs) -> Result<(), ServerError> {
         )
     });
     let state = Arc::new(ApiState {
-        notifications: notification_store,
         settings: RwLock::new(view),
         store,
         snapshot: RwLock::new(None),

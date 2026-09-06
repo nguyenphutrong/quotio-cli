@@ -15,11 +15,25 @@ pub enum ConfigError {
     #[error("config contains an unsupported provider; run quotio providers")]
     Unsupported,
 }
+// Read-only compatibility for preferences written by the unreleased 0.2.1 native
+// integration. Preserve them on settings writes without using them for behavior.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyNotificationPreferences {
+    pub enabled: bool,
+    pub quota_threshold: f64,
+    pub quota_low: bool,
+    pub cooling: bool,
+    pub proxy_crash: bool,
+    pub proxy_update: bool,
+    pub suppressed_update_version: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub notifications: Option<crate::notifications::Preferences>,
+    pub notifications: Option<LegacyNotificationPreferences>,
     #[serde(default)]
     pub enabled_providers: Vec<String>,
     /// Maximum cache age in seconds; zero refreshes every time.

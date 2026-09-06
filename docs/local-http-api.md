@@ -231,18 +231,10 @@ shutdown. This mode requires a Unix pipe, not a terminal or regular file. A nati
 parent must close unused pipe endpoints, keep the token private and stop only its
 owned child. The normal CLI stderr announcement is unchanged without this flag.
 
-## Notification policy
+## Native migration scope
 
-`POST /v1/notifications/evaluate` owns notification thresholds, lowest known quota,
-rearming, category preferences and persistent deduplication. It requires management
-mode. Swift sends observations and OS permission state; it only renders decisions.
-Unknown/negative quota observations do not mean exhausted. Settings GET/PATCH expose
-optional `notifications` preferences under the existing optimistic revision. An absent
-value means legacy preferences have not been imported; import must only fill an absent
-value and must reread on revision conflict. Existing values always win over legacy data.
-
-Notification tracking is stored atomically next to the selected config in a private
-JSON file containing scope digests only. Restart does not repeat a sent warning;
-quota recovery or a ready account rearms it. `observe_cooling` accepts raw account
-status so the client does not decide transitions. Imported `suppressed_update_version`
-seeds the old app's last notified proxy version without changing the legacy value.
+The native migration is limited to quota/usage. Agent configuration, proxy lifecycle,
+proxy keys, tunnels and proxy notification policy remain in the existing Swift app.
+The unreleased notification endpoint has been removed. An existing `notifications`
+config table is retained on settings writes for compatibility but does not control
+behavior. No migration step edits or stops a separately running CLIProxyAPI engine.
