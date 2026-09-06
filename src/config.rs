@@ -18,6 +18,8 @@ pub enum ConfigError {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<crate::notifications::Preferences>,
     #[serde(default)]
     pub enabled_providers: Vec<String>,
     /// Maximum cache age in seconds; zero refreshes every time.
@@ -40,6 +42,7 @@ fn default_cache_ttl() -> u64 {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            notifications: None,
             enabled_providers: vec![],
             cache_ttl_seconds: default_cache_ttl(),
             refresh_interval: default_refresh_interval(),

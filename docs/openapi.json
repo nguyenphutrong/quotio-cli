@@ -1281,6 +1281,44 @@
           }
         ]
       }
+    },
+    "/v1/notifications/evaluate": {
+      "post": {
+        "summary": "Evaluate notification policy; native client renders approved deliveries",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NotificationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Delivery decision",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationDecision"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid notification request"
+          },
+          "405": {
+            "description": "Management mode required"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -2196,6 +2234,16 @@
             "items": {
               "type": "string"
             }
+          },
+          "notifications": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NotificationPreferences"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false,
@@ -2245,6 +2293,16 @@
             ],
             "minimum": 1,
             "maximum": 3600
+          },
+          "notifications": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NotificationPreferences"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false,
@@ -2360,6 +2418,129 @@
           },
           "capabilities": {
             "$ref": "#/components/schemas/ProviderCapability"
+          }
+        }
+      },
+      "NotificationPreferences": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "enabled",
+          "quota_threshold",
+          "quota_low",
+          "cooling",
+          "proxy_crash",
+          "proxy_update"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "quota_threshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "quota_low": {
+            "type": "boolean"
+          },
+          "cooling": {
+            "type": "boolean"
+          },
+          "proxy_crash": {
+            "type": "boolean"
+          },
+          "proxy_update": {
+            "type": "boolean"
+          },
+          "suppressed_update_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "NotificationRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "action",
+          "event",
+          "scope",
+          "authorized"
+        ],
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "submit",
+              "observe_quota",
+              "clear",
+              "suppress",
+              "clear_all",
+              "observe_cooling"
+            ]
+          },
+          "event": {
+            "type": "string",
+            "enum": [
+              "quota_low",
+              "account_cooling",
+              "proxy_crashed",
+              "proxy_started",
+              "proxy_update_available",
+              "proxy_update_succeeded",
+              "proxy_update_failed",
+              "proxy_rolled_back"
+            ]
+          },
+          "scope": {
+            "type": "array",
+            "maxItems": 2,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            }
+          },
+          "remaining": {
+            "type": "array",
+            "maxItems": 4096,
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          "authorized": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "NotificationDecision": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "deliver",
+          "remaining_percent"
+        ],
+        "properties": {
+          "deliver": {
+            "type": "boolean"
+          },
+          "remaining_percent": {
+            "type": [
+              "number",
+              "null"
+            ]
           }
         }
       }

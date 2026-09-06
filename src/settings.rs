@@ -23,6 +23,7 @@ pub struct SettingsView {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsPatch {
+    pub notifications: Option<crate::notifications::Preferences>,
     pub revision: String,
     pub enabled_providers: Option<Vec<Provider>>,
     pub cache_ttl_seconds: Option<u64>,
@@ -162,6 +163,9 @@ impl SettingsStore {
         if let Some(value) = patch.provider_timeout {
             config.provider_timeout = value;
         }
+        if let Some(preferences) = patch.notifications {
+            config.notifications = Some(preferences);
+        }
         validate(&config)?;
         let text = toml::to_string(&config).map_err(|_| SettingsError::Invalid)?;
         let temporary = parent.join(format!(
@@ -190,6 +194,9 @@ impl SettingsStore {
     }
 }
 fn validate(config: &Config) -> Result<(), SettingsError> {
+    if config.notifications.as_ref().is_some_and(|p| !p.valid()) {
+        return Err(SettingsError::Invalid);
+    }
     config.providers().map_err(|_| SettingsError::Invalid)?;
     if !(1..=86400).contains(&config.refresh_interval)
         || !(1..=3600).contains(&config.provider_timeout)
@@ -210,6 +217,7 @@ mod tests {
         let store = SettingsStore::new(dir.join("config.toml"), Overrides::default());
         let initial = store.load().unwrap();
         let patch = |revision: String| SettingsPatch {
+            notifications: None,
             revision,
             enabled_providers: Some(vec![Provider::Mock]),
             cache_ttl_seconds: Some(25),
