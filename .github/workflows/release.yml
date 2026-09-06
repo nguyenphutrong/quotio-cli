@@ -1,0 +1,110 @@
+name: Prepare release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version matching Cargo.toml, without v (for example 0.1.0-beta.1)
+        required: true
+        type: string
+
+permissions: {}
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    environment: release
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ inputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Validate version and target
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess, tomllib
+          version = os.environ['VERSION']
+          assert re.fullmatch(r'\d+\.\d+\.\d+(?:-(?:alpha|beta|rc)\.\d+)?', version)
+          assert tomllib.load(open('Cargo.toml', 'rb'))['package']['version'] == version
+          host = subprocess.check_output(['rustc', '-vV'], text=True)
+          assert 'host: ' + os.environ['TARGET'] + '\n' in host
+          PY
+      - name: Install toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal --component clippy --component rustfmt
+      - name: Verify and build
+        run: |
+          cargo +1.98.0 fmt --check
+          cargo +1.98.0 fetch --locked
+          cargo +1.98.0 clippy --offline --locked --all-targets --all-features -- -D warnings
+          cargo +1.98.0 test --offline --locked --all-features
+          cargo +1.98.0 build --offline --locked --release
+          test "$(target/release/quotio --version)" = "quotio $VERSION"
+      - name: Sign and notarize macOS binary
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          NOTARY_PRIVATE_KEY: ${{ secrets.NOTARY_PRIVATE_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: scripts/ci-sign-macos.sh target/release/quotio
+      - name: Package binary and notices
+        run: python3 scripts/package-release.py archive --version "$VERSION" --target "$TARGET" --binary target/release/quotio --output artifacts
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: binary-${{ matrix.target }}
+          path: artifacts/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+  draft:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: binary-*
+          path: artifacts
+          merge-multiple: true
+      - name: Verify distribution tooling
+        run: |
+          node --test distribution/npm.test.cjs
+          python3 scripts/test-package-release.py
+      - name: Assemble npm package and Homebrew formula
+        run: python3 scripts/package-release.py assemble --version "$VERSION" --repository "$GITHUB_REPOSITORY" --artifacts artifacts --output release-output
+      - name: Create draft GitHub release
+        run: |
+          args=()
+          if [[ "$VERSION" == *-* ]]; then args+=(--prerelease); fi
+          gh release create "v$VERSION" release-output/*.tar.gz release-output/*.tgz release-output/*.rb release-output/SHA256SUMS \
+            --target "$GITHUB_SHA" --draft --title "Quotio v$VERSION" --generate-notes "${args[@]}"

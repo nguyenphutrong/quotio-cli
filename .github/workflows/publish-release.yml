@@ -1,0 +1,90 @@
+name: Publish package channels
+
+on:
+  release:
+    types: [published]
+
+permissions: {}
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+
+jobs:
+  npm:
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+      - name: Download and verify npm artifact
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]
+          version=${RELEASE_TAG#v}
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "quotio-$version.tgz" --pattern SHA256SUMS
+          awk -v name="quotio-$version.tgz" '$2 == name' SHA256SUMS > npm.sha256
+          test "$(wc -l < npm.sha256)" -eq 1
+          sha256sum --check npm.sha256
+      - name: Publish npm with trusted publishing
+        run: |
+          version=${RELEASE_TAG#v}
+          channel=latest
+          if [[ "$version" == *-* ]]; then channel=next; fi
+          local_integrity=$(node -e 'const fs=require("fs"),c=require("crypto"); console.log("sha512-"+c.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"))' "quotio-$version.tgz")
+          if existing=$(npm view "quotio@$version" dist.integrity --json 2>/dev/null); then
+            test "$existing" = "\"$local_integrity\""
+            echo 'The identical npm package is already published.'
+          else
+            npm publish "quotio-$version.tgz" --access public --tag "$channel" --provenance
+          fi
+  homebrew:
+    needs: npm
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+      TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+    steps:
+      - name: Download and verify formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]
+          formula=quotio.rb
+          if [[ "$RELEASE_TAG" == *-* ]]; then formula=quotio-beta.rb; fi
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$formula" --pattern SHA256SUMS
+          awk -v name="$formula" '$2 == name' SHA256SUMS > formula.sha256
+          test "$(wc -l < formula.sha256)" -eq 1
+          sha256sum --check formula.sha256
+          ruby -c "$formula"
+      - name: Update existing Homebrew tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          : "${GH_TOKEN:?Set HOMEBREW_TAP_TOKEN for the tap repository}"
+          : "${TAP_REPOSITORY:?Set HOMEBREW_TAP_REPOSITORY}"
+          [[ "$TAP_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          formula=quotio.rb
+          if [[ "$RELEASE_TAG" == *-* ]]; then formula=quotio-beta.rb; fi
+          api="repos/$TAP_REPOSITORY/contents/Formula/$formula"
+          existing=$(gh api "$api" 2>/dev/null || true)
+          content=$(base64 -w 0 "$formula")
+          args=()
+          if [[ -n "$existing" ]]; then
+            sha=$(jq -r .sha <<< "$existing")
+            previous=$(jq -r .content <<< "$existing" | tr -d '\n')
+            if [[ "$previous" == "$content" ]]; then exit 0; fi
+            args+=(-f "sha=$sha")
+          fi
+          gh api "$api" --method PUT -f "message=chore(quotio): update to $RELEASE_TAG" -f "content=$content" "${args[@]}" --silent

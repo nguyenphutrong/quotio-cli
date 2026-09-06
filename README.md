@@ -635,3 +635,8 @@ See [backend operation and recovery](docs/operations.md) for startup, background
 supervision and live acceptance, and [macOS release preparation](docs/releasing.md)
 for distribution signing, dependency notices and notarization. Local builds and
 offline tests do not establish live deployment or distribution acceptance.
+
+Release automation for GitHub Releases, npm (`quotio`) and Homebrew is described in
+[release channels](docs/release-channels.md). Configure signing, npm trust and tap
+access before triggering publication; the presence of the workflows does not mean
+packages have already been published.

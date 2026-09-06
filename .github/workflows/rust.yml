@@ -49,3 +49,22 @@ jobs:
         run: python3 scripts/test-third-party-notices.py
       - name: Build release binary
         run: cargo +"$TOOLCHAIN" build --offline --locked --release
+
+  distribution:
+    name: Check release packaging
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+      - name: Check npm wrapper and release generation
+        run: |
+          node --test distribution/npm.test.cjs
+          python3 scripts/test-package-release.py
+          shellcheck scripts/ci-sign-macos.sh
