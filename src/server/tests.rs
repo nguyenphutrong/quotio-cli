@@ -269,3 +269,56 @@ async fn scheduler_clears_deadline_on_timer_and_config_wake() {
     tokio::time::resume();
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn account_retry_survives_loss_of_in_memory_operations() {
+    let (state, dir, id) = fixture().await;
+    let body = json!({"label":"first change"});
+    let (_, Json(first)) = management::patch(
+        State(state.clone()),
+        Path(id.clone()),
+        key("durable-key"),
+        ApiJson(body.clone()),
+    )
+    .await
+    .unwrap_or_else(|_| panic!());
+    assert_eq!(done(&state, &first.id).await.status, "completed");
+    // Another intent can change the account before the original caller retries.
+    crate::accounts::service::patch(
+        state.vault.clone().unwrap(),
+        id.clone(),
+        Some("later change".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    *state.operations.lock().await = Operations::default();
+    let (_, Json(retry)) = management::patch(
+        State(state.clone()),
+        Path(id.clone()),
+        key("durable-key"),
+        ApiJson(body),
+    )
+    .await
+    .unwrap_or_else(|_| panic!());
+    assert_ne!(first.id, retry.id);
+    assert_eq!(done(&state, &retry.id).await.status, "completed");
+    let Json(account) = management::get_account(State(state.clone()), Path(id.clone()))
+        .await
+        .unwrap_or_else(|_| panic!());
+    assert_eq!(account.label, "later change");
+    *state.operations.lock().await = Operations::default();
+    let (_, Json(conflict)) = management::patch(
+        State(state.clone()),
+        Path(id),
+        key("durable-key"),
+        ApiJson(json!({"label":"different intent"})),
+    )
+    .await
+    .unwrap_or_else(|_| panic!());
+    assert_eq!(
+        done(&state, &conflict.id).await.error,
+        Some("idempotency_conflict")
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

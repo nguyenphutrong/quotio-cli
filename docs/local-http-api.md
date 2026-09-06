@@ -189,7 +189,20 @@ restart, so retrying a key cannot repeat a write after refresh history is pruned
 The server accepts at most 4096 distinct account write keys per lifetime; further
 new keys return 503 `idempotency_full`. Existing keys still replay their result,
 and refresh remains available. Complete pending writes and restart to clear this
-ledger. Keys and operations cannot be recovered across restart.
+in-memory operation ledger; this does not clear successful vault receipts. Operation IDs cannot be recovered across restart. Successful account writes now
+commit a receipt atomically inside the protected vault. Retrying the same key and
+body after restart returns a new operation with the original result, without
+revalidating credentials or applying the mutation again. A changed body or target
+fails with `idempotency_conflict`. Receipts do not resurrect deleted accounts.
+Failed writes do not persist receipts. Vault receipts are bounded at 4096 and are
+not cleared by restart; reaching that bound returns `idempotency_full`. No receipt
+is evicted silently because doing so could repeat a mutation.
+
+The first successful managed HTTP account write upgrades the vault document from
+version 1 to 2 while preserving accounts and credentials in the same atomic write.
+CLI 0.2.0 reads both formats. Earlier CLI binaries reject version 2; do not downgrade
+after that write. CLI-only account operations preserve existing version-2 receipts.
+This is retry infrastructure, not an implementation of the Swift legacy import API.
 
 ### Refresh schedule
 

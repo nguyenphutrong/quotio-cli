@@ -16,6 +16,8 @@ pub(super) fn account_code(error: &AccountError) -> &'static str {
     match error {
         AccountError::Storage | AccountError::Corrupt => "credential_storage_unavailable",
         AccountError::Busy => "account_busy",
+        AccountError::IdempotencyConflict => "idempotency_conflict",
+        AccountError::IdempotencyFull => "idempotency_full",
         AccountError::NotFound => "account_not_found",
         AccountError::Duplicate => "duplicate_account",
         AccountError::Label => "invalid_label",
@@ -155,6 +157,8 @@ async fn mutate(
             .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?,
     ]);
     drop(body);
+    let intent = crate::accounts::service::MutationIntent::new(key, fingerprint.clone())
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_idempotency_key"))?;
     let (operation, new) = state
         .operations
         .lock()
@@ -166,6 +170,12 @@ async fn mutate(
         let id = operation.id.clone();
         let spawn_result = state.spawn(async move {
             let result = async {
+                if let Some(id) = crate::accounts::service::mutation_receipt(vault.clone(), &intent)
+                    .await
+                    .map_err(|e| account_code(&e))?
+                {
+                    return Ok(json!({"account_id":id}));
+                }
                 match mutation {
                     Mutation::Create(input) => {
                         let prepared = api::prepare(&work.context, input)
@@ -174,27 +184,27 @@ async fn mutate(
                         let _guard = crate::accounts::service::mutation_guard(&work.commit_guard)
                             .await
                             .map_err(|e| account_code(&e))?;
-                        let account = api::save(vault, prepared)
+                        let account_id = api::save_once(vault, prepared, intent)
                             .await
                             .map_err(|e| account_code(&e))?;
                         work.invalidate().await;
-                        Ok(json!({"account_id":account.id}))
+                        Ok(json!({"account_id":account_id}))
                     }
                     Mutation::Update(id, patch) => {
                         let _guard = crate::accounts::service::mutation_guard(&work.commit_guard)
                             .await
                             .map_err(|e| account_code(&e))?;
-                        let account = api::update(vault, id, patch)
+                        let account_id = api::update_once(vault, id, patch, intent)
                             .await
                             .map_err(|e| account_code(&e))?;
                         work.invalidate().await;
-                        Ok(json!({"account_id":account.id}))
+                        Ok(json!({"account_id":account_id}))
                     }
                     Mutation::Remove(id) => {
                         let _guard = crate::accounts::service::mutation_guard(&work.commit_guard)
                             .await
                             .map_err(|e| account_code(&e))?;
-                        api::remove(vault, id.clone())
+                        api::remove_once(vault, id.clone(), intent)
                             .await
                             .map_err(|e| account_code(&e))?;
                         work.invalidate().await;

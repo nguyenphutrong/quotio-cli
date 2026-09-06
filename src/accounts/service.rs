@@ -150,6 +150,65 @@ async fn commit(tx: Transaction) -> Result<(), AccountError> {
         .await
         .map_err(|_| AccountError::Storage)?
 }
+/// Intent fingerprints are stored only in the protected vault, atomically with the write.
+#[derive(Clone)]
+pub struct MutationIntent {
+    key: String,
+    fingerprint: String,
+}
+impl MutationIntent {
+    pub fn new(key: &str, fingerprint: String) -> Result<Self, AccountError> {
+        if key.is_empty() || key.len() > 128 || !key.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(AccountError::Input);
+        }
+        Ok(Self {
+            key: crate::cache::fingerprint(&[key]),
+            fingerprint,
+        })
+    }
+    fn receipt(&self, document: &super::Document) -> Result<Option<String>, AccountError> {
+        match document.mutation_receipts.get(&self.key) {
+            Some(receipt) if receipt.fingerprint == self.fingerprint => {
+                Ok(Some(receipt.account_id.clone()))
+            }
+            Some(_) => Err(AccountError::IdempotencyConflict),
+            None => Ok(None),
+        }
+    }
+}
+pub async fn mutation_receipt(
+    vault: Vault,
+    intent: &MutationIntent,
+) -> Result<Option<String>, AccountError> {
+    let tx = begin(vault).await?;
+    intent.receipt(&tx.document)
+}
+pub async fn commit_once(
+    vault: Vault,
+    intent: MutationIntent,
+    mutation: impl FnOnce(&mut super::Document) -> Result<String, AccountError> + Send,
+) -> Result<String, AccountError> {
+    let mut tx = begin(vault).await?;
+    if let Some(id) = intent.receipt(&tx.document)? {
+        return Ok(id);
+    }
+    if tx.document.mutation_receipts.len() >= 4096 {
+        return Err(AccountError::IdempotencyFull);
+    }
+    let id = mutation(&mut tx.document)?;
+    tx.document.mutation_receipts.insert(
+        intent.key,
+        super::MutationReceipt {
+            fingerprint: intent.fingerprint,
+            account_id: id.clone(),
+        },
+    );
+    // Older binaries must reject the document instead of silently discarding receipts.
+    tx.document.version = 2;
+    commit(tx).await?;
+    Ok(id)
+}
+
 pub async fn add_persisted(
     vault: Vault,
     provider: Provider,
@@ -1244,5 +1303,112 @@ mod catalog_credential_tests {
                 Err(AccountError::Settings)
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+    use crate::accounts::vault::{Backend, tests::Memory};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn fixture() -> (Vault, Arc<Memory>, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "quotio-receipt-{}.lock",
+            crate::accounts::random_string().unwrap()
+        ));
+        let backend = Arc::new(Memory::default());
+        (Vault::new(backend.clone(), path.clone()), backend, path)
+    }
+    fn intent(key: &str, body: &str) -> MutationIntent {
+        MutationIntent::new(key, crate::cache::fingerprint(&[body])).unwrap()
+    }
+    fn create(document: &mut crate::accounts::Document) -> Result<String, AccountError> {
+        document.add(
+            Provider::Amp,
+            "label",
+            "identity".into(),
+            Credential::ApiKey {
+                token: "fixture-private-credential".into(),
+                region: None,
+                organization: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn replay_after_reopening_vault_does_not_repeat_write_or_resurrect_deleted_account() {
+        let (vault, backend, path) = fixture();
+        let id = commit_once(vault.clone(), intent("intent", "create"), create)
+            .await
+            .unwrap();
+        assert_eq!(vault.begin().unwrap().document.version, 2);
+        remove(vault, id.clone()).await.unwrap();
+        let reopened = Vault::new(backend, path.clone());
+        let replay = commit_once(reopened.clone(), intent("intent", "create"), |_| {
+            panic!("replayed mutation")
+        })
+        .await
+        .unwrap();
+        assert_eq!(replay, id);
+        assert!(list(reopened.clone()).await.unwrap().is_empty());
+        assert!(matches!(
+            mutation_receipt(reopened, &intent("intent", "other body")).await,
+            Err(AccountError::IdempotencyConflict)
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn failed_native_write_commits_neither_account_nor_receipt_and_retry_recovers() {
+        let (vault, backend, path) = fixture();
+        backend.fail.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            commit_once(vault.clone(), intent("intent", "create"), create).await,
+            Err(AccountError::Storage)
+        ));
+        assert!(
+            mutation_receipt(vault.clone(), &intent("intent", "create"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(list(vault.clone()).await.unwrap().is_empty());
+        backend.fail.store(false, Ordering::SeqCst);
+        commit_once(vault.clone(), intent("intent", "create"), create)
+            .await
+            .unwrap();
+        assert_eq!(list(vault).await.unwrap().len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn concurrent_retries_commit_once_and_keep_keys_out_of_serialized_receipts() {
+        let (vault, backend, path) = fixture();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let vault = vault.clone();
+            let writes = writes.clone();
+            tasks.push(tokio::spawn(async move {
+                commit_once(vault, intent("private-retry-key", "body"), |document| {
+                    writes.fetch_add(1, Ordering::SeqCst);
+                    create(document)
+                })
+                .await
+                .unwrap()
+            }));
+        }
+        let first = tasks.remove(0).await.unwrap();
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), first);
+        }
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        let bytes = backend.read().unwrap().unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let receipts = value["mutation_receipts"].to_string();
+        assert!(!receipts.contains("private-retry-key"));
+        assert!(!receipts.contains("fixture-private-credential"));
+        let _ = std::fs::remove_file(path);
     }
 }

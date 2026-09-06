@@ -119,7 +119,10 @@ impl Vault {
                 }
                 let doc: Document =
                     serde_json::from_slice(&bytes).map_err(|_| AccountError::Corrupt)?;
-                if doc.version != 1 {
+                if !matches!(doc.version, 1 | 2)
+                    || (doc.version == 1 && !doc.mutation_receipts.is_empty())
+                    || doc.mutation_receipts.len() > 4096
+                {
                     return Err(AccountError::Corrupt);
                 }
                 doc

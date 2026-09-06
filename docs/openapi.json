@@ -2369,5 +2369,11 @@
     "version": 1,
     "bootstrap_schema": "#/components/schemas/Bootstrap",
     "description": "Inherited stdin token line and lifetime pipe; one stdout JSON record after bind. Authenticate /v1/status before use."
+  },
+  "x-quotio-account-idempotency": {
+    "successful_writes": "atomic protected-vault receipt across restart",
+    "operation_ids": "process lifetime",
+    "receipt_capacity": 4096,
+    "vault_version": 2
   }
 }

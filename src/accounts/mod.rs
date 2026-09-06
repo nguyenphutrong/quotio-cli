@@ -12,6 +12,10 @@ use thiserror::Error;
 pub enum AccountError {
     #[error("account storage is unavailable or access was denied")]
     Storage,
+    #[error("idempotency key was already used for a different request")]
+    IdempotencyConflict,
+    #[error("durable account retry ledger is full")]
+    IdempotencyFull,
     #[error("saved account data is invalid; no changes were made")]
     Corrupt,
     #[error("another account operation is in progress; retry shortly")]
@@ -90,16 +94,25 @@ impl Account {
         }
     }
 }
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MutationReceipt {
+    pub fingerprint: String,
+    pub account_id: String,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct Document {
     pub version: u8,
     pub accounts: Vec<Account>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub mutation_receipts: std::collections::BTreeMap<String, MutationReceipt>,
 }
 impl Document {
     pub fn empty() -> Self {
         Self {
             version: 1,
             accounts: vec![],
+            mutation_receipts: Default::default(),
         }
     }
     pub fn add(

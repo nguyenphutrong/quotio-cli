@@ -121,6 +121,45 @@ pub async fn save(vault: Vault, prepared: PreparedAccount) -> Result<AccountDto,
     .await?;
     Ok(AccountDto::from(&account))
 }
+pub async fn save_once(
+    vault: Vault,
+    prepared: PreparedAccount,
+    intent: service::MutationIntent,
+) -> Result<String, AccountError> {
+    service::commit_once(vault, intent, move |document| {
+        document.add(
+            prepared.provider,
+            &prepared.label,
+            prepared.identity,
+            prepared.credential,
+        )
+    })
+    .await
+}
+pub async fn update_once(
+    vault: Vault,
+    id: String,
+    patch: AccountPatch,
+    intent: service::MutationIntent,
+) -> Result<String, AccountError> {
+    service::commit_once(vault, intent, move |document| {
+        document.patch(&id, patch.label.as_deref(), patch.active)?;
+        Ok(id)
+    })
+    .await
+}
+pub async fn remove_once(
+    vault: Vault,
+    id: String,
+    intent: service::MutationIntent,
+) -> Result<String, AccountError> {
+    service::commit_once(vault, intent, move |document| {
+        document.remove(&id)?;
+        Ok(id)
+    })
+    .await
+}
+
 pub async fn create(
     vault: Vault,
     context: &ProviderContext,
