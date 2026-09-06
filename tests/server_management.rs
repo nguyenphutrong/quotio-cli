@@ -7,15 +7,20 @@ struct Server {
     dir: PathBuf,
     base: String,
     client: reqwest::Client,
+    logs: std::sync::Arc<std::sync::Mutex<String>>,
+    log_reader: tokio::task::JoinHandle<()>,
 }
 impl Server {
     async fn start(extra: &[&str]) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "quotio-management-{}",
+            "quotio-management-{}-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("config.toml"), "enabled_providers = []\n").unwrap();
@@ -46,8 +51,17 @@ impl Server {
             .strip_prefix("Quotio API listening on ")
             .unwrap()
             .into();
+        let logs = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured = logs.clone();
+        let log_reader = tokio::spawn(async move {
+            while let Ok(Some(line)) = lines.next_line().await {
+                captured.lock().unwrap().push_str(&line);
+            }
+        });
         Self {
             child,
+            logs,
+            log_reader,
             dir,
             base,
             client: reqwest::Client::builder()
@@ -84,6 +98,7 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
+        self.log_reader.abort();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -276,4 +291,37 @@ async fn completed_refresh_history_does_not_exhaust_operation_capacity() {
             "completed"
         );
     }
+}
+
+#[tokio::test]
+async fn server_events_exclude_request_secrets() {
+    let server = Server::start(&["--manage", "--provider", "mock"]).await;
+    let rejected = server
+        .request(reqwest::Method::POST, "/v1/refresh")
+        .json(&json!({"private-body":"private-sentinel"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 422);
+    let response = server
+        .request(reqwest::Method::POST, "/v1/refresh")
+        .header("idempotency-key", "private-retry-key")
+        .json(&json!({"force":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let op: Value = response.json().await.unwrap();
+    server.done(op["id"].as_str().unwrap()).await;
+    for _ in 0..100 {
+        if server.logs.lock().unwrap().contains("operation finished") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let logs = server.logs.lock().unwrap();
+    assert!(logs.contains("operation finished"));
+    assert!(logs.contains("refresh completed"));
+    assert!(!logs.contains("private-"));
+    assert!(!logs.contains(TOKEN));
 }

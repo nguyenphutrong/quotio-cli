@@ -54,6 +54,14 @@ async fn run() -> ExitCode {
     };
     let (text, code) = match cli.command {
         Command::Serve(args) => {
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(io::stderr),
+                )
+                .with(Targets::new().with_target("quotio", tracing::Level::INFO))
+                .init();
             return match quotio::server::run(args).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {

@@ -103,6 +103,8 @@ impl Operations {
             } else {
                 "failed"
             };
+            tracing::info!(operation_id = %id, kind = %e.operation.kind, status = e.operation.status,
+                code = result.as_ref().err().copied().unwrap_or("ok"), "operation finished");
             match result {
                 Ok(value) => e.operation.result = Some(value),
                 Err(code) => {

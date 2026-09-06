@@ -506,6 +506,7 @@ async fn refresh(state: &ApiState, request: Option<RefreshRequest>) -> Result<Va
     } else {
         *snapshot = Some((generation, report));
     }
+    tracing::info!(successes, failures, "refresh completed");
     Ok(json!({"providers":successes,"failures":failures}))
 }
 async fn wait_for_next_refresh(state: &ApiState) {
@@ -609,15 +610,22 @@ pub async fn run(args: ServeArgs) -> Result<(), ServerError> {
         vault,
         oauth,
     });
+    eprintln!("Quotio API listening on http://{address}");
+    tracing::info!(
+        manage = state.manage,
+        version = env!("CARGO_PKG_VERSION"),
+        "server started"
+    );
     let worker_state = state.clone();
     let mut worker = tokio::spawn(async move {
         loop {
-            let _ = refresh(&worker_state, None).await;
+            if let Err(code) = refresh(&worker_state, None).await {
+                tracing::warn!(code, "scheduled refresh failed");
+            }
             wait_for_next_refresh(&worker_state).await;
         }
     });
     let (stop, mut stopped) = watch::channel(false);
-    eprintln!("Quotio API listening on http://{address}");
     let server = axum::serve(listener, router(state.clone(), policy))
         .with_graceful_shutdown(async move {
             let _ = stopped.wait_for(|v| *v).await;
@@ -634,6 +642,7 @@ pub async fn run(args: ServeArgs) -> Result<(), ServerError> {
     for job in state.jobs.lock().expect("job tracker").iter() {
         job.abort();
     }
+    tracing::info!(success = result.is_ok(), "server stopped");
     result
 }
 async fn shutdown_signal() {
