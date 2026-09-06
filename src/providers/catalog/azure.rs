@@ -423,10 +423,8 @@ fn parse_cost_query_page(value: &Value) -> Result<CostQueryPage, ProviderError> 
                     return Err(ProviderError::InvalidData);
                 }
             }
-            "Currency" if kind == "String" => {
-                if currency.replace(index).is_some() {
-                    return Err(ProviderError::InvalidData);
-                }
+            "Currency" if kind == "String" && currency.replace(index).is_some() => {
+                return Err(ProviderError::InvalidData);
             }
             _ => (),
         }

@@ -7,6 +7,7 @@ use time::OffsetDateTime;
 const SERVICE: &str = "exa.language_server_pb.LanguageServerService";
 struct Candidate {
     pid: u32,
+    #[cfg(target_os = "macos")]
     executable: PathBuf,
     csrf: Secret,
 }
@@ -33,7 +34,7 @@ fn candidates(output: &str, uid: u32, executables: &[PathBuf]) -> Vec<Candidate>
             let (pid, command) = rest.trim_start().split_once(char::is_whitespace)?;
             let pid = pid.parse::<u32>().ok().filter(|pid| *pid > 0)?;
             let command = command.trim_start();
-            let (executable, args) = executables.iter().find_map(|path| {
+            let (_executable, args) = executables.iter().find_map(|path| {
                 command
                     .strip_prefix(path.to_str()?)
                     .filter(|rest| rest.starts_with(char::is_whitespace))
@@ -59,7 +60,8 @@ fn candidates(output: &str, uid: u32, executables: &[PathBuf]) -> Vec<Candidate>
             }
             Some(Candidate {
                 pid,
-                executable,
+                #[cfg(target_os = "macos")]
+                executable: _executable,
                 csrf: Secret(csrf.into()),
             })
         })

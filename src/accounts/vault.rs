@@ -11,6 +11,7 @@ pub trait Backend: Send + Sync {
     fn write(&self, bytes: &[u8]) -> Result<(), AccountError>;
 }
 pub struct Keychain {
+    #[cfg(target_os = "macos")]
     interactive: bool,
 }
 #[cfg(target_os = "macos")]
@@ -84,10 +85,13 @@ impl Vault {
     pub fn for_usage() -> Result<Self, AccountError> {
         Self::system_with_interaction(false)
     }
-    fn system_with_interaction(interactive: bool) -> Result<Self, AccountError> {
+    fn system_with_interaction(_interactive: bool) -> Result<Self, AccountError> {
         let dirs = directories::ProjectDirs::from("", "", "quotio").ok_or(AccountError::Storage)?;
         Ok(Self::new(
-            Arc::new(Keychain { interactive }),
+            Arc::new(Keychain {
+                #[cfg(target_os = "macos")]
+                interactive: _interactive,
+            }),
             dirs.data_local_dir().join("accounts.lock"),
         ))
     }

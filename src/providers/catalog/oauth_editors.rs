@@ -1,8 +1,10 @@
 use super::{AuthKind, Definition, common};
+#[cfg(target_os = "macos")]
+use crate::providers::process;
 use crate::{
     domain::{ProviderUsage, QuotaWindow},
     error::ProviderError,
-    providers::{FetchFuture, ProviderContext, Secret, http, process},
+    providers::{FetchFuture, ProviderContext, Secret, http},
 };
 use serde_json::Value;
 use std::{
@@ -25,11 +27,14 @@ const CURSOR_USAGE_URL: &str =
 const GROK_CREDITS_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const KIMI_CODE_USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
 const CURSOR_KEYCHAIN_SERVICE: &str = "cursor-access-token";
+#[cfg(target_os = "macos")]
 const CURSOR_STATE_QUERY: &str =
     "SELECT value FROM ItemTable WHERE key = 'cursorAuth/accessToken' LIMIT 1;";
 const MAX_NATIVE_FILE_BYTES: u64 = 1024 * 1024;
+#[cfg(target_os = "macos")]
 const MAX_CURSOR_DATABASE_BYTES: u64 = 64 * 1024 * 1024;
 const NATIVE_READ_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(target_os = "macos")]
 const CURSOR_SQLITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub const DEFINITIONS: &[Definition] = &[
@@ -533,6 +538,7 @@ fn cursor_database_is_rollback(file: &std::fs::File) -> Result<bool, ProviderErr
     Ok(header[18] == 1 && header[19] == 1)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn cursor_token_from_sqlite_output(bytes: &[u8]) -> Result<Option<Secret>, ProviderError> {
     if bytes.is_empty() {
         return Ok(None);
