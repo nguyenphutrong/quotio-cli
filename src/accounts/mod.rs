@@ -5,6 +5,7 @@ mod encrypted_file;
 mod input;
 pub mod oauth;
 pub mod service;
+pub mod sources;
 pub mod vault;
 use crate::{cli::Provider, error::ProviderError};
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,8 @@ use thiserror::Error;
 pub enum AccountError {
     #[error("account storage is unavailable or access was denied")]
     Storage,
+    #[error("the credential source is disabled by its owner")]
+    SourceDisabled,
     #[error("idempotency key was already used for a different request")]
     IdempotencyConflict,
     #[error("durable account retry ledger is full")]
@@ -52,6 +55,9 @@ pub enum AccountError {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Credential {
+    QuotioCustomProvider {
+        source: sources::CustomProviderReference,
+    },
     CatalogKey {
         token: String,
         settings: std::collections::BTreeMap<String, String>,
@@ -70,6 +76,12 @@ pub enum Credential {
         expires_at: i64,
     },
 }
+#[derive(Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountOrigin {
+    Owned,
+    BorrowedProxy,
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Account {
     pub id: String,
@@ -85,14 +97,22 @@ pub struct AccountInfo<'a> {
     pub provider: Provider,
     pub label: &'a str,
     pub active: bool,
+    pub origin: AccountOrigin,
 }
 impl Account {
+    pub fn origin(&self) -> AccountOrigin {
+        match self.credential {
+            Credential::QuotioCustomProvider { .. } => AccountOrigin::BorrowedProxy,
+            _ => AccountOrigin::Owned,
+        }
+    }
     pub fn info(&self) -> AccountInfo<'_> {
         AccountInfo {
             id: &self.id,
             provider: self.provider,
             label: &self.label,
             active: self.active,
+            origin: self.origin(),
         }
     }
 }
@@ -137,6 +157,9 @@ impl Document {
             .accounts
             .iter()
             .any(|a| a.provider == provider && a.active);
+        if matches!(credential, Credential::QuotioCustomProvider { .. }) {
+            self.version = 3;
+        }
         self.accounts.push(Account {
             id: id.clone(),
             provider,

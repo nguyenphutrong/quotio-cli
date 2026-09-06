@@ -339,3 +339,36 @@ async fn explicit_usage_queries_require_management_and_validate_before_provider_
         assert!(!server.logs.lock().unwrap().contains("fixture-invalid"));
     }
 }
+
+#[tokio::test]
+async fn source_registration_uses_existing_management_and_storage_guards() {
+    let read_only = Server::start(&[]).await;
+    let body = json!({"kind":"quotio_custom_provider","source":{"domain":"production","record_id":"01234567-89ab-cdef-0123-456789abcdef"}});
+    let denied = read_only
+        .request(reqwest::Method::POST, "/v1/account-sources")
+        .header("Idempotency-Key", "source-fixture")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 405);
+    let managed = Server::start(&["--manage"]).await;
+    let invalid = managed.request(reqwest::Method::POST, "/v1/account-sources")
+        .header("Idempotency-Key", "source-fixture").json(&json!({"kind":"quotio_custom_provider","source":{"domain":"com.other.app","record_id":"fixture"}})).send().await.unwrap();
+    assert_eq!(invalid.status(), 400);
+    let disabled = managed
+        .request(reqwest::Method::POST, "/v1/account-sources")
+        .header("Idempotency-Key", "source-fixture")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), 503);
+    assert!(
+        disabled
+            .text()
+            .await
+            .unwrap()
+            .contains("account_storage_disabled")
+    );
+}

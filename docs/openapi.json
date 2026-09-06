@@ -1319,6 +1319,90 @@
           }
         }
       }
+    },
+    "/v1/account-sources": {
+      "post": {
+        "summary": "Register read-only ClinePass source",
+        "responses": {
+          "202": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operation"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "500": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "Internal error"
+          },
+          "408": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "Request body timeout"
+          },
+          "413": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "JSON body exceeds 64 KiB"
+          },
+          "415": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "JSON content type required"
+          },
+          "422": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "Invalid JSON request"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccountSourceInput"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "description": "Explicitly bind one existing ClinePass record in the production or development Quotio customProviders preferences on macOS. Stores a reference only. Never writes or refreshes the source credential. Requires management mode and Idempotency-Key."
+      }
     }
   },
   "components": {
@@ -1868,6 +1952,14 @@
           },
           "active": {
             "type": "boolean"
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "owned",
+              "borrowed_proxy"
+            ],
+            "description": "Assigned by the backend from the credential creation path; cannot be changed with an account patch."
           }
         },
         "additionalProperties": false,
@@ -1925,7 +2017,13 @@
           },
           "account_storage_platforms": {
             "type": "array",
-            "items": { "type": "string", "enum": ["macos", "linux"] },
+            "items": {
+              "type": "string",
+              "enum": [
+                "macos",
+                "linux"
+              ]
+            },
             "description": "Supported saved-account storage platforms. Linux requires a separately supplied vault master key."
           },
           "account_storage_platform": {
@@ -1953,6 +2051,36 @@
                 "remove_account",
                 "start_oauth"
               ]
+            }
+          },
+          "source_references": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "platforms",
+                "origin",
+                "credential_refresh"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "quotio_custom_provider"
+                },
+                "platforms": {
+                  "type": "array",
+                  "items": {
+                    "const": "macos"
+                  }
+                },
+                "origin": {
+                  "const": "borrowed_proxy"
+                },
+                "credential_refresh": {
+                  "const": false
+                }
+              }
             }
           }
         },
@@ -2479,6 +2607,40 @@
           "force": {
             "type": "boolean",
             "default": false
+          }
+        }
+      },
+      "AccountSourceInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source",
+          "kind"
+        ],
+        "properties": {
+          "source": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "domain",
+              "record_id"
+            ],
+            "properties": {
+              "domain": {
+                "type": "string",
+                "enum": [
+                  "production",
+                  "development"
+                ]
+              },
+              "record_id": {
+                "type": "string",
+                "format": "uuid"
+              }
+            }
+          },
+          "kind": {
+            "const": "quotio_custom_provider"
           }
         }
       }

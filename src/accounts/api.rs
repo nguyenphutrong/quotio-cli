@@ -10,6 +10,7 @@ pub struct AccountDto {
     pub provider: Provider,
     pub label: String,
     pub active: bool,
+    pub origin: super::AccountOrigin,
 }
 impl From<&super::Account> for AccountDto {
     fn from(account: &super::Account) -> Self {
@@ -18,6 +19,7 @@ impl From<&super::Account> for AccountDto {
             provider: account.provider,
             label: account.label.clone(),
             active: account.active,
+            origin: account.origin(),
         }
     }
 }
@@ -88,6 +90,24 @@ pub struct PreparedAccount {
     label: String,
     credential: Credential,
     identity: String,
+}
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SourceInput {
+    QuotioCustomProvider {
+        source: super::sources::CustomProviderReference,
+    },
+}
+pub async fn prepare_source(input: SourceInput) -> Result<PreparedAccount, AccountError> {
+    let SourceInput::QuotioCustomProvider { source } = input;
+    let identity = source.identity()?;
+    let resolved = source.resolve().await?;
+    Ok(PreparedAccount {
+        provider: Provider::Catalog("clinepass"),
+        label: resolved.label,
+        identity,
+        credential: Credential::QuotioCustomProvider { source },
+    })
 }
 pub async fn prepare(
     context: &ProviderContext,

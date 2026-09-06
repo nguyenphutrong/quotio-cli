@@ -30,6 +30,13 @@ pub enum Operation {
     StartOAuth,
 }
 #[derive(Clone, Serialize, PartialEq, Eq)]
+pub struct SourceCapability {
+    pub kind: &'static str,
+    pub platforms: Vec<&'static str>,
+    pub origin: &'static str,
+    pub credential_refresh: bool,
+}
+#[derive(Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderCapability {
     pub provider: Provider,
     pub auth: Vec<AuthMethod>,
@@ -42,6 +49,7 @@ pub struct ProviderCapability {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_instructions: Option<&'static str>,
     pub operations: Vec<Operation>,
+    pub source_references: Vec<SourceCapability>,
 }
 const FACTORY_REGIONS: &[&str] = &["global", "eu"];
 const ASIA_REGIONS: &[&str] = &["global", "cn"];
@@ -142,6 +150,16 @@ pub fn capability(provider: Provider) -> ProviderCapability {
         account_storage_platform: provider.supports_accounts().then_some("macos"),
         account_storage_platforms: if provider.supports_accounts() {
             vec!["macos", "linux"]
+        } else {
+            vec![]
+        },
+        source_references: if provider == Provider::Catalog("clinepass") {
+            vec![SourceCapability {
+                kind: "quotio_custom_provider",
+                platforms: vec!["macos"],
+                origin: "borrowed_proxy",
+                credential_refresh: false,
+            }]
         } else {
             vec![]
         },

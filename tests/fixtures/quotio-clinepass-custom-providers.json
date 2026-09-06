@@ -1,0 +1,28 @@
+[
+  {
+    "api-keys" : [
+      {
+        "api-key" : "fixture-first",
+        "id" : "01234567-89AB-CDEF-0123-456789ABCDEA"
+      },
+      {
+        "api-key" : "fixture-second",
+        "id" : "01234567-89AB-CDEF-0123-456789ABCDEB"
+      }
+    ],
+    "base-url" : "https:\/\/api.cline.bot\/api\/v1",
+    "created-at" : "1970-01-01T00:00:00Z",
+    "headers" : [
+
+    ],
+    "id" : "01234567-89AB-CDEF-0123-456789ABCDEF",
+    "is-enabled" : true,
+    "limit-to-selected-models" : true,
+    "models" : [
+
+    ],
+    "name" : "Cline group",
+    "type" : "clinepass",
+    "updated-at" : "1970-01-01T00:00:00Z"
+  }
+]

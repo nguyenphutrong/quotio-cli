@@ -13,6 +13,8 @@ pub enum ProviderError {
     Transient,
     #[error("credentials unavailable or rejected")]
     Authentication,
+    #[error("the credential source is disabled by its owner")]
+    SourceDisabled,
     #[error("provider returned invalid usage")]
     InvalidData,
     #[error("signed in, but direct Google API quota could not be verified")]

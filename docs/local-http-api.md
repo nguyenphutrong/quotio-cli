@@ -263,3 +263,46 @@ Force bypasses freshness; key rotation cannot reuse another login's snapshot. Th
 provider token is not persisted, returned, logged or passed through arguments/URLs.
 Operation history is bounded like refresh history; disconnecting a client does not
 claim a provider operation completed, and backend shutdown cancels tracked jobs.
+
+## Borrowed ClinePass source references
+
+On macOS, `POST /v1/account-sources` registers one existing ClinePass group from
+Quotio's custom-provider preferences. It requires management authentication and an
+`Idempotency-Key`, and returns an operation whose result contains the new account
+ID. The request contains references only:
+
+```json
+{
+  "kind": "quotio_custom_provider",
+  "source": {
+    "domain": "production",
+    "record_id": "01234567-89ab-cdef-0123-456789abcdef"
+  }
+}
+```
+
+`production` addresses `app.bytrong.quotio`; `development` addresses
+`app.bytrong.quotio.dev`. Arbitrary domains, file paths, credentials and ownership
+flags are rejected. This operation does not discover groups, copy their keys,
+change the proxy configuration, or refresh their credentials. The group must exist,
+be enabled and contain a usable key. As in the Swift implementation, quota uses the
+first key. Linux can use owned ClinePass API keys, but cannot read macOS preferences.
+Provider capabilities expose this distinction in `source_references`.
+
+The account has `origin: borrowed_proxy`; accounts created through the owned-key or
+OAuth APIs have `origin: owned`. Ownership cannot be patched. The opaque account ID
+and duplicate detection bind to the source domain and group UUID, not its label.
+Use the existing account endpoints to rename or remove the reference, and refresh
+by account ID. Removing a reference never removes the source group or its key.
+
+Source keys are resolved on the backend for usage and cache identity checks. Disabled
+sources report `source_disabled`. Source changes during a fetch reject that result;
+credential replacement or account deletion also rejects an in-flight result.
+Registration receipts and references use vault document format 3, which older
+binaries reject. Documents in formats 1 and 2 remain readable. Registration is
+explicit and is not run automatically by the current Swift production composition.
+
+Automated source tests use a JSON fixture encoded by Swift's `CustomProvider` model,
+a separate macOS test preferences domain for cross-process visibility, and an
+in-memory vault for retry and deletion races. These do not establish live ClinePass
+account acceptance or a completed Swift migration.

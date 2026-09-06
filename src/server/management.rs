@@ -16,6 +16,7 @@ pub(super) fn account_code(error: &AccountError) -> &'static str {
     match error {
         AccountError::Storage | AccountError::Corrupt => "credential_storage_unavailable",
         AccountError::Busy => "account_busy",
+        AccountError::SourceDisabled => "source_disabled",
         AccountError::IdempotencyConflict => "idempotency_conflict",
         AccountError::IdempotencyFull => "idempotency_full",
         AccountError::NotFound => "account_not_found",
@@ -80,6 +81,7 @@ pub(super) async fn usage(State(state): State<Arc<ApiState>>, Path(id): Path<Str
 }
 enum Mutation {
     Create(api::ApiKeyInput),
+    Reference(api::SourceInput),
     Update(String, api::AccountPatch),
     Remove(String),
 }
@@ -97,6 +99,23 @@ pub(super) async fn create(
         "",
         body,
         Mutation::Create(input),
+    )
+    .await
+}
+pub(super) async fn reference(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    ApiJson(body): ApiJson<Value>,
+) -> Result<(StatusCode, Json<Operation>), ApiError> {
+    let input = serde_json::from_value(body.clone())
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    mutate(
+        state,
+        headers,
+        "account_source_register",
+        "",
+        body,
+        Mutation::Reference(input),
     )
     .await
 }
@@ -179,6 +198,19 @@ async fn mutate(
                 match mutation {
                     Mutation::Create(input) => {
                         let prepared = api::prepare(&work.context, input)
+                            .await
+                            .map_err(|e| account_code(&e))?;
+                        let _guard = crate::accounts::service::mutation_guard(&work.commit_guard)
+                            .await
+                            .map_err(|e| account_code(&e))?;
+                        let account_id = api::save_once(vault, prepared, intent)
+                            .await
+                            .map_err(|e| account_code(&e))?;
+                        work.invalidate().await;
+                        Ok(json!({"account_id":account_id}))
+                    }
+                    Mutation::Reference(input) => {
+                        let prepared = api::prepare_source(input)
                             .await
                             .map_err(|e| account_code(&e))?;
                         let _guard = crate::accounts::service::mutation_guard(&work.commit_guard)

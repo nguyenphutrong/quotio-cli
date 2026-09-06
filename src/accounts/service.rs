@@ -80,6 +80,20 @@ pub async fn validate(
     provider: Provider,
     credential: &Credential,
 ) -> Result<ProviderUsage, AccountError> {
+    let resolved;
+    let source = match credential {
+        Credential::QuotioCustomProvider { source } => Some(source),
+        _ => None,
+    };
+    let credential = if let Some(source) = source {
+        if provider != Provider::Catalog("clinepass") {
+            return Err(AccountError::Unsupported);
+        }
+        resolved = source.resolve().await?;
+        &resolved.credential
+    } else {
+        credential
+    };
     let ctx = scoped(context, provider, credential)?;
     let usage = match provider {
         Provider::Amp => AmpApiProvider.fetch(&ctx).await?,
@@ -95,6 +109,11 @@ pub async fn validate(
         || usage.windows.iter().any(|w| !w.quota.is_valid())
     {
         return Err(ProviderError::InvalidData.into());
+    }
+    if let Some(source) = source
+        && source.resolve().await?.credential != *credential
+    {
+        return Err(AccountError::Busy);
     }
     Ok(usage)
 }
@@ -204,7 +223,7 @@ pub async fn commit_once(
         },
     );
     // Older binaries must reject the document instead of silently discarding receipts.
-    tx.document.version = 2;
+    tx.document.version = tx.document.version.max(2);
     commit(tx).await?;
     Ok(id)
 }
@@ -331,6 +350,7 @@ pub fn default_label(
         return super::validate_label(label);
     }
     match credential {
+        Credential::QuotioCustomProvider { .. } => Err(AccountError::Input),
         Credential::CodexOAuth { email, .. } => super::validate_label(email),
         Credential::ApiKey { token, .. } | Credential::CatalogKey { token, .. } => {
             let suffix =
@@ -398,10 +418,11 @@ impl ManagedProvider {
         drop(tx);
         let credential = account.credential;
         if self.provider != Provider::Codex {
-            return self
+            let usage = self
                 .operations
                 .quota(context, self.provider, &credential)
-                .await;
+                .await?;
+            return self.verify_current(&credential, usage).await;
         }
         let needs_refresh = matches!(&credential,Credential::CodexOAuth{expires_at,..} if *expires_at<=context.clock.now().unix_timestamp()+60);
         if !needs_refresh {
@@ -410,7 +431,7 @@ impl ManagedProvider {
                 .quota(context, self.provider, &credential)
                 .await
             {
-                Ok(usage) => return Ok(usage),
+                Ok(usage) => return self.verify_current(&credential, usage).await,
                 Err(AccountError::Provider(ProviderError::Authentication)) => (),
                 Err(error) => return Err(error),
             }
@@ -428,7 +449,11 @@ impl ManagedProvider {
         drop(tx);
         if credential != latest {
             drop(guard);
-            return self.operations.quota(context, self.provider, &latest).await;
+            let usage = self
+                .operations
+                .quota(context, self.provider, &latest)
+                .await?;
+            return self.verify_current(&latest, usage).await;
         }
         let updated = self.operations.refresh(context, &latest).await?;
         let mut tx = begin(self.vault.clone()).await?;
@@ -445,9 +470,28 @@ impl ManagedProvider {
         // Persist rotation without holding the global vault lock during network IO.
         commit(tx).await?;
         drop(guard);
-        self.operations
+        let usage = self
+            .operations
             .quota(context, self.provider, &updated)
-            .await
+            .await?;
+        self.verify_current(&updated, usage).await
+    }
+    async fn verify_current(
+        &self,
+        credential: &Credential,
+        usage: ProviderUsage,
+    ) -> Result<ProviderUsage, AccountError> {
+        let tx = begin(self.vault.clone()).await?;
+        let current = tx
+            .document
+            .accounts
+            .iter()
+            .find(|a| a.id == self.id && a.provider == self.provider)
+            .ok_or(AccountError::NotFound)?;
+        if current.credential != *credential {
+            return Err(AccountError::Busy);
+        }
+        Ok(usage)
     }
 }
 impl ProviderAdapter for ManagedProvider {
@@ -462,7 +506,12 @@ impl ProviderAdapter for ManagedProvider {
                 .accounts
                 .iter()
                 .find(|a| a.id == self.id && a.provider == self.provider)?;
+            let account = account.clone();
+            drop(tx);
             let scope = match &account.credential {
+                Credential::QuotioCustomProvider { source } => {
+                    serde_json::to_string(&source.resolve().await.ok()?.credential).ok()?
+                }
                 Credential::CodexOAuth { account_id, .. } => account_id.clone(),
                 credential => serde_json::to_string(credential).ok()?,
             };
@@ -491,6 +540,7 @@ impl ProviderAdapter for ManagedProvider {
             self.read(context).await.map_err(|e| match e {
                 AccountError::Provider(e) => e,
                 AccountError::Busy => ProviderError::Transient,
+                AccountError::SourceDisabled => ProviderError::SourceDisabled,
                 AccountError::Storage | AccountError::Corrupt => ProviderError::CredentialStorage,
                 _ => ProviderError::Authentication,
             })
@@ -812,6 +862,87 @@ mod tests {
                 }
                 Ok(k)
             })
+        }
+    }
+
+    struct MutateDuringQuota {
+        vault: Vault,
+        id: String,
+        remove: bool,
+    }
+    impl Operations for MutateDuringQuota {
+        fn quota<'a>(
+            &'a self,
+            context: &'a ProviderContext,
+            _: Provider,
+            _: &'a Credential,
+        ) -> OperationFuture<'a, ProviderUsage> {
+            Box::pin(async move {
+                let mut tx = self.vault.begin()?;
+                if self.remove {
+                    tx.document.remove(&self.id)?;
+                } else {
+                    tx.document
+                        .accounts
+                        .iter_mut()
+                        .find(|a| a.id == self.id)
+                        .unwrap()
+                        .credential = Credential::ApiKey {
+                        token: "rotated-fixture".into(),
+                        region: None,
+                        organization: None,
+                    };
+                }
+                tx.commit()?;
+                Ok(MockProvider.fetch(context).await?)
+            })
+        }
+        fn refresh<'a>(
+            &'a self,
+            _: &'a ProviderContext,
+            _: &'a Credential,
+        ) -> OperationFuture<'a, Credential> {
+            panic!("borrowed source must never refresh")
+        }
+    }
+    #[tokio::test]
+    async fn borrowed_results_are_rejected_after_account_removal_or_replacement() {
+        for remove in [true, false] {
+            let path = std::env::temp_dir().join(random_string().unwrap());
+            let vault = Vault::new(Arc::new(Memory::default()), path.join("lock"));
+            let source = super::super::sources::CustomProviderReference {
+                domain: super::super::sources::QuotioDomain::Production,
+                record_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+            };
+            let mut tx = vault.begin().unwrap();
+            let id = tx
+                .document
+                .add(
+                    Provider::Catalog("clinepass"),
+                    "Fixture",
+                    source.identity().unwrap(),
+                    Credential::QuotioCustomProvider { source },
+                )
+                .unwrap();
+            tx.commit().unwrap();
+            let adapter = ManagedProvider {
+                label: "Fixture".into(),
+                operations: Arc::new(MutateDuringQuota {
+                    vault: vault.clone(),
+                    id: id.clone(),
+                    remove,
+                }),
+                vault,
+                id,
+                provider: Provider::Catalog("clinepass"),
+                provider_id: ProviderId("clinepass".into()),
+            };
+            let result = adapter.read(&http::fixture::context()).await;
+            assert!(matches!(
+                result,
+                Err(AccountError::NotFound | AccountError::Busy)
+            ));
+            cleanup(path);
         }
     }
     fn setup(
