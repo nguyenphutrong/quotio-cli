@@ -474,9 +474,6 @@ async fn refresh(state: &ApiState, request: Option<RefreshRequest>) -> Result<Va
     let mut status = state.status.lock().await;
     status.refreshing = false;
     status.last_completed_at = Some(timestamp(report.generated_at));
-    status.next_refresh_at = Some(timestamp(
-        state.context.clock.now() + time::Duration::seconds(config.refresh_interval as i64),
-    ));
     drop(status);
     if generation != state.generation.load(Ordering::SeqCst) {
         state.wake.notify_one();
@@ -510,6 +507,18 @@ async fn refresh(state: &ApiState, request: Option<RefreshRequest>) -> Result<Va
         *snapshot = Some((generation, report));
     }
     Ok(json!({"providers":successes,"failures":failures}))
+}
+async fn wait_for_next_refresh(state: &ApiState) {
+    let interval = state.settings.read().await.values.refresh_interval;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(interval);
+    state.status.lock().await.next_refresh_at = Some(timestamp(
+        state.context.clock.now() + time::Duration::seconds(interval as i64),
+    ));
+    tokio::select! {
+        _ = tokio::time::sleep_until(deadline) => (),
+        _ = state.wake.notified() => (),
+    }
+    state.status.lock().await.next_refresh_at = None;
 }
 pub async fn run(args: ServeArgs) -> Result<(), ServerError> {
     if !args.listen.ip().is_loopback() {
@@ -604,8 +613,7 @@ pub async fn run(args: ServeArgs) -> Result<(), ServerError> {
     let mut worker = tokio::spawn(async move {
         loop {
             let _ = refresh(&worker_state, None).await;
-            let interval = worker_state.settings.read().await.values.refresh_interval;
-            tokio::select! {_=tokio::time::sleep(Duration::from_secs(interval))=>(),_=worker_state.wake.notified()=>()}
+            wait_for_next_refresh(&worker_state).await;
         }
     });
     let (stop, mut stopped) = watch::channel(false);

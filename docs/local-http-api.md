@@ -190,3 +190,10 @@ The server accepts at most 4096 distinct account write keys per lifetime; furthe
 new keys return 503 `idempotency_full`. Existing keys still replay their result,
 and refresh remains available. Complete pending writes and restart to clear this
 ledger. Keys and operations cannot be recovered across restart.
+
+### Refresh schedule
+
+`next_refresh_at` describes the periodic scheduler's actual timer. Manual refresh
+updates `last_completed_at` but does not postpone that timer. The next time is null
+while the scheduler is refreshing or waiting for another refresh to finish.
+Settings and account changes wake the scheduler and replace its pending timer.

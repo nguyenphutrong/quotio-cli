@@ -226,3 +226,46 @@ async fn blocked_mutation_guard_returns_bounded_errors() {
     assert!(settings(State(state)).await.is_ok());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn manual_refresh_preserves_the_schedulers_deadline() {
+    let (state, dir, _) = fixture().await;
+    state.settings.write().await.values.enabled_providers = vec!["mock".into()];
+    state.status.lock().await.next_refresh_at = Some("scheduled-deadline".into());
+    refresh(
+        &state,
+        Some(RefreshRequest {
+            providers: vec![Provider::Mock],
+            account_id: None,
+            force: false,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        state.status.lock().await.next_refresh_at.as_deref(),
+        Some("scheduled-deadline")
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[tokio::test]
+async fn scheduler_clears_deadline_on_timer_and_config_wake() {
+    let (state, dir, _) = fixture().await;
+    state.settings.write().await.values.refresh_interval = 60;
+    tokio::time::pause();
+    for wake in [false, true] {
+        let worker = state.clone();
+        let task = tokio::spawn(async move { wait_for_next_refresh(&worker).await });
+        tokio::task::yield_now().await;
+        assert!(state.status.lock().await.next_refresh_at.is_some());
+        if wake {
+            state.wake.notify_one();
+        } else {
+            tokio::time::advance(Duration::from_secs(60)).await;
+        }
+        task.await.unwrap();
+        assert!(state.status.lock().await.next_refresh_at.is_none());
+    }
+    tokio::time::resume();
+    std::fs::remove_dir_all(dir).unwrap();
+}
