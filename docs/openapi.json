@@ -2016,7 +2016,8 @@
           "result",
           "error",
           "message"
-        ]
+        ],
+        "description": "At most 128 operations run concurrently. The latest 128 completed refresh results expire after 15 minutes. Account write results and idempotency keys persist until restart, limited to 4096 distinct keys; new keys beyond that limit return 503 idempotency_full. Existing keys remain replayable."
       },
       "ApiKeyInput": {
         "type": "object",

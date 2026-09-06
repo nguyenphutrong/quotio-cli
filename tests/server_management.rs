@@ -251,3 +251,29 @@ async fn remote_policy_preflight_limits_and_read_only() {
         409
     );
 }
+
+#[tokio::test]
+async fn completed_refresh_history_does_not_exhaust_operation_capacity() {
+    let server = Server::start(&[
+        "--manage",
+        "--provider",
+        "mock",
+        "--refresh-interval",
+        "3600",
+    ])
+    .await;
+    for _ in 0..140 {
+        let response = server
+            .request(reqwest::Method::POST, "/v1/refresh")
+            .json(&json!({"force": false}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 202);
+        let op: Value = response.json().await.unwrap();
+        assert_eq!(
+            server.done(op["id"].as_str().unwrap()).await["status"],
+            "completed"
+        );
+    }
+}

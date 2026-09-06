@@ -57,7 +57,7 @@ The read-only default has no account or settings writes. `--manage` adds the man
 | `GET /v1/settings` | Current settings and revision; available in read-only mode |
 | `PATCH /v1/settings` | Optimistic revision patch; requires `--manage` |
 | `POST /v1/refresh` | Asynchronous refresh request (requires `--manage`) |
-| `GET /v1/operations/{id}` | Operation status; completed entries are retained for 15 minutes |
+| `GET /v1/operations/{id}` | Operation status; recent refresh results expire after 15 minutes; account write results persist until restart |
 
 Usage responses use Quotio's existing `schema_version: 1` JSON contract, matching
 `quotio usage --format json`: `generated_at`, `providers`, and `failures`. Each usage
@@ -179,3 +179,14 @@ Once a native credential write starts, Quotio waits for its actual result instea
 of reporting a timeout that might hide a successful write. A stalled write remains
 running; other requests stop waiting for its lock after 10 seconds. After an
 interruption or restart, inspect the account list before submitting another write.
+
+### Operation capacity and retries
+
+Up to 128 operations may run at once. Completed refreshes do not consume running
+slots. The latest 128 refresh results are available for up to 15 minutes; older
+results return 404. Account write results and their idempotency keys remain until
+restart, so retrying a key cannot repeat a write after refresh history is pruned.
+The server accepts at most 4096 distinct account write keys per lifetime; further
+new keys return 503 `idempotency_full`. Existing keys still replay their result,
+and refresh remains available. Complete pending writes and restart to clear this
+ledger. Keys and operations cannot be recovered across restart.

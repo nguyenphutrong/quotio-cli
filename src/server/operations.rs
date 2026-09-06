@@ -26,10 +26,23 @@ pub struct Operations {
 }
 impl Operations {
     fn prune(&mut self) {
+        // Account writes retain their retry keys for this server's lifetime.
         self.entries.retain(|_, e| {
-            e.finished
-                .is_none_or(|t| t.elapsed() < Duration::from_secs(900))
+            e.key.is_some()
+                || e.finished
+                    .is_none_or(|t| t.elapsed() < Duration::from_secs(900))
         });
+        let mut completed: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.key.is_none() && e.finished.is_some())
+            .map(|(id, e)| (id.clone(), e.finished.unwrap()))
+            .collect();
+        completed.sort_by_key(|(_, at)| *at);
+        let excess = completed.len().saturating_sub(128);
+        for (id, _) in completed.into_iter().take(excess) {
+            self.entries.remove(&id);
+        }
     }
     pub fn start(
         &mut self,
@@ -50,7 +63,16 @@ impl Operations {
                 };
             }
         }
-        if self.entries.len() >= 128 {
+        if key.is_some() && self.entries.values().filter(|e| e.key.is_some()).count() >= 4096 {
+            return Err("idempotency_full");
+        }
+        if self
+            .entries
+            .values()
+            .filter(|e| e.finished.is_none())
+            .count()
+            >= 128
+        {
             return Err("operations_full");
         }
         let id = crate::accounts::random_string().map_err(|_| "internal_error")?;
@@ -122,7 +144,12 @@ mod tests {
         assert_eq!(ops.get(&op.id).unwrap().status, "completed");
         ops.entries.get_mut(&op.id).unwrap().finished =
             Some(Instant::now() - Duration::from_secs(901));
-        assert!(ops.get(&op.id).is_none());
+        assert!(ops.get(&op.id).is_some());
+        assert!(
+            !ops.start("create", Some("request-1".into()), "a".into())
+                .unwrap()
+                .1
+        );
         for _ in 0..128 {
             ops.start("refresh", None, String::new()).unwrap();
         }
@@ -130,5 +157,43 @@ mod tests {
             ops.start("refresh", None, String::new()),
             Err("operations_full")
         ));
+    }
+    #[test]
+    fn completed_refreshes_do_not_block_new_work() {
+        let mut ops = Operations::default();
+        let mut first = String::new();
+        for n in 0..300 {
+            let (op, _) = ops.start("refresh", None, n.to_string()).unwrap();
+            if n == 0 {
+                first = op.id.clone();
+            }
+            ops.finish(&op.id, Ok(serde_json::json!({"providers":1,"failures":0})));
+        }
+        assert!(ops.get(&first).is_none());
+        assert_eq!(ops.entries.len(), 128);
+        assert!(
+            ops.start("account_update", Some("new-key".into()), "body".into())
+                .is_ok()
+        );
+    }
+    #[test]
+    fn retry_ledger_is_bounded_without_blocking_refreshes() {
+        let mut ops = Operations::default();
+        for n in 0..4096 {
+            let (op, _) = ops
+                .start("account_update", Some(n.to_string()), "body".into())
+                .unwrap();
+            ops.finish(&op.id, Ok(serde_json::json!({"account_id":"fake"})));
+        }
+        assert!(matches!(
+            ops.start("account_update", Some("overflow".into()), "body".into()),
+            Err("idempotency_full")
+        ));
+        assert!(
+            !ops.start("account_update", Some("0".into()), "body".into())
+                .unwrap()
+                .1
+        );
+        assert!(ops.start("refresh", None, "scope".into()).is_ok());
     }
 }
