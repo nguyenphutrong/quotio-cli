@@ -10,6 +10,7 @@ pub mod factory;
 pub(crate) mod http;
 pub mod key_api;
 pub mod mock;
+pub mod openrouter;
 pub(crate) mod process;
 use crate::{
     domain::{ProviderId, ProviderUsage},

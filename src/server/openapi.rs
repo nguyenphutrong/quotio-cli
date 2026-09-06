@@ -275,6 +275,10 @@ mod tests {
             schema_version: 1,
             generated_at: now,
             providers: vec![crate::domain::ProviderUsage {
+                diagnostics: vec![crate::domain::UsageDiagnostic {
+                    source: "fixture".into(),
+                    code: crate::error::ProviderError::Transient,
+                }],
                 account_ref: None,
                 provider: crate::domain::ProviderId("mock".into()),
                 account: crate::domain::AccountIdentity {

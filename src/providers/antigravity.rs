@@ -396,6 +396,7 @@ impl AntigravityProvider {
             }
         };
         Ok(ProviderUsage {
+            diagnostics: vec![],
             account_ref: None,
             provider: self.id(),
             account: AccountIdentity {

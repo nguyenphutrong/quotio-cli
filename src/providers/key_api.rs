@@ -208,7 +208,10 @@ fn synthetic(root: &Value, now: OffsetDateTime) -> Result<Vec<QuotaWindow>, Prov
     }
     Ok(windows)
 }
-fn openrouter(root: &Value, now: OffsetDateTime) -> Result<Vec<QuotaWindow>, ProviderError> {
+pub(crate) fn openrouter(
+    root: &Value,
+    now: OffsetDateTime,
+) -> Result<Vec<QuotaWindow>, ProviderError> {
     let data = root
         .get("data")
         .filter(|v| v.is_object())
@@ -453,6 +456,7 @@ impl KeyApiProvider {
             .map(|b| format!("{b:02x}"))
             .collect();
         Ok(ProviderUsage {
+            diagnostics: vec![],
             account_ref: None,
             provider: self.id(),
             account: AccountIdentity {
@@ -485,8 +489,11 @@ impl ProviderAdapter for KeyApiProvider {
                 .and_then(|name| context.credentials.get(name))
                 .map(|s| s.0)
                 .unwrap_or_else(|| "global".into());
-            self.fetch_at(context, self.0.endpoint(&region)?, &region)
-                .await
+            let endpoint = self.0.endpoint(&region)?;
+            if matches!(self.0, Kind::OpenRouter) {
+                return super::openrouter::fetch(context).await;
+            }
+            self.fetch_at(context, endpoint, &region).await
         })
     }
 }
@@ -554,6 +561,7 @@ mod tests {
             schema_version: 1,
             generated_at: OffsetDateTime::UNIX_EPOCH,
             providers: vec![ProviderUsage {
+                diagnostics: vec![],
                 account_ref: None,
                 provider: ProviderId("openrouter".into()),
                 account: AccountIdentity {

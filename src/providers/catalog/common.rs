@@ -103,6 +103,7 @@ pub fn usage(
         .map(|b| format!("{b:02x}"))
         .collect();
     Ok(ProviderUsage {
+        diagnostics: vec![],
         account_ref: None,
         provider: ProviderId(id.into()),
         account: AccountIdentity {

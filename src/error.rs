@@ -1,8 +1,8 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 // Fixed messages deliberately exclude transport errors, URLs and response bodies.
-#[derive(Clone, Copy, Debug, Error, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Error, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderError {
     #[error("provider request timed out")]

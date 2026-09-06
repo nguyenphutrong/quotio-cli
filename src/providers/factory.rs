@@ -126,6 +126,7 @@ fn parse(
         });
     }
     Ok(ProviderUsage {
+        diagnostics: vec![],
         account_ref: None,
         provider: ProviderId("factory".into()),
         account: AccountIdentity {

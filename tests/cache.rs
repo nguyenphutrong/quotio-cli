@@ -38,6 +38,7 @@ struct Adapter {
     login: Mutex<String>,
     calls: AtomicUsize,
     fails: AtomicBool,
+    partial: AtomicBool,
 }
 impl Adapter {
     fn new(account: &str) -> Arc<Self> {
@@ -49,6 +50,7 @@ impl Adapter {
             login: Mutex::new(account.into()),
             calls: AtomicUsize::new(0),
             fails: AtomicBool::new(false),
+            partial: AtomicBool::new(false),
         })
     }
 }
@@ -83,6 +85,12 @@ impl ProviderAdapter for Adapter {
             }
             let mut usage = MockProvider.fetch(context).await?;
             usage.provider = self.id();
+            if self.partial.load(Ordering::SeqCst) {
+                usage.diagnostics.push(quotio::domain::UsageDiagnostic {
+                    source: "fixture_endpoint".into(),
+                    code: ProviderError::Transient,
+                });
+            }
             usage.account.id = self.login.lock().unwrap().clone();
             for window in &mut usage.windows {
                 window.fetched_at = context.clock.now();
@@ -446,4 +454,33 @@ async fn environment_key_and_scope_changes_invalidate_without_persisting_secrets
         let bytes = std::fs::read(path).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("secret-sentinel"));
     }
+}
+
+#[tokio::test]
+async fn partial_diagnostics_survive_fresh_cache_without_refetching() {
+    let fixture = Fixture::new();
+    let adapter = Adapter::new("partial-account");
+    adapter.partial.store(true, Ordering::SeqCst);
+    for _ in 0..2 {
+        let report = fixture
+            .cache
+            .collect(
+                &fixture.collector,
+                CollectRequest {
+                    providers: vec![adapter.clone()],
+                    timeout: Duration::from_secs(2),
+                    cancellation: Cancellation::default(),
+                },
+                false,
+            )
+            .await;
+        assert_eq!(report.providers.len(), 1);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(
+            report.providers[0].diagnostics[0].source,
+            "fixture_endpoint"
+        );
+        assert_eq!(report.failures[0].code, ProviderError::Transient);
+    }
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
 }

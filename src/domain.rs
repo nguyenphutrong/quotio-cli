@@ -117,7 +117,14 @@ pub struct AccountRef {
     pub label: String,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UsageDiagnostic {
+    pub source: String,
+    pub code: ProviderError,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderUsage {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<UsageDiagnostic>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_ref: Option<AccountRef>,
     pub provider: ProviderId,
@@ -141,6 +148,25 @@ pub struct UsageReport {
     pub failures: Vec<ProviderFailure>,
 }
 impl UsageReport {
+    pub(crate) fn include_diagnostics(&mut self) {
+        for usage in &self.providers {
+            for diagnostic in &usage.diagnostics {
+                if !self.failures.iter().any(|failure| {
+                    failure.provider == usage.provider
+                        && failure.account_ref.as_ref().map(|a| &a.id)
+                            == usage.account_ref.as_ref().map(|a| &a.id)
+                        && failure.code == diagnostic.code
+                }) {
+                    self.failures.push(ProviderFailure {
+                        provider: usage.provider.clone(),
+                        account_ref: usage.account_ref.clone(),
+                        code: diagnostic.code,
+                        message: diagnostic.code.to_string(),
+                    });
+                }
+            }
+        }
+    }
     pub fn exit_code(&self) -> u8 {
         if self.providers.is_empty() {
             3

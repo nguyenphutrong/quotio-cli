@@ -238,3 +238,12 @@ proxy keys, tunnels and proxy notification policy remain in the existing Swift a
 The unreleased notification endpoint has been removed. An existing `notifications`
 config table is retained on settings writes for compatibility but does not control
 behavior. No migration step edits or stops a separately running CLIProxyAPI engine.
+
+## Partial provider endpoints
+
+A usage entry may include `diagnostics` with fixed error codes and an endpoint
+identifier when some provider endpoints succeed and others fail. The report's
+`failures` array also includes these account-scoped failures. Cached responses
+preserve the diagnostics and original window timestamps. OpenRouter now combines
+account credits/balance with key limits and spend using its existing API-key source.
+No new credential input endpoint or native credential discovery is included.

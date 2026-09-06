@@ -143,6 +143,7 @@ impl UsageCache {
             report.failures.extend(next.failures);
         }
         reconcile_accounts(&mut report.providers);
+        report.include_diagnostics();
         report
     }
     async fn one(

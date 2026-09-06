@@ -154,6 +154,7 @@ fn parse(
     }
     let email = account.email.ok_or(ProviderError::InvalidData)?;
     Ok(ProviderUsage {
+        diagnostics: vec![],
         account_ref: None,
         provider: ProviderId("codex".into()),
         account: AccountIdentity {

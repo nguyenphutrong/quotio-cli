@@ -1740,6 +1740,12 @@
             "items": {
               "$ref": "#/components/schemas/QuotaWindow"
             }
+          },
+          "diagnostics": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UsageDiagnostic"
+            }
           }
         },
         "additionalProperties": false,
@@ -2365,6 +2371,22 @@
           },
           "capabilities": {
             "$ref": "#/components/schemas/ProviderCapability"
+          }
+        }
+      },
+      "UsageDiagnostic": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source",
+          "code"
+        ],
+        "properties": {
+          "source": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
           }
         }
       }

@@ -106,6 +106,7 @@ impl Collector {
             }
         }
         reconcile_accounts(&mut report.providers);
+        report.include_diagnostics();
         report
     }
 }
