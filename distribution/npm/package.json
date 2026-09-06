@@ -1,0 +1,13 @@
+{
+  "name": "quotio",
+  "version": "0.1.0",
+  "description": "Check AI provider quota and usage with the Quotio CLI",
+  "license": "MIT",
+  "repository": {"type": "git", "url": "git+https://github.com/nguyenphutrong/quotio-cli.git"},
+  "homepage": "https://github.com/nguyenphutrong/quotio-cli",
+  "engines": {"node": ">=22"},
+  "bin": {"quotio": "bin/quotio.cjs"},
+  "files": ["bin", "native", "LICENSE", "THIRD-PARTY-NOTICES.md", "README.md"],
+  "scripts": {"test": "node --test ../npm.test.cjs"},
+  "publishConfig": {"access": "public"}
+}
