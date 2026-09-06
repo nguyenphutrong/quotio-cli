@@ -37,12 +37,13 @@ there; never put their values in Git, workflow inputs or chat:
 | `NOTARY_PRIVATE_KEY` | Apple notarization API private key, in PEM format |
 | `NOTARY_KEY_ID` | Associated Apple API key ID |
 | `NOTARY_ISSUER_ID` | Associated Apple API issuer ID |
-| `HOMEBREW_TAP_TOKEN` | Token restricted to contents read/write on the tap repository |
+| `HOMEBREW_TAP_SSH_KEY` | Private SSH deploy key whose public key has write access only on the tap repository |
 
 Set the environment variable `HOMEBREW_TAP_REPOSITORY` in GitHub Actions to
 `nguyenphutrong/homebrew-tap`. The publishing workflow writes only
 `Formula/quotio.rb` or `Formula/quotio-beta.rb`; other tap entries are preserved.
-Forks must change this variable and configure their own secrets and npm ownership.
+The workflow verifies GitHub SSH host keys from the authenticated GitHub metadata
+API before cloning; it does not disable host verification. Forks must change this variable and configure their own secrets and npm ownership.
 
 In npm package settings, configure a GitHub trusted publisher for:
 
@@ -86,7 +87,7 @@ integrity matches exactly.
    Apple is a notarization transport; the distributed raw CLI relies on online
    Gatekeeper ticket lookup, not a stapled installer.
 6. Publish the draft in GitHub. **Publish package channels** publishes the verified
-   npm tarball, then updates the existing tap through GitHub's contents API.
+   npm tarball, then updates the existing tap using its repository-scoped SSH deploy key.
 
 | Version | npm tag | Homebrew formula |
 | --- | --- | --- |

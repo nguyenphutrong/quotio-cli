@@ -70,21 +70,27 @@ jobs:
           ruby -c "$formula"
       - name: Update existing Homebrew tap
         env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          HOMEBREW_TAP_SSH_KEY: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}
         run: |
-          : "${GH_TOKEN:?Set HOMEBREW_TAP_TOKEN for the tap repository}"
+          : "${HOMEBREW_TAP_SSH_KEY:?Set the tap deploy key secret}"
           : "${TAP_REPOSITORY:?Set HOMEBREW_TAP_REPOSITORY}"
           [[ "$TAP_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
           formula=quotio.rb
           if [[ "$RELEASE_TAG" == *-* ]]; then formula=quotio-beta.rb; fi
-          api="repos/$TAP_REPOSITORY/contents/Formula/$formula"
-          existing=$(gh api "$api" 2>/dev/null || true)
-          content=$(base64 -w 0 "$formula")
-          args=()
-          if [[ -n "$existing" ]]; then
-            sha=$(jq -r .sha <<< "$existing")
-            previous=$(jq -r .content <<< "$existing" | tr -d '\n')
-            if [[ "$previous" == "$content" ]]; then exit 0; fi
-            args+=(-f "sha=$sha")
-          fi
-          gh api "$api" --method PUT -f "message=chore(quotio): update to $RELEASE_TAG" -f "content=$content" "${args[@]}" --silent
+          private=$(mktemp -d)
+          trap 'rm -rf "$private"' EXIT
+          printf '%s\n' "$HOMEBREW_TAP_SSH_KEY" > "$private/key"
+          chmod 600 "$private/key"
+          gh api meta --jq '.ssh_keys[] | "github.com " + .' > "$private/known_hosts"
+          test -s "$private/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $private/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$private/known_hosts"
+          git clone --depth 1 "git@github.com:$TAP_REPOSITORY.git" "$private/tap"
+          mkdir -p "$private/tap/Formula"
+          cp "$formula" "$private/tap/Formula/$formula"
+          cd "$private/tap"
+          git add "Formula/$formula"
+          if git diff --cached --quiet; then exit 0; fi
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m "chore(quotio): update to $RELEASE_TAG"
+          git push origin HEAD
