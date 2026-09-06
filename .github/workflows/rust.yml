@@ -1,0 +1,48 @@
+name: Rust checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust ${{ matrix.toolchain }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04]
+        toolchain: [stable, '1.88.0']
+    env:
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: '1'
+      TOOLCHAIN: ${{ matrix.toolchain }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        if: matrix.toolchain == 'stable'
+        run: cargo +"$TOOLCHAIN" fmt --check
+      - name: Fetch locked dependencies
+        run: cargo +"$TOOLCHAIN" fetch --locked
+      - name: Check all targets
+        run: cargo +"$TOOLCHAIN" clippy --offline --locked --all-targets --all-features -- -D warnings
+      - name: Run offline tests and OpenAPI contract checks
+        run: cargo +"$TOOLCHAIN" test --offline --locked --all-features
+      - name: Build release binary
+        run: cargo +"$TOOLCHAIN" build --offline --locked --release
