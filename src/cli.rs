@@ -247,6 +247,9 @@ pub enum AccountCommand {
 
 #[derive(Debug, Args)]
 pub struct ServeArgs {
+    /// Native parent protocol: token on stdin, bootstrap JSON on stdout, stop on stdin EOF
+    #[arg(long, requires = "manage")]
+    pub parent_pipe: bool,
     /// Listen on a loopback address; port 0 selects an available port
     #[arg(long, default_value = "127.0.0.1:8317")]
     pub listen: std::net::SocketAddr,

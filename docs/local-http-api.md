@@ -197,3 +197,23 @@ ledger. Keys and operations cannot be recovered across restart.
 updates `last_completed_at` but does not postpone that timer. The next time is null
 while the scheduler is refreshing or waiting for another refresh to finish.
 Settings and account changes wake the scheduler and replace its pending timer.
+
+## Native parent pipe, bootstrap version 1
+
+`serve --manage --parent-pipe --listen 127.0.0.1:0` is the native app transport.
+The parent supplies one 32–4096 byte visible-ASCII token followed by LF over an
+inherited stdin pipe within five seconds. Do not also set `QUOTIO_SERVER_TOKEN`.
+The process emits one JSON line on stdout after binding and initialization:
+
+```json
+{"bootstrap_version":1,"api_version":1,"server_version":"0.1.1","pid":123,"host":"127.0.0.1","port":49152}
+```
+
+The example port and PID are illustrative. Use the actual record, then authenticate
+`GET /v1/status` and verify version/access mode and readiness. The record means the
+listener is bound, not that the initial provider refresh is complete. Logs stay on
+stderr. Tokens never appear in the record. Keep stdin open for the process lifetime;
+EOF, input failure or extra bytes terminate the session using normal graceful
+shutdown. This mode requires a Unix pipe, not a terminal or regular file. A native
+parent must close unused pipe endpoints, keep the token private and stop only its
+owned child. The normal CLI stderr announcement is unchanged without this flag.

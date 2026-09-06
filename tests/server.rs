@@ -41,6 +41,7 @@ fn server_argument_contract() {
 async fn startup_rejects_remote_bind_empty_selection_and_occupied_port() {
     let config = Config::new("startup");
     let args = || ServeArgs {
+        parent_pipe: false,
         listen: "127.0.0.1:0".parse().unwrap(),
         provider: vec![],
         config: Some(config.0.clone()),
@@ -225,4 +226,105 @@ async fn http_snapshots_security_and_process_shutdown() {
     }
     #[cfg(not(unix))]
     child.kill().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn parent_pipe_bootstrap_authentication_and_eof_shutdown() {
+    use tokio::io::AsyncWriteExt;
+    let config = Config::new("parent-pipe");
+    let token = "synthetic-parent-pipe-bearer-1234567890";
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_quotio"))
+        .args([
+            "serve",
+            "--manage",
+            "--parent-pipe",
+            "--listen",
+            "127.0.0.1:0",
+            "--no-saved-accounts",
+            "--config",
+        ])
+        .arg(&config.0)
+        .env_remove("QUOTIO_SERVER_TOKEN")
+        .env("QUOTIO_CACHE_DIR", config.0.with_extension("cache"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(format!("{token}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let record = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!record.contains(token));
+    let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+    assert_eq!(record["bootstrap_version"], 1);
+    assert_eq!(record["api_version"], 1);
+    assert_eq!(record["server_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(record["pid"], pid);
+    assert_eq!(record["host"], "127.0.0.1");
+    let port = record["port"].as_u64().unwrap();
+    assert!(port > 0 && port <= 65535);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let url = format!("http://127.0.0.1:{port}/v1/status");
+    assert_eq!(client.get(&url).send().await.unwrap().status(), 401);
+    let status: serde_json::Value = client
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["access_mode"], "manage");
+    assert_eq!(status["server_version"], record["server_version"]);
+    drop(input);
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(token));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn parent_pipe_rejects_ambiguous_token_without_bootstrap() {
+    let config = Config::new("parent-conflict");
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_quotio"))
+        .args([
+            "serve",
+            "--manage",
+            "--parent-pipe",
+            "--listen",
+            "127.0.0.1:0",
+            "--no-saved-accounts",
+            "--config",
+        ])
+        .arg(&config.0)
+        .env(
+            "QUOTIO_SERVER_TOKEN",
+            "synthetic-conflicting-token-1234567890",
+        )
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("synthetic-conflicting"));
+    assert!(Cli::try_parse_from(["quotio", "serve", "--parent-pipe"]).is_err());
 }

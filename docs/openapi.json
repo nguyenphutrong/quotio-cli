@@ -2299,7 +2299,51 @@
             }
           }
         }
+      },
+      "Bootstrap": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "bootstrap_version",
+          "api_version",
+          "server_version",
+          "pid",
+          "host",
+          "port"
+        ],
+        "properties": {
+          "bootstrap_version": {
+            "const": 1
+          },
+          "api_version": {
+            "const": 1
+          },
+          "server_version": {
+            "type": "string"
+          },
+          "pid": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "host": {
+            "type": "string",
+            "enum": [
+              "127.0.0.1",
+              "::1"
+            ]
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          }
+        }
       }
     }
+  },
+  "x-quotio-parent-pipe": {
+    "version": 1,
+    "bootstrap_schema": "#/components/schemas/Bootstrap",
+    "description": "Inherited stdin token line and lifetime pipe; one stdout JSON record after bind. Authenticate /v1/status before use."
   }
 }

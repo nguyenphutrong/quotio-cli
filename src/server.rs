@@ -1,4 +1,5 @@
 //! HTTP management and snapshot transport; provider work uses the shared usage cache.
+mod bootstrap;
 mod management;
 mod openapi;
 mod operations;
@@ -540,10 +541,19 @@ pub async fn run(args: ServeArgs) -> Result<(), ServerError> {
         },
     );
     let view = store.load().map_err(|_| ServerError::Config)?;
-    let token = match std::env::var("QUOTIO_SERVER_TOKEN") {
-        Ok(t) => Some(t),
-        Err(std::env::VarError::NotPresent) => None,
-        Err(_) => return Err(ServerError::Security),
+    let mut parent = if args.parent_pipe {
+        Some(bootstrap::Parent::open().await?)
+    } else {
+        None
+    };
+    let token = if let Some(parent) = &mut parent {
+        Some(parent.take_token())
+    } else {
+        match std::env::var("QUOTIO_SERVER_TOKEN") {
+            Ok(t) => Some(t),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(_) => return Err(ServerError::Security),
+        }
     };
     // Validate before binding or inspecting any provider credential.
     security::Policy::new(
@@ -610,7 +620,11 @@ pub async fn run(args: ServeArgs) -> Result<(), ServerError> {
         vault,
         oauth,
     });
-    eprintln!("Quotio API listening on http://{address}");
+    if args.parent_pipe {
+        bootstrap::announce(address)?;
+    } else {
+        eprintln!("Quotio API listening on http://{address}");
+    }
     tracing::info!(
         manage = state.manage,
         version = env!("CARGO_PKG_VERSION"),
@@ -635,7 +649,13 @@ pub async fn run(args: ServeArgs) -> Result<(), ServerError> {
     let result = tokio::select! {
         r=&mut server=>r.map_err(|_|ServerError::Initialize),
         _=&mut worker=>Err(ServerError::Initialize),
-        _=shutdown_signal()=>{stop.send_replace(true);let _=tokio::time::timeout(Duration::from_secs(2),&mut server).await;Ok(())}
+        _=async {
+            if let Some(parent) = &mut parent {
+                tokio::select! { _=shutdown_signal()=>(), _=parent.closed()=>() }
+            } else {
+                shutdown_signal().await;
+            }
+        }=>{stop.send_replace(true);let _=tokio::time::timeout(Duration::from_secs(2),&mut server).await;Ok(())}
     };
     stop.send_replace(true);
     worker.abort();
