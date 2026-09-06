@@ -5,12 +5,23 @@ if [ "$(uname -s)" != Darwin ]; then
     echo 'Developer signing requires macOS.' >&2
     exit 1
 fi
-if [ "$#" -ne 1 ] || [ ! -f "$1" ] || [ -L "$1" ]; then
-    echo 'Usage: scripts/sign-macos.sh <regular binary path>' >&2
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ] || [ ! -f "$1" ] || [ -L "$1" ]; then
+    echo 'Usage: scripts/sign-macos.sh <regular binary path> [--distribution]' >&2
     exit 2
 fi
 
+distribution=false
+if [ "$#" -eq 2 ]; then
+    if [ "$2" != --distribution ]; then
+        echo 'Only --distribution is supported after the binary path.' >&2
+        exit 2
+    fi
+    distribution=true
+fi
 identities=$(/usr/bin/security find-identity -v -p codesigning)
+if [ "$distribution" = true ]; then
+    identities=$(printf '%s\n' "$identities" | awk '/"Developer ID Application:/')
+fi
 requested=${QUOTIO_SIGNING_IDENTITY:-}
 if [ -n "$requested" ]; then
     candidates=$(printf '%s\n' "$identities" | awk -v wanted="$requested" '
@@ -40,7 +51,9 @@ trap 'rm -f "$staged"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' HUP TERM
 cp -p "$binary" "$staged"
+timestamp=--timestamp=none
+if [ "$distribution" = true ]; then timestamp=--timestamp; fi
 /usr/bin/codesign --force --sign "$candidates" --identifier dev.quotio.cli \
-    --options runtime --timestamp=none "$staged"
+    --options runtime "$timestamp" "$staged"
 /usr/bin/codesign --verify --strict "$staged"
 mv -f "$staged" "$binary"

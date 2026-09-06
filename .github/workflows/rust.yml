@@ -44,5 +44,8 @@ jobs:
         run: cargo +"$TOOLCHAIN" clippy --offline --locked --all-targets --all-features -- -D warnings
       - name: Run offline tests and OpenAPI contract checks
         run: cargo +"$TOOLCHAIN" test --offline --locked --all-features
+      - name: Test release notice generation
+        if: matrix.toolchain == 'stable'
+        run: python3 scripts/test-third-party-notices.py
       - name: Build release binary
         run: cargo +"$TOOLCHAIN" build --offline --locked --release

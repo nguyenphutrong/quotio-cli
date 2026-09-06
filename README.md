@@ -628,3 +628,10 @@ stored checkout credentials. No developer certificate or provider secret is need
 
 The patched date parser uses time 0.3.47 and bounds Retry-After header input. See
 [security remediation evidence](SECURITY_REMEDIATION.md) for verified results.
+
+## Backend operations and releases
+
+See [backend operation and recovery](docs/operations.md) for startup, background
+supervision and live acceptance, and [macOS release preparation](docs/releasing.md)
+for distribution signing, dependency notices and notarization. Local builds and
+offline tests do not establish live deployment or distribution acceptance.
