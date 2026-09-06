@@ -672,7 +672,7 @@ pub async fn adapters(
     if filter == Some("local") {
         return Ok(providers.into_iter().map(Provider::adapter).collect());
     }
-    if !saved || !cfg!(target_os = "macos") {
+    if !saved || !cfg!(any(target_os = "macos", target_os = "linux")) {
         if filter.is_some() {
             return Err(AccountError::Unsupported);
         }

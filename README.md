@@ -30,7 +30,7 @@ curl http://127.0.0.1:8317/v1/usage
 
 `serve` refreshes usage in the background and exposes read-only snapshots on
 loopback. It shares the CLI's provider adapters, saved accounts, and JSON report
-schema. Add `--manage` with `QUOTIO_SERVER_TOKEN` to enable managed account, Codex OAuth relay/loopback, settings, and refresh operations. `--public-url` records an HTTPS reverse-proxy origin and `--allow-origin` enables exact CORS origins; neither provisions TLS or changes the loopback listener. See [local REST API](docs/local-http-api.md) for routes, authentication, refresh behavior, and startup options. The complete contract is [OpenAPI 3.1](docs/openapi.json). Managed writes use idempotency keys, with up to 128 running operations. The most recent 128 refresh results are retained for up to 15 minutes; up to 4096 account write results and retry keys are retained until restart. Linux account storage still has no vault backend, and adding a provider requires its supported native login or credential path.
+schema. Add `--manage` with `QUOTIO_SERVER_TOKEN` to enable managed account, Codex OAuth relay/loopback, settings, and refresh operations. `--public-url` records an HTTPS reverse-proxy origin and `--allow-origin` enables exact CORS origins; neither provisions TLS or changes the loopback listener. See [local REST API](docs/local-http-api.md) for routes, authentication, refresh behavior, and startup options. The complete contract is [OpenAPI 3.1](docs/openapi.json). Managed writes use idempotency keys, with up to 128 running operations. The most recent 128 refresh results are retained for up to 15 minutes; up to 4096 account write results and retry keys are retained until restart. Linux supports an encrypted account vault with a separately supplied master key. Adding a provider still requires its supported login or credential path.
 
 ## Run
 
@@ -172,10 +172,10 @@ Do not put credentials in config. Unknown fields, including token fields, are
 rejected. Parse errors show a line and column without echoing input. Argument
 errors also omit input values; use `quotio usage --help` for valid syntax.
 `CredentialStore` reads environment variables, but mock never requests a secret.
-Credentials are persisted only by explicit account commands in Keychain; they are
+Credentials are persisted only by explicit account commands in the protected vault; they are
 never printed or logged.
 
-## Add and manage accounts on macOS
+## Add and manage accounts on macOS and Linux
 
 ```sh
 # Codex opens the official sign-in page. No Codex CLI is required.
@@ -218,12 +218,35 @@ saved without changing the selection; use `accounts use` to select them. Removin
 an active account selects the next account for that provider. Removal affects only
 Quotio's saved record; it does not revoke remote tokens or log other apps out.
 
-All account metadata and tokens live in one protected Keychain item:
+On macOS, all account metadata and tokens live in one protected Keychain item:
 service `app.quotio.cli.accounts.v1`, account `vault`. This existing storage key is
 independent of signing identifier `dev.quotio.cli` and is retained for account
 compatibility. No plaintext credential files
 are created. Empty local lock files coordinate short vault transactions and per-account refresh. Failed atomic writes
 preserve the previous document. Listing prints metadata only.
+
+On Linux, the same account commands and REST service use AES-256-GCM storage at
+`${XDG_DATA_HOME:-~/.local/share}/quotio/vault/accounts.enc`. The binary envelope
+has a version and authenticated header; each write uses a new random nonce.
+The existing document format and transaction locks are shared with macOS.
+
+Supply exactly one master-key source before starting the CLI or service:
+
+- `QUOTIO_VAULT_KEY_FILE`: path to a file containing exactly 32 random bytes. It
+  must belong to the current user, have no group/other permissions, have one
+  hard link, and be a regular file, not a symlink. Store it outside the vault
+  directory. Quotio does not generate or save the master key.
+- `QUOTIO_VAULT_KEY_FD`: an inherited file descriptor numbered 3 or above,
+  containing exactly 32 bytes followed by EOF. Pipes must close within five
+  seconds. A regular-file descriptor has the same ownership, permission and
+  location restrictions as a key file. The descriptor is marked close-on-exec.
+
+Keep a protected backup of the key separately from the encrypted vault; losing
+it makes saved accounts unreadable. The key itself never belongs in command
+arguments, configuration, logs, or API requests. Missing/invalid keys and damaged
+ciphertext report storage unavailable; they do not produce an empty account list
+or overwrite an existing vault. Restart the service after correcting key access.
+Use `--no-saved-accounts` explicitly to run usage without opening saved accounts.
 
 For Codex and Amp, `usage --provider <provider>` reads the available local account
 and all saved accounts, including inactive ones. Synthetic, OpenRouter, Z.ai and

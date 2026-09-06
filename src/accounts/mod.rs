@@ -1,5 +1,7 @@
 pub mod api;
 pub mod command;
+#[cfg(any(target_os = "linux", all(test, unix)))]
+mod encrypted_file;
 mod input;
 pub mod oauth;
 pub mod service;

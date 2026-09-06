@@ -1923,7 +1923,13 @@
           "usage_platform": {
             "const": "all"
           },
+          "account_storage_platforms": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["macos", "linux"] },
+            "description": "Supported saved-account storage platforms. Linux requires a separately supplied vault master key."
+          },
           "account_storage_platform": {
+            "deprecated": true,
             "type": [
               "string",
               "null"

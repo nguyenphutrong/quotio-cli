@@ -34,9 +34,11 @@ pub struct ProviderCapability {
     pub provider: Provider,
     pub auth: Vec<AuthMethod>,
     pub settings: Vec<SettingMetadata>,
-    /// Usage collection works on every supported platform; saved accounts use macOS Keychain.
+    /// Usage collection works on every supported platform.
     pub usage_platform: &'static str,
+    /// Legacy field retained for clients predating Linux account storage.
     pub account_storage_platform: Option<&'static str>,
+    pub account_storage_platforms: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_instructions: Option<&'static str>,
     pub operations: Vec<Operation>,
@@ -138,6 +140,11 @@ pub fn capability(provider: Provider) -> ProviderCapability {
         settings,
         usage_platform: "all",
         account_storage_platform: provider.supports_accounts().then_some("macos"),
+        account_storage_platforms: if provider.supports_accounts() {
+            vec!["macos", "linux"]
+        } else {
+            vec![]
+        },
         native_instructions: native,
         operations,
     }
@@ -155,6 +162,7 @@ mod tests {
     #[test]
     fn registry_metadata_and_core_settings_are_exposed_without_environment_names() {
         let factory = capability(Provider::Factory);
+        assert_eq!(factory.account_storage_platforms, vec!["macos", "linux"]);
         assert_eq!(factory.auth, vec![AuthMethod::ApiKey]);
         assert!(
             factory

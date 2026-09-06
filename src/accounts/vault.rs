@@ -10,6 +10,17 @@ pub trait Backend: Send + Sync {
     /// Atomically replace this application's document; leave old data on failure.
     fn write(&self, bytes: &[u8]) -> Result<(), AccountError>;
 }
+#[cfg(target_os = "linux")]
+struct Locked;
+#[cfg(target_os = "linux")]
+impl Backend for Locked {
+    fn read(&self) -> Result<Option<Vec<u8>>, AccountError> {
+        Err(AccountError::Storage)
+    }
+    fn write(&self, _: &[u8]) -> Result<(), AccountError> {
+        Err(AccountError::Storage)
+    }
+}
 pub struct Keychain {
     #[cfg(target_os = "macos")]
     interactive: bool,
@@ -87,11 +98,20 @@ impl Vault {
     }
     fn system_with_interaction(_interactive: bool) -> Result<Self, AccountError> {
         let dirs = directories::ProjectDirs::from("", "", "quotio").ok_or(AccountError::Storage)?;
+        #[cfg(target_os = "linux")]
+        let backend: Arc<dyn Backend> = match super::encrypted_file::EncryptedFile::from_environment(
+            &dirs.data_local_dir().join("vault"),
+        ) {
+            Ok(backend) => Arc::new(backend),
+            Err(_) => Arc::new(Locked),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let backend: Arc<dyn Backend> = Arc::new(Keychain {
+            #[cfg(target_os = "macos")]
+            interactive: _interactive,
+        });
         Ok(Self::new(
-            Arc::new(Keychain {
-                #[cfg(target_os = "macos")]
-                interactive: _interactive,
-            }),
+            backend,
             dirs.data_local_dir().join("accounts.lock"),
         ))
     }

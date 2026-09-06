@@ -9,7 +9,7 @@ pub async fn run(
     command: AccountCommand,
     context: &ProviderContext,
 ) -> Result<String, AccountError> {
-    if !cfg!(target_os = "macos") {
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
         return Err(AccountError::Unsupported);
     }
     let vault = Vault::system()?;
