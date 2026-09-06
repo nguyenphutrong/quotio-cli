@@ -1,77 +1,82 @@
-# Provider verification
+# Backend verification
 
-Code revision: `e6ecd3a64b085f919b8930a100395dfd6cf54af8`. Environment: macOS, Rust/Cargo 1.92.0.
-Binary: `target/debug/quotio`, SHA-256 `bac14e75c83be11bad7a075d33dc4e879eb2fa352fb7e7b9563699ab2c85aeb1`.
+Verified on 2026-09-06, macOS ARM64, at code revision `2c5cfbb`.
+Local default Rust: 1.92.0. Minimum supported Rust checked separately: 1.88.0.
+The default toolchain was not changed.
 
-## Automated checks
+Release binary: `target/release/quotio`.
+SHA-256: `9539a7a2de6a6b4131bdccd3a3483365b0c5d7880ad593df79b1475674aa7d79`.
+This checksum identifies this signed artifact; a new timestamp/signature changes it.
 
-All Cargo checks used `CARGO_TARGET_DIR=target CARGO_NET_OFFLINE=true`.
-The host's default Cargo target path remains unchanged.
+## Automated results
 
-| Command | Result |
+| Check | Observed result |
 | --- | --- |
-| `cargo fmt --check` | PASS, exit 0 |
-| `cargo clippy --all-targets --all-features -- -D warnings` | PASS, exit 0 |
-| `cargo test` | PASS, 34 tests, exit 0 |
-| `cargo run -- --help` | PASS, exit 0 |
-| `cargo run -- providers` | PASS, exit 0 |
-| `cargo run -- usage --provider mock --format text` | PASS, exit 0 |
-| `cargo run -- usage --provider mock --format json` | PASS, exit 0 |
+| `cargo fmt --check` | PASS |
+| `cargo clippy --offline --locked --all-targets --all-features -- -D warnings` | PASS |
+| `cargo test --offline --locked --all-features --quiet` | PASS: 222 passed, 1 ignored |
+| `cargo +1.88.0 clippy --offline --locked --all-targets --all-features -- -D warnings` | PASS |
+| `cargo +1.88.0 test --offline --locked --all-features --quiet` | PASS: 222 passed, 1 ignored |
+| `actionlint .github/workflows/rust.yml` | PASS |
+| `shellcheck scripts/build-signed.sh scripts/sign-macos.sh` | PASS |
+| `python3 scripts/test-check-advisories.py` | PASS: 3 tests |
+| `python3 scripts/check-advisories.py` | PASS: 212 locked packages, no OSV findings returned |
+| `python3 scripts/test-third-party-notices.py` | PASS: 1 test |
+| Notice generation for `aarch64-apple-darwin` | PASS: 162 normal/build dependencies, no missing license texts |
+| `scripts/build-signed.sh --release --offline --locked --distribution` | PASS |
+| `codesign --verify --strict target/release/quotio` | PASS; Developer ID authority and secure timestamp also checked |
 
-## Live read-only checks
+The ignored test is the existing explicit native Keychain round trip. The Rust
+suites cover domain, provider fixtures, account services, cache, CLI, HTTP and
+OpenAPI serialization. They do not require live provider credentials.
+OSV results are a point-in-time dependency check, not proof of no vulnerabilities.
+GitHub's macOS/Linux matrix is configured but has not run remotely in this phase;
+no push was performed. The Linux matrix is not evidence of Linux vault support.
 
-The final binary ran `usage --provider codex --provider amp --format json --timeout 30`
-with an empty temporary config. Result: exit 0, successes [('codex', 4), ('amp', 5)],
-failures []. Account identities and raw responses were not retained.
-This confirms transport and parsing against the installed accounts; no separate
-human dashboard comparison was performed.
+## Regressions covered
 
-Antigravity's earlier local-service probe succeeded but that implementation was
-replaced at the user's request. It is not evidence for the final direct API adapter.
-Direct Google API token use is awaiting explicit approval after automatic review
-rejected it. No direct Antigravity live response was obtained.
+- Vault contention stops before mutation and recovers after release. Waiting on
+  the shared mutation lock has a deadline; usage/settings return bounded errors.
+- Native writes retain their actual completion semantics. No whole-write timeout
+  was added that could falsely report failure after a successful OS write.
+- Completed refreshes do not consume the 128 running-operation slots. A binary
+  integration test completes 140 sequential refreshes.
+- Account write retry keys survive refresh history pruning and the 15-minute
+  refresh retention window. The 4096-key limit preserves replay for existing keys
+  and does not block refresh.
+- Manual refresh preserves the scheduler deadline. Timer expiry and configuration
+  wakeups clear and replace the advertised next refresh time.
+- Binary integration checks observe operation/refresh events without request
+  body sentinels, bearer tokens or idempotency keys in captured logs.
+- Existing shared-cache, identity, OAuth callback/session, partial-failure and
+  secret-free DTO tests still pass.
 
-Factory's endpoint and schema were inspected in first-party code. The local-auth
-extraction/network probe was rejected by automatic review. Local decryption is not
-implemented; API-key acceptance is not live-verified. The CLI /limits probe did not
-produce usable data. Neither path is reported as a live success.
+## Signed release smoke
 
-## Claims and evidence
+The signed release ran with an isolated empty-of-secrets config, mock provider,
+private temporary cache and synthetic server token. Saved accounts were disabled.
+Observed results:
 
-| Claim / risk | Evidence | Result |
-| --- | --- | --- |
-| Unknown differs from exhausted | Domain, per-provider parsers, JSON assertions | PASS |
-| Credit balances have no fabricated quota | Amp balance fixture; zero balance keeps Unknown | PASS |
-| Failures preserve other providers | Collection tests and binary mock + missing Factory key, exit 1 | PASS |
-| Subprocess protocol is bounded | Codex scripted stdio exchange; oversized line rejection | PASS |
-| Cancellation terminates the owned child | Actual PID test with stdin held open | PASS |
-| Request metadata and account scope are correct | Loopback Antigravity/Factory HTTP sequence tests | PASS offline |
-| HTTP errors are safe and bounded | Auth/429/503, body size, malformed JSON, redirect tests | PASS offline |
-| Projectless API fallback works | Antigravity optional lookup and projectless summary regressions | PASS offline |
-| Credential file reads reject symlinks/oversize and do not rewrite | Synthetic temporary files only | PASS offline |
-| Both direct API providers work on these accounts | Credential permission prerequisite missing | BLOCKED |
+- 140 sequential refresh requests completed, with no `operations_full` failure.
+- Manual refreshes preserved `next_refresh_at`; usage remained schema v1.
+- A configured public Host and allowed Origin succeeded. Rejected Origin returned
+  403; invalid bearer returned 401; OpenAPI returned version 3.1.0.
+- Captured logs did not contain the synthetic token. SIGTERM returned exit 0 and
+  emitted the server-stop event. Temporary files and process were cleaned up.
 
-## Independent review and fault detection
+The public Host/Origin checks used loopback HTTP with synthetic headers. They do
+not prove that an actual HTTPS proxy or tunnel is configured correctly.
 
-A separate read-only reviewer identified the optional Antigravity lookup, missing
-projectless retry and Amp percentage-token bug. All were corrected. Regression
-runs were observed failing before the Amp and Antigravity fixes, then passing.
+## Acceptance still required
 
-The reviewer also found a false-positive child-cleanup test. It now holds stdin
-open. Temporarily changing kill_on_drop to false made the test fail; restoration
-to true passed. Mutation was reverted before this final artifact was built.
+This phase made no live OAuth login, real account mutation, notarization upload
+or public deployment. Current live evidence must be recorded separately for:
 
-## Compatibility and remaining work
+1. OAuth relay/loopback, token renewal and saved-account access on the signed server.
+2. Keychain grant/denial/lock behavior and interruption during a native write.
+3. Provider quota comparisons against real dashboards and account entitlements.
+4. HTTPS proxy/tunnel integration and sustained operation across sleep/restart.
+5. Accepted notarization and clean-machine distribution/upgrade checks.
 
-Offline tests call only loopback fixture servers and synthetic local programs;
-they never require real credentials or remote endpoints. Actual integration was
-checked on this macOS installation only. No Linux/Windows/MSRV matrix was run.
-Remote provider contracts and Amp text output remain version-sensitive.
-
-No source/config in the main Quotio or CodexBar checkout was modified. There are
-no path dependencies, copied reference files, reference binary calls or submodules.
-No new dependency was added; existing Tokio features enable process/IO/network tests.
-
-Verdict: implementation and offline checks pass; milestone live acceptance is
-BLOCKED for Antigravity and Factory pending the two explicit credential approvals.
-TUI and token-refresh/local-Factory-auth work remain outside this completed slice.
+Use [backend operations](docs/operations.md) and [release preparation](docs/releasing.md)
+for the procedure. Completion of the automated checks does not close these gates.
