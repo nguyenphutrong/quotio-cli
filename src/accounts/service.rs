@@ -98,19 +98,37 @@ pub async fn validate(
     }
     Ok(usage)
 }
+pub(crate) async fn mutation_guard(
+    guard: &tokio::sync::Mutex<()>,
+) -> Result<tokio::sync::MutexGuard<'_, ()>, AccountError> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), guard.lock())
+        .await
+        .map_err(|_| AccountError::Busy)
+}
 async fn begin(vault: Vault) -> Result<Transaction, AccountError> {
-    loop {
-        let copy = vault.clone();
-        match tokio::task::spawn_blocking(move || copy.begin())
-            .await
-            .map_err(|_| AccountError::Storage)?
-        {
-            Err(AccountError::Busy) => {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await
+    begin_with_timeout(vault, std::time::Duration::from_secs(10)).await
+}
+async fn begin_with_timeout(
+    vault: Vault,
+    timeout: std::time::Duration,
+) -> Result<Transaction, AccountError> {
+    // Only reads are cancellable here. A detached native read cannot commit credentials.
+    tokio::time::timeout(timeout, async move {
+        loop {
+            let copy = vault.clone();
+            match tokio::task::spawn_blocking(move || copy.begin())
+                .await
+                .map_err(|_| AccountError::Storage)?
+            {
+                Err(AccountError::Busy) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await
+                }
+                result => return result,
             }
-            result => return result,
         }
-    }
+    })
+    .await
+    .map_err(|_| AccountError::Busy)?
 }
 async fn refresh_lock(vault: Vault, id: String) -> Result<std::fs::File, AccountError> {
     loop {
@@ -633,6 +651,37 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
     };
+    #[tokio::test]
+    async fn vault_contention_times_out_before_mutation_and_recovers() {
+        let path = std::env::temp_dir().join(format!(
+            "quotio-contention-{}.lock",
+            random_string().unwrap()
+        ));
+        let vault = Vault::new(Arc::new(Memory::default()), path.clone());
+        let held = vault.begin().unwrap();
+        assert!(matches!(
+            begin_with_timeout(vault.clone(), Duration::from_millis(50)).await,
+            Err(AccountError::Busy)
+        ));
+        drop(held);
+        assert!(
+            begin_with_timeout(vault, Duration::from_secs(1))
+                .await
+                .is_ok()
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+    #[tokio::test(start_paused = true)]
+    async fn mutation_guard_has_a_deadline() {
+        let lock = tokio::sync::Mutex::new(());
+        let held = lock.lock().await;
+        assert!(matches!(
+            mutation_guard(&lock).await,
+            Err(AccountError::Busy)
+        ));
+        drop(held);
+        assert!(mutation_guard(&lock).await.is_ok());
+    }
     struct Fake {
         memory: Arc<Memory>,
         started: tokio::sync::Notify,

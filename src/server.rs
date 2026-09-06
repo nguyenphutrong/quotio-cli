@@ -239,7 +239,10 @@ async fn usage_response(
     provider: Option<&str>,
     account: Option<&str>,
 ) -> Response {
-    let _guard = state.commit_guard.lock().await;
+    let _guard = match crate::accounts::service::mutation_guard(&state.commit_guard).await {
+        Ok(guard) => guard,
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "account_busy"),
+    };
     let snapshot = state.snapshot.read().await;
     let Some((generation, report)) = &*snapshot else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "not_ready");
@@ -261,7 +264,9 @@ async fn usage_response(
     Json(value).into_response()
 }
 async fn settings(State(state): State<Arc<ApiState>>) -> Result<Json<SettingsView>, ApiError> {
-    let _guard = state.commit_guard.lock().await;
+    let _guard = crate::accounts::service::mutation_guard(&state.commit_guard)
+        .await
+        .map_err(|_| settings_error(SettingsError::Busy))?;
     let store = state.store.clone();
     let view = tokio::task::spawn_blocking(move || store.load())
         .await
@@ -293,7 +298,13 @@ async fn patch_settings(
     let (send, receive) = tokio::sync::oneshot::channel();
     let work = state.clone();
     state.spawn(async move {
-        let _guard = work.commit_guard.lock().await;
+        let _guard = match crate::accounts::service::mutation_guard(&work.commit_guard).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                let _ = send.send(Err(SettingsError::Busy));
+                return;
+            }
+        };
         let store = work.store.clone();
         let result = tokio::task::spawn_blocking(move || store.patch(patch))
             .await
@@ -453,7 +464,13 @@ async fn refresh(state: &ApiState, request: Option<RefreshRequest>) -> Result<Va
     };
     let failures = report.failures.len();
     let successes = report.providers.len();
-    let _guard = state.commit_guard.lock().await;
+    let _guard = match crate::accounts::service::mutation_guard(&state.commit_guard).await {
+        Ok(guard) => guard,
+        Err(_) => {
+            state.status.lock().await.refreshing = false;
+            return Err("account_busy");
+        }
+    };
     let mut status = state.status.lock().await;
     status.refreshing = false;
     status.last_completed_at = Some(timestamp(report.generated_at));

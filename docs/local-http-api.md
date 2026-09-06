@@ -167,3 +167,15 @@ Managed routes also use `idempotency_key_required`, `invalid_idempotency_key`, `
 
 Malformed HTTP is rejected by the HTTP stack before these API handlers. Startup
 argument/config errors exit with code 2; initialization or bind errors use code 3.
+
+### Account operation deadlines
+
+Vault reads and waits for the shared mutation lock stop after 10 seconds. A busy
+vault produces `account_busy`; settings lock contention produces `settings_busy`
+(409). Usage reads return 503 `account_busy` while a write holds the lock too long.
+OAuth token exchange and quota validation each have a 30-second deadline.
+
+Once a native credential write starts, Quotio waits for its actual result instead
+of reporting a timeout that might hide a successful write. A stalled write remains
+running; other requests stop waiting for its lock after 10 seconds. After an
+interruption or restart, inspect the account list before submitting another write.

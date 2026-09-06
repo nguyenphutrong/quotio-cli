@@ -207,3 +207,22 @@ async fn external_config_conflict_recovers_and_refresh_requests_coalesce() {
     assert!(state.snapshot.read().await.is_none());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn blocked_mutation_guard_returns_bounded_errors() {
+    let (state, dir, _) = fixture().await;
+    let held = state.commit_guard.lock().await;
+    tokio::time::pause();
+    assert_eq!(
+        usage_response(&state, None, None).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(matches!(
+        settings(State(state.clone())).await,
+        Err(ApiError(StatusCode::CONFLICT, "settings_busy"))
+    ));
+    tokio::time::resume();
+    drop(held);
+    assert!(settings(State(state)).await.is_ok());
+    std::fs::remove_dir_all(dir).unwrap();
+}

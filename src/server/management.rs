@@ -171,7 +171,9 @@ async fn mutate(
                         let prepared = api::prepare(&work.context, input)
                             .await
                             .map_err(|e| account_code(&e))?;
-                        let _guard = work.commit_guard.lock().await;
+                        let _guard = crate::accounts::service::mutation_guard(&work.commit_guard)
+                            .await
+                            .map_err(|e| account_code(&e))?;
                         let account = api::save(vault, prepared)
                             .await
                             .map_err(|e| account_code(&e))?;
@@ -179,7 +181,9 @@ async fn mutate(
                         Ok(json!({"account_id":account.id}))
                     }
                     Mutation::Update(id, patch) => {
-                        let _guard = work.commit_guard.lock().await;
+                        let _guard = crate::accounts::service::mutation_guard(&work.commit_guard)
+                            .await
+                            .map_err(|e| account_code(&e))?;
                         let account = api::update(vault, id, patch)
                             .await
                             .map_err(|e| account_code(&e))?;
@@ -187,7 +191,9 @@ async fn mutate(
                         Ok(json!({"account_id":account.id}))
                     }
                     Mutation::Remove(id) => {
-                        let _guard = work.commit_guard.lock().await;
+                        let _guard = crate::accounts::service::mutation_guard(&work.commit_guard)
+                            .await
+                            .map_err(|e| account_code(&e))?;
                         api::remove(vault, id.clone())
                             .await
                             .map_err(|e| account_code(&e))?;

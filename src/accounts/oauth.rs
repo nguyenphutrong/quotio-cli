@@ -170,17 +170,21 @@ async fn exchange_code_at(
     code: &str,
     endpoint: &str,
 ) -> Result<Credential, AccountError> {
-    let tokens: Tokens = http::json(
-        context.http.post(endpoint).form(&[
-            ("grant_type", "authorization_code"),
-            ("client_id", CLIENT_ID),
-            ("code", code),
-            ("redirect_uri", REDIRECT),
-            ("code_verifier", &authorization.verifier),
-        ]),
-        context.clock.now(),
+    let tokens: Tokens = tokio::time::timeout(
+        Duration::from_secs(30),
+        http::json(
+            context.http.post(endpoint).form(&[
+                ("grant_type", "authorization_code"),
+                ("client_id", CLIENT_ID),
+                ("code", code),
+                ("redirect_uri", REDIRECT),
+                ("code_verifier", &authorization.verifier),
+            ]),
+            context.clock.now(),
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| AccountError::Cancelled)??;
     credential(
         tokens,
         Some(&authorization.nonce),
@@ -479,6 +483,7 @@ impl OAuthSessionManager {
     fn failure_code(error: &AccountError) -> &'static str {
         match error {
             AccountError::Storage => "credential_storage_unavailable",
+            AccountError::Busy => "account_busy",
             AccountError::Cancelled => "cancelled",
             AccountError::Provider(_) => "validation_failed",
             _ => "oauth_failed",
@@ -492,10 +497,14 @@ impl OAuthSessionManager {
     ) -> Result<SessionDto, AccountError> {
         let result = async {
             let credential = credential?;
-            let usage =
-                service::validate(&self.context, crate::cli::Provider::Codex, &credential).await?;
+            let usage = tokio::time::timeout(
+                Duration::from_secs(30),
+                service::validate(&self.context, crate::cli::Provider::Codex, &credential),
+            )
+            .await
+            .map_err(|_| AccountError::Cancelled)??;
             let label = service::default_label(label.as_deref(), &credential)?;
-            let _guard = self.commit_guard.lock().await;
+            let _guard = service::mutation_guard(&self.commit_guard).await?;
             let account_id = service::add(
                 self.vault.clone(),
                 crate::cli::Provider::Codex,
