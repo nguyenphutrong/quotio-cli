@@ -398,6 +398,7 @@ impl Operations for Network {
     }
 }
 struct ManagedProvider {
+    origin: super::AccountOrigin,
     label: String,
     operations: Arc<dyn Operations>,
     vault: Vault,
@@ -525,6 +526,7 @@ impl ProviderAdapter for ManagedProvider {
 
     fn account_ref(&self) -> Option<crate::domain::AccountRef> {
         Some(crate::domain::AccountRef {
+            origin: Some(self.origin),
             id: self.id.clone(),
             label: self.label.clone(),
         })
@@ -648,6 +650,7 @@ async fn local_sources(requested: &[Provider], timeout: std::time::Duration) -> 
 }
 fn managed(vault: &Vault, account: &Account) -> Arc<dyn ProviderAdapter> {
     Arc::new(ManagedProvider {
+        origin: account.origin(),
         label: account.label.clone(),
         operations: Arc::new(Network),
         vault: vault.clone(),
@@ -703,6 +706,7 @@ fn choose(
                 selected.push(Arc::new(FailedProvider {
                     provider_id: provider.adapter().id(),
                     account_ref: Some(crate::domain::AccountRef {
+                        origin: None,
                         id: "saved".into(),
                         label: "Saved accounts".into(),
                     }),
@@ -928,6 +932,7 @@ mod tests {
                 .unwrap();
             tx.commit().unwrap();
             let adapter = ManagedProvider {
+                origin: super::super::AccountOrigin::BorrowedProxy,
                 label: "Fixture".into(),
                 operations: Arc::new(MutateDuringQuota {
                     vault: vault.clone(),
@@ -1005,6 +1010,7 @@ mod tests {
         provider: Provider,
     ) -> ManagedProvider {
         ManagedProvider {
+            origin: super::super::AccountOrigin::Owned,
             label: "Test account".into(),
             vault,
             operations,

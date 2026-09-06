@@ -60,6 +60,7 @@ impl ProviderAdapter for Adapter {
     }
     fn account_ref(&self) -> Option<AccountRef> {
         Some(AccountRef {
+            origin: None,
             id: self.account.clone(),
             label: self.account.clone(),
         })

@@ -143,6 +143,15 @@ async fn empty_onboarding_settings_refresh_and_revision_conflicts() {
     let op: Value = response.json().await.unwrap();
     let done = server.done(op["id"].as_str().unwrap()).await;
     assert_eq!(done["status"], "completed");
+    assert_eq!(done["result"]["report"]["providers"][0]["provider"], "mock");
+    assert_eq!(
+        done["result"]["report"]["providers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(done["result"]["report"]["failures"], json!([]));
     let usage = server.get("/v1/usage/mock").await;
     assert_eq!(usage["providers"][0]["provider"], "mock");
     assert_eq!(

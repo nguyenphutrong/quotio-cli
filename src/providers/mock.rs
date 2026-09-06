@@ -28,6 +28,7 @@ impl ProviderAdapter for MockProvider {
                 ]
                 .into_iter()
                 .map(|(label, used)| QuotaWindow {
+                    metric_id: None,
                     consumption: None,
                     reset_description: None,
                     amounts: None,

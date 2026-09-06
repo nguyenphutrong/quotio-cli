@@ -316,3 +316,17 @@ visible; snapshots are invalidated even when this error occurs. Inspect accounts
 before starting another mutation. After a service restart, retrying with the same
 Idempotency-Key checks the durable receipt if the replacement survived. Do not
 start a new OAuth flow merely because storage durability could not be confirmed.
+
+## Quota presentation and refresh results
+
+Completed refresh operations include `result.report`, containing the exact requested
+scope from that refresh, alongside the existing provider/failure counts. Clients
+can render that result without reading a later, potentially changed snapshot.
+
+Quota windows can include `metric_id`. ClinePass supplies `clinepass-five-hour`,
+`clinepass-weekly`, and `clinepass-monthly` in that order when the corresponding
+windows exist. Missing percentages and duplicate windows produce unknown quota
+with a scoped diagnostic. A malformed reset drops only that reset timestamp;
+valid percentages and other windows remain available. An absent reset stays
+absent, and a past source timestamp is retained. This does not add upstream proxy
+support or enable the Swift production backend.

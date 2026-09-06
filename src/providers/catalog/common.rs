@@ -56,6 +56,7 @@ pub fn window(
         .map(|(l, r)| Quota::from_remaining(Some(r / l * 100.0)))
         .unwrap_or(Quota::Unknown);
     Ok(QuotaWindow {
+        metric_id: None,
         label: label.into(),
         quota,
         consumption: used.map(|used| Consumption {
@@ -94,6 +95,15 @@ pub fn usage(
     {
         return Err(ProviderError::InvalidData);
     }
+    Ok(ProviderUsage {
+        diagnostics: vec![],
+        account_ref: None,
+        provider: ProviderId(id.into()),
+        account: account_identity(id, key, scope),
+        windows,
+    })
+}
+pub fn account_identity(id: &str, key: &Secret, scope: &str) -> AccountIdentity {
     let digest = ring::digest::digest(
         &ring::digest::SHA256,
         format!("{id}\0{scope}\0{}", key.0).as_bytes(),
@@ -102,17 +112,11 @@ pub fn usage(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    Ok(ProviderUsage {
-        diagnostics: vec![],
-        account_ref: None,
-        provider: ProviderId(id.into()),
-        account: AccountIdentity {
-            id: format!("key:{fingerprint}"),
-            label: format!("{id} API key"),
-            plan: None,
-        },
-        windows,
-    })
+    AccountIdentity {
+        id: format!("key:{fingerprint}"),
+        label: format!("{id} API key"),
+        plan: None,
+    }
 }
 #[cfg(target_os = "macos")]
 fn keychain_options(

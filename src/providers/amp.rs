@@ -51,6 +51,7 @@ fn window(
     reset_description: Option<String>,
 ) -> QuotaWindow {
     QuotaWindow {
+        metric_id: None,
         consumption: None,
         reset_description,
         label: label.into(),
@@ -380,6 +381,7 @@ impl ProviderAdapter for AmpProvider {
 
     fn account_ref(&self) -> Option<AccountRef> {
         Some(AccountRef {
+            origin: None,
             id: "local".into(),
             label: "Local Amp account".into(),
         })

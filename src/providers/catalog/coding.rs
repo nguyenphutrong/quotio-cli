@@ -118,28 +118,6 @@ fn public_name(value: Option<&Value>, fallback: &str) -> Result<String, Provider
     Ok(value.into())
 }
 
-fn percent_window(
-    label: &str,
-    used_percent: f64,
-    resets_at: Option<time::OffsetDateTime>,
-    source: &str,
-    now: time::OffsetDateTime,
-) -> Result<QuotaWindow, ProviderError> {
-    if !(0.0..=100.0).contains(&used_percent) {
-        return Err(ProviderError::InvalidData);
-    }
-    common::window(
-        label,
-        Some(used_percent),
-        Some(100.0),
-        None,
-        "percent",
-        resets_at,
-        source,
-        now,
-    )
-}
-
 fn url(base: &str) -> Result<reqwest::Url, ProviderError> {
     reqwest::Url::parse(base).map_err(|_| ProviderError::InvalidData)
 }
@@ -512,30 +490,59 @@ async fn clinepass_at(
         .and_then(Value::as_array)
         .ok_or(ProviderError::InvalidData)?;
     let mut windows = Vec::new();
-    for (kind, label) in [
-        ("five_hour", "5 hours"),
-        ("weekly", "Weekly"),
-        ("monthly", "Monthly"),
+    let mut diagnostics = Vec::new();
+    for (kind, label, metric_id) in [
+        ("five_hour", "5 hours", "clinepass-five-hour"),
+        ("weekly", "Weekly", "clinepass-weekly"),
+        ("monthly", "Monthly", "clinepass-monthly"),
     ] {
-        let limit = limits
+        let mut matching = limits
             .iter()
-            .find(|limit| limit.get("type").and_then(Value::as_str) == Some(kind));
-        let Some(limit) = limit else {
+            .filter(|limit| limit.get("type").and_then(Value::as_str) == Some(kind));
+        let Some(limit) = matching.next() else {
             continue;
         };
-        let limit = limit.as_object().ok_or(ProviderError::InvalidData)?;
-        windows.push(percent_window(
+        let duplicate = matching.next().is_some();
+        let used = limit
+            .get("percentUsed")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite())
+            .filter(|_| !duplicate)
+            .map(|v| v.clamp(0.0, 100.0));
+        let reset = common::date(limit.get("resetsAt"));
+        if used.is_none() || reset.is_err() || duplicate {
+            diagnostics.push(crate::domain::UsageDiagnostic {
+                source: metric_id.into(),
+                code: ProviderError::InvalidData,
+            });
+        }
+        let mut window = common::window(
             label,
-            required_number(limit, "percentUsed")?,
-            common::date(limit.get("resetsAt"))?,
+            used,
+            Some(100.0),
+            None,
+            "percent",
+            if duplicate {
+                None
+            } else {
+                reset.unwrap_or(None)
+            },
             "clinepass_usage_limits",
             now,
-        )?);
+        )?;
+        window.metric_id = Some(metric_id.into());
+        windows.push(window);
     }
     if windows.is_empty() {
         return Err(ProviderError::QuotaUnavailable);
     }
-    common::usage("clinepass", &key, "personal", windows)
+    Ok(ProviderUsage {
+        provider: crate::domain::ProviderId("clinepass".into()),
+        account: common::account_identity("clinepass", &key, "personal"),
+        account_ref: None,
+        windows,
+        diagnostics,
+    })
 }
 
 fn codebuff(context: &ProviderContext) -> FetchFuture<'_> {
@@ -1278,6 +1285,71 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer test-key")
         );
+    }
+
+    #[tokio::test]
+    async fn clinepass_preserves_unknown_and_successful_windows_with_scoped_diagnostics() {
+        let (base, server) = http::fixture::server(vec![json!({"success":true,"data":{"limits":[
+            {"type":"five_hour","percentUsed":0},
+            {"type":"weekly","resetsAt":"not-a-date"},
+            {"type":"monthly","percentUsed":120,"resetsAt":"2020-01-01T00:00:00Z"}
+        ]}})])
+        .await;
+        let usage = clinepass_at(
+            &context(&[("CLINEPASS_API_KEY", "fixture-key")]),
+            &format!("{base}/limits"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            usage.windows[0].metric_id.as_deref(),
+            Some("clinepass-five-hour")
+        );
+        assert!(matches!(
+            usage.windows[0].quota,
+            crate::domain::Quota::Available {
+                remaining_percent: 100.0,
+                ..
+            }
+        ));
+        assert_eq!(usage.windows[1].quota, crate::domain::Quota::Unknown);
+        assert!(usage.windows[1].resets_at.is_none());
+        assert!(matches!(
+            usage.windows[2].quota,
+            crate::domain::Quota::Exhausted { .. }
+        ));
+        assert_eq!(usage.windows[2].resets_at.unwrap().year(), 2020);
+        assert_eq!(usage.diagnostics.len(), 1);
+        assert_eq!(usage.diagnostics[0].source, "clinepass-weekly");
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn clinepass_duplicate_or_missing_percent_is_unknown_not_zero() {
+        let (base, server) = http::fixture::server(vec![json!({"success":true,"data":{"limits":[
+            {"type":"five_hour","percentUsed":20}, {"type":"five_hour","percentUsed":30},
+            {"type":"weekly"}
+        ]}})])
+        .await;
+        let usage = clinepass_at(
+            &context(&[("CLINEPASS_API_KEY", "fixture-key")]),
+            &format!("{base}/limits"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(usage.windows.len(), 2);
+        assert!(
+            usage
+                .windows
+                .iter()
+                .all(|w| w.quota == crate::domain::Quota::Unknown && w.consumption.is_none())
+        );
+        assert_eq!(usage.diagnostics.len(), 2);
+        assert!(
+            !serde_json::to_string(&usage)
+                .unwrap()
+                .contains("fixture-key")
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]

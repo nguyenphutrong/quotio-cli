@@ -93,6 +93,7 @@ impl crate::providers::ProviderAdapter for CatalogProvider {
     }
     fn account_ref(&self) -> Option<crate::domain::AccountRef> {
         Some(crate::domain::AccountRef {
+            origin: None,
             id: "local".into(),
             label: "Local or environment account".into(),
         })

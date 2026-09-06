@@ -293,6 +293,7 @@ impl ProviderAdapter for AccountCandidate {
     }
     fn account_ref(&self) -> Option<AccountRef> {
         Some(AccountRef {
+            origin: None,
             id: self.selector.into(),
             label: format!("Label {}", self.selector),
         })
@@ -438,6 +439,7 @@ impl ProviderAdapter for AmpCandidate {
     }
     fn account_ref(&self) -> Option<AccountRef> {
         Some(AccountRef {
+            origin: None,
             id: self.selector.into(),
             label: self.selector.into(),
         })

@@ -67,6 +67,7 @@ pub(super) async fn start(
     let ttl = state.settings.read().await.values.cache_ttl_seconds;
     let provider = Arc::new(InputProvider {
         reference: AccountRef {
+            origin: None,
             id: query.client_account_id.clone(),
             label: query.label.clone(),
         },
@@ -143,6 +144,7 @@ mod tests {
         }
         fn account_ref(&self) -> Option<AccountRef> {
             Some(AccountRef {
+                origin: None,
                 id: "client-account".into(),
                 label: "work".into(),
             })

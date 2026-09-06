@@ -135,6 +135,7 @@ fn parse(
             bucket_windows.push((
                 order,
                 QuotaWindow {
+                    metric_id: None,
                     consumption: None,
                     reset_description: None,
                     amounts: None,
@@ -269,6 +270,7 @@ impl ProviderAdapter for CodexProvider {
 
     fn account_ref(&self) -> Option<AccountRef> {
         Some(AccountRef {
+            origin: None,
             id: "local".into(),
             label: "Local Codex".into(),
         })

@@ -288,6 +288,7 @@ mod tests {
                     label: "Demo".into(),
                 },
                 windows: vec![crate::domain::QuotaWindow {
+                    metric_id: None,
                     consumption: None,
                     label: "daily".into(),
                     quota: crate::domain::Quota::Unknown,

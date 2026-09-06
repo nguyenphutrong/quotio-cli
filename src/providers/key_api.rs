@@ -107,6 +107,7 @@ fn window(
         .map(|(cap, left)| Quota::from_remaining(Some(left / cap * 100.0)))
         .unwrap_or(Quota::Unknown);
     QuotaWindow {
+        metric_id: None,
         label: label.into(),
         quota,
         consumption: used.map(|used| Consumption {
@@ -474,6 +475,7 @@ impl ProviderAdapter for KeyApiProvider {
     }
     fn account_ref(&self) -> Option<AccountRef> {
         Some(AccountRef {
+            origin: None,
             id: "local".into(),
             label: "Environment API key".into(),
         })

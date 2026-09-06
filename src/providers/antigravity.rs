@@ -100,6 +100,7 @@ pub(super) fn window(
         _ => return Err(ProviderError::InvalidData),
     };
     Ok(QuotaWindow {
+        metric_id: None,
         consumption: None,
         reset_description: None,
         label,

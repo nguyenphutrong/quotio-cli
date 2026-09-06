@@ -80,12 +80,7 @@ pub enum Credential {
         expires_at: i64,
     },
 }
-#[derive(Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AccountOrigin {
-    Owned,
-    BorrowedProxy,
-}
+pub use crate::domain::AccountOrigin;
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Account {
     pub id: String,

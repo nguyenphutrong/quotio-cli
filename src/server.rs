@@ -483,6 +483,7 @@ async fn refresh(state: &ApiState, request: Option<RefreshRequest>) -> Result<Va
         state.wake.notify_one();
         return Err("state_changed");
     }
+    let result = json!({"providers":successes,"failures":failures,"report":&report});
     let mut snapshot = state.snapshot.write().await;
     // Replace the requested scope, never restore failed data here; UsageCache owns retention.
     if selected == enabled && account.is_none() {
@@ -511,7 +512,7 @@ async fn refresh(state: &ApiState, request: Option<RefreshRequest>) -> Result<Va
         *snapshot = Some((generation, report));
     }
     tracing::info!(successes, failures, "refresh completed");
-    Ok(json!({"providers":successes,"failures":failures}))
+    Ok(result)
 }
 async fn wait_for_next_refresh(state: &ApiState) {
     let interval = state.settings.read().await.values.refresh_interval;

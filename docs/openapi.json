@@ -1655,6 +1655,13 @@
           },
           "label": {
             "type": "string"
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "owned",
+              "borrowed_proxy"
+            ]
           }
         },
         "additionalProperties": false,
@@ -1827,6 +1834,10 @@
           "fetched_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "metric_id": {
+            "type": "string",
+            "description": "Stable backend metric identifier when supplied; clients use it instead of interpreting the label."
           }
         },
         "additionalProperties": false,

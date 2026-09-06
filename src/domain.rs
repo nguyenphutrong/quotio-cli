@@ -96,6 +96,8 @@ pub struct Consumption {
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct QuotaWindow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consumption: Option<Consumption>,
     pub label: String,
@@ -111,8 +113,16 @@ pub struct QuotaWindow {
     #[serde(with = "time::serde::rfc3339")]
     pub fetched_at: OffsetDateTime,
 }
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountOrigin {
+    Owned,
+    BorrowedProxy,
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AccountRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<AccountOrigin>,
     pub id: String,
     pub label: String,
 }
