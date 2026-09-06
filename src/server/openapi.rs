@@ -134,6 +134,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn provider_routes_match_runtime_envelope() {
+        let d = document_value();
+        let provider = super::super::provider_value(crate::cli::Provider::Codex, &[]);
+        validate(
+            &d["components"]["schemas"]["ProviderList"],
+            &serde_json::json!({"schema_version":1,"providers":[provider.clone()]}),
+            &d,
+            "providers",
+        );
+        validate(
+            &d["paths"]["/v1/providers/{id}"]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"],
+            &provider,
+            &d,
+            "provider",
+        );
+    }
+
     fn resolve<'a>(schema: &'a Value, root: &'a Value) -> &'a Value {
         if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
             let mut current = root;

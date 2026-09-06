@@ -211,7 +211,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProviderCapability"
+                  "$ref": "#/components/schemas/ProviderDescriptor"
                 }
               }
             }
@@ -1925,7 +1925,7 @@
           "providers": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/ProviderCapability"
+              "$ref": "#/components/schemas/ProviderDescriptor"
             }
           }
         },
@@ -2336,6 +2336,30 @@
             "type": "integer",
             "minimum": 1,
             "maximum": 65535
+          }
+        }
+      },
+      "ProviderDescriptor": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "description",
+          "enabled",
+          "capabilities"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/ProviderId"
+          },
+          "description": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "capabilities": {
+            "$ref": "#/components/schemas/ProviderCapability"
           }
         }
       }
