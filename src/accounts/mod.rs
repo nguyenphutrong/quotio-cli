@@ -15,6 +15,10 @@ use thiserror::Error;
 pub enum AccountError {
     #[error("account storage is unavailable or access was denied")]
     Storage,
+    #[error(
+        "account data was replaced but durable storage could not be confirmed; inspect accounts before retrying"
+    )]
+    CommitUncertain,
     #[error("the credential source is disabled by its owner")]
     SourceDisabled,
     #[error("idempotency key was already used for a different request")]

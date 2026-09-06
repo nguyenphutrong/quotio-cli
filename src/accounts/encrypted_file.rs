@@ -215,6 +215,15 @@ impl Backend for EncryptedFile {
     }
 
     fn write(&self, bytes: &[u8]) -> Result<(), AccountError> {
+        self.replace(bytes, File::sync_all)
+    }
+}
+impl EncryptedFile {
+    fn replace(
+        &self,
+        bytes: &[u8],
+        sync: impl Fn(&File) -> std::io::Result<()>,
+    ) -> Result<(), AccountError> {
         if bytes.len() > MAX_DOCUMENT {
             return Err(AccountError::Input);
         }
@@ -235,7 +244,9 @@ impl Backend for EncryptedFile {
         let temp = self
             .path
             .with_extension(format!("{}.tmp", super::random_string()?));
+        let mut renamed = false;
         let result: std::io::Result<()> = (|| {
+            let directory = File::open(self.path.parent().unwrap())?;
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -245,14 +256,21 @@ impl Backend for EncryptedFile {
             file.write_all(HEADER)?;
             file.write_all(&nonce)?;
             file.write_all(&ciphertext)?;
-            file.sync_all()?;
+            sync(&file)?;
             std::fs::rename(&temp, &self.path)?;
-            File::open(self.path.parent().unwrap())?.sync_all()
+            renamed = true;
+            sync(&directory)
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(temp);
         }
-        result.map_err(|_| AccountError::Storage)
+        result.map_err(|_| {
+            if renamed {
+                AccountError::CommitUncertain
+            } else {
+                AccountError::Storage
+            }
+        })
     }
 }
 
@@ -336,6 +354,29 @@ mod tests {
         assert_eq!(f.vault(1).read().unwrap().unwrap(), b"private fixture");
         vault.write(b"private fixture").unwrap();
         assert_ne!(first, std::fs::read(&vault.path).unwrap());
+    }
+    #[test]
+    fn reports_whether_a_sync_failure_happened_before_or_after_replacement() {
+        let f = Fixture::new();
+        let vault = f.vault(1);
+        vault.write(b"previous-fixture").unwrap();
+        let old = std::fs::read(&vault.path).unwrap();
+        assert!(matches!(
+            vault.replace(b"new-fixture", |_| Err(std::io::Error::other(
+                "fixture sync failure"
+            ))),
+            Err(AccountError::Storage)
+        ));
+        assert_eq!(std::fs::read(&vault.path).unwrap(), old);
+        let result = vault.replace(b"new-fixture", |file| {
+            if file.metadata()?.is_dir() {
+                Err(std::io::Error::other("fixture directory sync failure"))
+            } else {
+                file.sync_all()
+            }
+        });
+        assert!(matches!(result, Err(AccountError::CommitUncertain)));
+        assert_eq!(vault.read().unwrap().unwrap(), b"new-fixture");
     }
     #[test]
     fn wrong_key_and_tamper_preserve_existing_file() {

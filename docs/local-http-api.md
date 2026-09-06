@@ -306,3 +306,13 @@ Automated source tests use a JSON fixture encoded by Swift's `CustomProvider` mo
 a separate macOS test preferences domain for cross-process visibility, and an
 in-memory vault for retry and deletion races. These do not establish live ClinePass
 account acceptance or a completed Swift migration.
+
+## Uncertain storage commits
+
+A Linux vault write can replace the document successfully and then fail while
+syncing the parent directory. Such a result uses `credential_commit_uncertain`,
+not a rollback or completed-login claim. The new account state may already be
+visible; snapshots are invalidated even when this error occurs. Inspect accounts
+before starting another mutation. After a service restart, retrying with the same
+Idempotency-Key checks the durable receipt if the replacement survived. Do not
+start a new OAuth flow merely because storage durability could not be confirmed.

@@ -483,6 +483,7 @@ impl OAuthSessionManager {
     fn failure_code(error: &AccountError) -> &'static str {
         match error {
             AccountError::Storage => "credential_storage_unavailable",
+            AccountError::CommitUncertain => "credential_commit_uncertain",
             AccountError::Busy => "account_busy",
             AccountError::Cancelled => "cancelled",
             AccountError::Provider(_) => "validation_failed",
@@ -529,6 +530,9 @@ impl OAuthSessionManager {
                 Ok(Self::dto(id.into(), session))
             }
             Err(error) => {
+                if matches!(error, AccountError::CommitUncertain) {
+                    self.generation.fetch_add(1, Ordering::SeqCst);
+                }
                 session.status = SessionStatus::Failed;
                 session.error_code = Some(Self::failure_code(&error));
                 Err(error)

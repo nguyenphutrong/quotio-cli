@@ -541,7 +541,9 @@ impl ProviderAdapter for ManagedProvider {
                 AccountError::Provider(e) => e,
                 AccountError::Busy => ProviderError::Transient,
                 AccountError::SourceDisabled => ProviderError::SourceDisabled,
-                AccountError::Storage | AccountError::Corrupt => ProviderError::CredentialStorage,
+                AccountError::Storage | AccountError::Corrupt | AccountError::CommitUncertain => {
+                    ProviderError::CredentialStorage
+                }
                 _ => ProviderError::Authentication,
             })
         })
@@ -1465,6 +1467,42 @@ mod receipt_tests {
                 organization: None,
             },
         )
+    }
+
+    struct UncertainWrite(Memory);
+    impl crate::accounts::vault::Backend for UncertainWrite {
+        fn read(&self) -> Result<Option<Vec<u8>>, AccountError> {
+            self.0.read()
+        }
+        fn write(&self, bytes: &[u8]) -> Result<(), AccountError> {
+            self.0.write(bytes)?;
+            Err(AccountError::CommitUncertain)
+        }
+    }
+    #[tokio::test]
+    async fn uncertain_commit_preserves_receipt_for_recovery_without_second_write() {
+        let path = std::env::temp_dir().join(format!(
+            "quotio-uncertain-{}",
+            crate::accounts::random_string().unwrap()
+        ));
+        let vault = Vault::new(Arc::new(UncertainWrite(Memory::default())), path.clone());
+        let intent = intent("uncertain-fixture", "create");
+        assert!(matches!(
+            commit_once(vault.clone(), intent.clone(), create).await,
+            Err(AccountError::CommitUncertain)
+        ));
+        let id = mutation_receipt(vault.clone(), &intent)
+            .await
+            .unwrap()
+            .unwrap();
+        let retry = commit_once(vault.clone(), intent, |_| {
+            panic!("must recover committed receipt")
+        })
+        .await
+        .unwrap();
+        assert_eq!(id, retry);
+        assert_eq!(list(vault).await.unwrap().len(), 1);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]

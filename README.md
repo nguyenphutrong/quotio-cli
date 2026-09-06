@@ -222,8 +222,10 @@ On macOS, all account metadata and tokens live in one protected Keychain item:
 service `app.quotio.cli.accounts.v1`, account `vault`. This existing storage key is
 independent of signing identifier `dev.quotio.cli` and is retained for account
 compatibility. No plaintext credential files
-are created. Empty local lock files coordinate short vault transactions and per-account refresh. Failed atomic writes
-preserve the previous document. Listing prints metadata only.
+are created. Empty local lock files coordinate short vault transactions and per-account refresh. Writes that fail before replacement preserve the previous document. If directory
+sync fails after replacement, `credential_commit_uncertain` reports that the change
+may already be present. Inspect accounts before attempting a new mutation. Listing
+prints metadata only.
 
 On Linux, the same account commands and REST service use AES-256-GCM storage at
 `${XDG_DATA_HOME:-~/.local/share}/quotio/vault/accounts.enc`. The binary envelope

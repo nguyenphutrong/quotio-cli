@@ -17,6 +17,7 @@ pub(super) fn account_code(error: &AccountError) -> &'static str {
         AccountError::Storage | AccountError::Corrupt => "credential_storage_unavailable",
         AccountError::Busy => "account_busy",
         AccountError::SourceDisabled => "source_disabled",
+        AccountError::CommitUncertain => "credential_commit_uncertain",
         AccountError::IdempotencyConflict => "idempotency_conflict",
         AccountError::IdempotencyFull => "idempotency_full",
         AccountError::NotFound => "account_not_found",
@@ -38,7 +39,9 @@ fn account_error(error: AccountError) -> ApiError {
         AccountError::Busy | AccountError::Duplicate | AccountError::CallbackPort => {
             StatusCode::CONFLICT
         }
-        AccountError::Storage | AccountError::Corrupt => StatusCode::SERVICE_UNAVAILABLE,
+        AccountError::Storage | AccountError::Corrupt | AccountError::CommitUncertain => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         _ => StatusCode::BAD_REQUEST,
     };
     ApiError(status, account_code(&error))
@@ -245,6 +248,9 @@ async fn mutate(
                 }
             }
             .await;
+            if matches!(result, Err("credential_commit_uncertain")) {
+                work.invalidate().await;
+            }
             work.operations.lock().await.finish(&id, result);
         });
         if let Err(error) = spawn_result {

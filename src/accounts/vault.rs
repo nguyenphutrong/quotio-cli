@@ -7,7 +7,9 @@ use std::{
 
 pub trait Backend: Send + Sync {
     fn read(&self) -> Result<Option<Vec<u8>>, AccountError>;
-    /// Atomically replace this application's document; leave old data on failure.
+    /// Atomically replace this application's document. CommitUncertain means the
+    /// replacement is visible but directory durability could not be confirmed.
+    /// Other errors leave the previous document intact.
     fn write(&self, bytes: &[u8]) -> Result<(), AccountError>;
 }
 #[cfg(target_os = "linux")]
