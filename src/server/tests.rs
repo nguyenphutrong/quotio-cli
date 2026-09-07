@@ -289,6 +289,7 @@ async fn account_retry_survives_loss_of_in_memory_operations() {
         id.clone(),
         Some("later change".into()),
         None,
+        None,
     )
     .await
     .unwrap();

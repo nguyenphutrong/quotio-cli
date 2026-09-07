@@ -13,6 +13,8 @@ pub enum ProviderError {
     Transient,
     #[error("credentials unavailable or rejected")]
     Authentication,
+    #[error("the native credential owner must refresh or sign in again")]
+    OwnerRefreshRequired,
     #[error("the credential source is disabled by its owner")]
     SourceDisabled,
     #[error("provider returned invalid usage")]

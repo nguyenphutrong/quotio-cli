@@ -116,6 +116,7 @@ pub struct QuotaWindow {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountOrigin {
+    BorrowedNative,
     Owned,
     BorrowedProxy,
 }

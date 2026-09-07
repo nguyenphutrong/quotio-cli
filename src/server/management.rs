@@ -363,6 +363,21 @@ pub(super) async fn validate_refresh_account(
     id: &str,
 ) -> Result<(), ApiError> {
     if id == "local" {
+        if provider == Provider::Amp
+            && !state.no_saved_accounts
+            && crate::accounts::service::uses_native_amp_source()
+        {
+            let accounts = api::list(vault(state)?).await.map_err(account_error)?;
+            if accounts.iter().any(|a| {
+                a.origin == crate::accounts::AccountOrigin::BorrowedNative
+                    && a.provider == Provider::Amp
+            }) {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    "registered_source_requires_account_id",
+                ));
+            }
+        }
         return Ok(());
     }
     let account = tokio::time::timeout(Duration::from_secs(10), api::get(vault(state)?, id.into()))

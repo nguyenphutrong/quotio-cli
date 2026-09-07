@@ -94,11 +94,15 @@ fn headless_cli_reads_selects_removes_and_restarts_with_encrypted_accounts() {
     assert!(!String::from_utf8_lossy(&list.stdout).contains("fixture-token"));
     let rows: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
     let second = rows[1]["id"].as_str().unwrap();
-    assert!(f.run(&["accounts", "use", second]).status.success());
+    assert!(f.run(&["accounts", "use", "--", second]).status.success());
     let rows: serde_json::Value =
         serde_json::from_slice(&f.run(&["accounts", "list", "--format", "json"]).stdout).unwrap();
     assert_eq!(rows[1]["active"], true);
-    assert!(f.run(&["accounts", "remove", second]).status.success());
+    assert!(
+        f.run(&["accounts", "remove", "--", second])
+            .status
+            .success()
+    );
     let rows: serde_json::Value =
         serde_json::from_slice(&f.run(&["accounts", "list", "--format", "json"]).stdout).unwrap();
     assert_eq!(rows.as_array().unwrap().len(), 1);
@@ -210,6 +214,166 @@ async fn rest_reports_locked_storage_instead_of_empty_accounts() {
     let body = response.text().await.unwrap();
     assert!(body.contains("credential_storage_unavailable"));
     assert!(!body.contains(token));
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_amp_reference_registers_disables_and_removes_through_rest() {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let f = Fixture::new();
+    let source_dir = f.root.join(".local/share/amp");
+    fs::create_dir_all(&source_dir).unwrap();
+    let source = source_dir.join("secrets.json");
+    let original = br#"{"apiKey@https://ampcode.com/":"native-fixture-key"}"#;
+    fs::write(&source, original).unwrap();
+    fs::write(f.root.join("config.toml"), "enabled_providers = []\n").unwrap();
+    let token = "fixture-management-token-1234567890123456";
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_quotio"))
+        .env_clear()
+        .env("HOME", &f.root)
+        .env("XDG_DATA_HOME", f.root.join("data"))
+        .env("QUOTIO_CACHE_DIR", f.root.join("cache"))
+        .env("QUOTIO_SERVER_TOKEN", token)
+        .env("QUOTIO_VAULT_KEY_FILE", f.root.join("master"))
+        .args(["serve", "--manage", "--listen", "127.0.0.1:0", "--config"])
+        .arg(f.root.join("config.toml"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+    let line = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let base = line.strip_prefix("Quotio API listening on ").unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    async fn finish(
+        client: &reqwest::Client,
+        base: &str,
+        token: &str,
+        response: reqwest::Response,
+    ) -> serde_json::Value {
+        assert_eq!(response.status(), 202);
+        let mut op: serde_json::Value = response.json().await.unwrap();
+        let id = op["id"].as_str().unwrap().to_owned();
+        for _ in 0..100 {
+            if op["status"] != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            op = client
+                .get(format!("{base}/v1/operations/{id}"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        }
+        assert_eq!(op["status"], "completed", "{op}");
+        assert!(!op.to_string().contains("native-fixture-key"));
+        op
+    }
+    let response = client
+        .post(format!("{base}/v1/account-sources"))
+        .bearer_auth(token)
+        .header("Idempotency-Key", "native-register")
+        .json(&serde_json::json!({"kind":"amp_native"}))
+        .send()
+        .await
+        .unwrap();
+    let op = finish(&client, base, token, response).await;
+    let id = op["result"]["account_id"].as_str().unwrap();
+    let response = client
+        .patch(format!("{base}/v1/accounts/{id}"))
+        .bearer_auth(token)
+        .header("Idempotency-Key", "native-disable")
+        .json(&serde_json::json!({"enabled":false}))
+        .send()
+        .await
+        .unwrap();
+    finish(&client, base, token, response).await;
+    let account: serde_json::Value = client
+        .get(format!("{base}/v1/accounts/{id}"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(account["origin"], "borrowed_native");
+    assert_eq!(account["enabled"], false);
+    let settings: serde_json::Value = client
+        .get(format!("{base}/v1/settings"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let response = client
+        .patch(format!("{base}/v1/settings"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({"revision":settings["revision"],"enabled_providers":["amp"]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let settings: serde_json::Value = response.json().await.unwrap();
+    let response = client
+        .post(format!("{base}/v1/refresh"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({"providers":["amp"],"account_id":id,"force":true}))
+        .send()
+        .await
+        .unwrap();
+    let refreshed = finish(&client, base, token, response).await;
+    let alias = client
+        .post(format!("{base}/v1/refresh"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({"providers":["amp"],"account_id":"local","force":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(alias.status(), 409);
+
+    assert_eq!(
+        refreshed["result"]["report"]["providers"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        refreshed["result"]["report"]["failures"][0]["code"],
+        "source_disabled"
+    );
+    let response = client
+        .patch(format!("{base}/v1/settings"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({"revision":settings["revision"],"enabled_providers":[]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let response = client
+        .delete(format!("{base}/v1/accounts/{id}"))
+        .bearer_auth(token)
+        .header("Idempotency-Key", "native-remove")
+        .send()
+        .await
+        .unwrap();
+    finish(&client, base, token, response).await;
+    assert_eq!(fs::read(source).unwrap(), original);
     child.kill().await.unwrap();
     child.wait().await.unwrap();
 }

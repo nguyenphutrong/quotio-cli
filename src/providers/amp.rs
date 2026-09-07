@@ -353,7 +353,7 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
 }
 pub struct AmpApiProvider;
 impl AmpApiProvider {
-    async fn fetch_api(
+    pub(crate) async fn fetch_api(
         &self,
         context: &ProviderContext,
         endpoint: &str,
@@ -416,7 +416,7 @@ impl super::CredentialStore for ApiKey {
         (name == "AMP_API_KEY").then(|| super::Secret(self.0.clone()))
     }
 }
-fn local_key(path: &Path) -> Result<Option<String>, ProviderError> {
+pub(crate) fn local_key(path: &Path) -> Result<Option<String>, ProviderError> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]

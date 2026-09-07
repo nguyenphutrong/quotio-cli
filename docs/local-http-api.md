@@ -343,6 +343,29 @@ percentage, including a zero balance.
 Daily, renewal, billing-period and replenishment information remains a reset
 description. No exact reset timestamp is inferred from that text. Native public-host
 key aliases follow the Swift selection order without modifying the file. Amp native
-source registration and full frontend composition still require implementation;
-this parser work does not activate Swift production or establish live-provider
+reference registration is described below. Full frontend composition remains pending.
+This parser work does not activate Swift production or establish live-provider
 acceptance.
+
+## Amp native account reference
+
+Register the current node's standard Amp source with authenticated management
+`POST /v1/account-sources`, an `Idempotency-Key`, and `{"kind":"amp_native"}`.
+The backend resolves `~/.local/share/amp/secrets.json` on macOS/Linux. The request
+cannot supply a path, token or ownership override. The vault stores a reference,
+not a second copy of the native key. Registration confirms that the source is
+readable; it does not claim the provider accepted the key.
+
+The account reports `origin: borrowed_native` and `enabled`. For this source,
+`PATCH /v1/accounts/{id}` accepts `enabled: false` or `true` using the usual
+idempotent mutation API. Disabled references return `source_disabled`, and native
+credential rejection returns `owner_refresh_required`; the backend never refreshes
+or writes the native key and never falls back to running `amp usage` for a reference.
+It checks the source again after provider I/O and separates cache identity by its
+current key. Removing the account removes only the binding.
+
+Once this public native source is registered, use its opaque account ID instead of
+the legacy `local` alias. The duplicate implicit native adapter is suppressed;
+independently configured AMP_API_KEY or custom AMP_URL local sources retain their
+existing behavior. This does not introduce automatic registration or migrate Swift
+credentials. The app's current binary pin predates this implementation.

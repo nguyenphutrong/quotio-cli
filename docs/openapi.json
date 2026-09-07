@@ -1322,7 +1322,7 @@
     },
     "/v1/account-sources": {
       "post": {
-        "summary": "Register read-only ClinePass source",
+        "summary": "Register a read-only quota source",
         "responses": {
           "202": {
             "description": "Success",
@@ -1401,7 +1401,7 @@
             }
           }
         ],
-        "description": "Explicitly bind one existing ClinePass record in the production or development Quotio customProviders preferences on macOS. Stores a reference only. Never writes or refreshes the source credential. Requires management mode and Idempotency-Key."
+        "description": "Register an existing ClinePass custom-provider reference on macOS, or the node standard Amp native source on macOS/Linux. Stores references only; never refreshes or writes source credentials. Requires management mode and Idempotency-Key."
       }
     }
   },
@@ -1660,7 +1660,8 @@
             "type": "string",
             "enum": [
               "owned",
-              "borrowed_proxy"
+              "borrowed_proxy",
+              "borrowed_native"
             ]
           }
         },
@@ -1968,9 +1969,13 @@
             "type": "string",
             "enum": [
               "owned",
-              "borrowed_proxy"
+              "borrowed_proxy",
+              "borrowed_native"
             ],
             "description": "Assigned by the backend from the credential creation path; cannot be changed with an account patch."
+          },
+          "enabled": {
+            "type": "boolean"
           }
         },
         "additionalProperties": false,
@@ -2077,16 +2082,25 @@
               ],
               "properties": {
                 "kind": {
-                  "const": "quotio_custom_provider"
+                  "enum": [
+                    "quotio_custom_provider",
+                    "amp_native"
+                  ]
                 },
                 "platforms": {
                   "type": "array",
                   "items": {
-                    "const": "macos"
+                    "enum": [
+                      "macos",
+                      "linux"
+                    ]
                   }
                 },
                 "origin": {
-                  "const": "borrowed_proxy"
+                  "enum": [
+                    "borrowed_proxy",
+                    "borrowed_native"
+                  ]
                 },
                 "credential_refresh": {
                   "const": false
@@ -2280,6 +2294,13 @@
               "boolean",
               "null"
             ]
+          },
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Enable or disable an Amp native reference without changing the native login."
           }
         },
         "additionalProperties": false
@@ -2622,38 +2643,54 @@
         }
       },
       "AccountSourceInput": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "source",
-          "kind"
-        ],
-        "properties": {
-          "source": {
+        "oneOf": [
+          {
             "type": "object",
             "additionalProperties": false,
             "required": [
-              "domain",
-              "record_id"
+              "source",
+              "kind"
             ],
             "properties": {
-              "domain": {
-                "type": "string",
-                "enum": [
-                  "production",
-                  "development"
-                ]
+              "source": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "domain",
+                  "record_id"
+                ],
+                "properties": {
+                  "domain": {
+                    "type": "string",
+                    "enum": [
+                      "production",
+                      "development"
+                    ]
+                  },
+                  "record_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                }
               },
-              "record_id": {
-                "type": "string",
-                "format": "uuid"
+              "kind": {
+                "const": "quotio_custom_provider"
               }
             }
           },
-          "kind": {
-            "const": "quotio_custom_provider"
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "amp_native"
+              }
+            }
           }
-        }
+        ]
       }
     }
   },

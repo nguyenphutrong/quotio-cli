@@ -235,6 +235,12 @@ pub(crate) mod fixture {
     pub async fn server_status(
         responses: Vec<(u16, serde_json::Value)>,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        server_status_with_action(responses, |_| {}).await
+    }
+    pub async fn server_status_with_action(
+        responses: Vec<(u16, serde_json::Value)>,
+        mut action: impl FnMut(usize) + Send + 'static,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -260,6 +266,7 @@ pub(crate) mod fixture {
                 socket.read_exact(&mut body).await.unwrap();
                 request.push_str(std::str::from_utf8(&body).unwrap());
                 requests.push(request);
+                action(requests.len() - 1);
                 let body = response.to_string();
                 socket.get_mut().write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
             }

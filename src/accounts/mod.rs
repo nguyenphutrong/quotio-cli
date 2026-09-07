@@ -59,6 +59,9 @@ pub enum AccountError {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Credential {
+    AmpNative {
+        source: sources::AmpNativeReference,
+    },
     QuotioCustomProvider {
         source: sources::CustomProviderReference,
     },
@@ -97,11 +100,19 @@ pub struct AccountInfo<'a> {
     pub label: &'a str,
     pub active: bool,
     pub origin: AccountOrigin,
+    pub enabled: bool,
 }
 impl Account {
+    pub fn enabled(&self) -> bool {
+        match &self.credential {
+            Credential::AmpNative { source } => source.enabled,
+            _ => true,
+        }
+    }
     pub fn origin(&self) -> AccountOrigin {
         match self.credential {
             Credential::QuotioCustomProvider { .. } => AccountOrigin::BorrowedProxy,
+            Credential::AmpNative { .. } => AccountOrigin::BorrowedNative,
             _ => AccountOrigin::Owned,
         }
     }
@@ -112,6 +123,7 @@ impl Account {
             label: &self.label,
             active: self.active,
             origin: self.origin(),
+            enabled: self.enabled(),
         }
     }
 }
@@ -156,7 +168,10 @@ impl Document {
             .accounts
             .iter()
             .any(|a| a.provider == provider && a.active);
-        if matches!(credential, Credential::QuotioCustomProvider { .. }) {
+        if matches!(
+            credential,
+            Credential::QuotioCustomProvider { .. } | Credential::AmpNative { .. }
+        ) {
             self.version = 3;
         }
         self.accounts.push(Account {
@@ -225,7 +240,19 @@ impl Document {
         id: &str,
         label: Option<&str>,
         active: Option<bool>,
+        enabled: Option<bool>,
     ) -> Result<(), AccountError> {
+        if let Some(enabled) = enabled {
+            let account = self
+                .accounts
+                .iter_mut()
+                .find(|a| a.id == id)
+                .ok_or(AccountError::NotFound)?;
+            match &mut account.credential {
+                Credential::AmpNative { source } => source.enabled = enabled,
+                _ => return Err(AccountError::Unsupported),
+            }
+        }
         if active == Some(false) {
             return Err(AccountError::Unsupported);
         }

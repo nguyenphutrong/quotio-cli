@@ -2,6 +2,81 @@
 use super::{AccountError, Credential};
 use serde::{Deserialize, Serialize};
 
+fn enabled_default() -> bool {
+    true
+}
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AmpNativeReference {
+    pub path: std::path::PathBuf,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+}
+impl AmpNativeReference {
+    pub fn system() -> Result<Self, AccountError> {
+        let path = crate::providers::amp::AmpProvider::default()
+            .credential_path
+            .ok_or(AccountError::Unsupported)?;
+        Ok(Self {
+            path,
+            enabled: true,
+        })
+    }
+    pub fn identity(&self) -> Result<String, AccountError> {
+        if !self.path.is_absolute() {
+            return Err(AccountError::Input);
+        }
+        Ok(crate::cache::fingerprint(&[
+            "amp_native",
+            self.path.to_str().ok_or(AccountError::Input)?,
+        ]))
+    }
+    pub async fn resolve(&self) -> Result<Resolved, AccountError> {
+        self.identity()?;
+        if !self.enabled {
+            return Err(AccountError::SourceDisabled);
+        }
+        let path = self.path.clone();
+        let token = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || crate::providers::amp::local_key(&path)),
+        )
+        .await
+        .map_err(|_| AccountError::Busy)?
+        .map_err(|_| AccountError::Storage)??
+        .ok_or(AccountError::NotFound)?;
+        Ok(Resolved {
+            label: "Local Amp account".into(),
+            credential: Credential::ApiKey {
+                token,
+                region: None,
+                organization: None,
+            },
+        })
+    }
+}
+impl Credential {
+    pub async fn resolve_reference(
+        &self,
+        provider: crate::cli::Provider,
+    ) -> Result<Option<Resolved>, AccountError> {
+        match self {
+            Self::QuotioCustomProvider { source }
+                if provider == crate::cli::Provider::Catalog("clinepass") =>
+            {
+                source.resolve().await.map(Some)
+            }
+            Self::AmpNative { source } if provider == crate::cli::Provider::Amp => {
+                source.resolve().await.map(Some)
+            }
+            Self::QuotioCustomProvider { .. } | Self::AmpNative { .. } => {
+                Err(AccountError::Unsupported)
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum QuotioDomain {
@@ -164,6 +239,85 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn amp_reference_observes_rotation_disable_and_removal_without_copying_credentials() {
+        use crate::accounts::{
+            service::{MutationIntent, commit_once, mutation_receipt},
+            vault::{Vault, tests::Memory},
+        };
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(super::super::random_string().unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("secrets.json");
+        let mut source = AmpNativeReference {
+            path: path.clone(),
+            enabled: true,
+        };
+        std::fs::write(&path, br#"{"apiKey@https://ampcode.com/":"fixture-first"}"#).unwrap();
+        let first = source.resolve().await.unwrap().credential;
+        let identity = source.identity().unwrap();
+        let vault = Vault::new(Arc::new(Memory::default()), dir.join("lock"));
+        let intent = MutationIntent::new("native-fixture", identity.clone()).unwrap();
+        let copy = source.clone();
+        let id = commit_once(vault.clone(), intent.clone(), move |doc| {
+            doc.add(
+                crate::cli::Provider::Amp,
+                "Local Amp",
+                identity,
+                Credential::AmpNative { source: copy },
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            mutation_receipt(vault.clone(), &intent).await.unwrap(),
+            Some(id.clone())
+        );
+        let tx = vault.begin().unwrap();
+        assert_eq!(
+            tx.document.accounts[0].origin(),
+            crate::domain::AccountOrigin::BorrowedNative
+        );
+        assert!(
+            !serde_json::to_string(&tx.document)
+                .unwrap()
+                .contains("fixture-first")
+        );
+        drop(tx);
+        std::fs::write(
+            &path,
+            br#"{"apiKey@https://ampcode.com/":"fixture-second"}"#,
+        )
+        .unwrap();
+        assert!(source.resolve().await.unwrap().credential != first);
+        let bytes = std::fs::read(&path).unwrap();
+        let mut tx = vault.begin().unwrap();
+        tx.document.patch(&id, None, None, Some(false)).unwrap();
+        tx.commit().unwrap();
+        assert!(!vault.begin().unwrap().document.accounts[0].enabled());
+        source.enabled = false;
+        assert!(matches!(
+            source.resolve().await,
+            Err(AccountError::SourceDisabled)
+        ));
+        source.enabled = true;
+        assert!(source.resolve().await.is_ok());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_file(&path).unwrap();
+        assert!(source.resolve().await.is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn amp_registration_cannot_supply_a_path_or_credential() {
+        assert!(
+            serde_json::from_str::<crate::accounts::api::SourceInput>(r#"{"kind":"amp_native"}"#)
+                .is_ok()
+        );
+        for field in ["path", "token", "owned", "source"] {
+            let value = serde_json::json!({"kind":"amp_native",field:"fixture"});
+            assert!(serde_json::from_value::<crate::accounts::api::SourceInput>(value).is_err());
+        }
+    }
     #[test]
     fn reference_preserves_group_identity_and_selects_first_key() {
         let source = source();

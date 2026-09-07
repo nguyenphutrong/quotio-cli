@@ -161,7 +161,11 @@ impl Vault {
                     || (doc.version == 1 && !doc.mutation_receipts.is_empty())
                     || (doc.version < 3
                         && doc.accounts.iter().any(|a| {
-                            matches!(a.credential, super::Credential::QuotioCustomProvider { .. })
+                            matches!(
+                                a.credential,
+                                super::Credential::QuotioCustomProvider { .. }
+                                    | super::Credential::AmpNative { .. }
+                            )
                         }))
                     || doc.mutation_receipts.len() > 4096
                 {

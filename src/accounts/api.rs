@@ -11,6 +11,7 @@ pub struct AccountDto {
     pub label: String,
     pub active: bool,
     pub origin: super::AccountOrigin,
+    pub enabled: bool,
 }
 impl From<&super::Account> for AccountDto {
     fn from(account: &super::Account) -> Self {
@@ -20,6 +21,7 @@ impl From<&super::Account> for AccountDto {
             label: account.label.clone(),
             active: account.active,
             origin: account.origin(),
+            enabled: account.enabled(),
         }
     }
 }
@@ -37,6 +39,7 @@ pub struct ApiKeyInput {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccountPatch {
+    pub enabled: Option<bool>,
     pub label: Option<String>,
     pub active: Option<bool>,
 }
@@ -94,21 +97,39 @@ pub struct PreparedAccount {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceInput {
+    AmpNative {},
     QuotioCustomProvider {
         source: super::sources::CustomProviderReference,
     },
 }
 pub async fn prepare_source(input: SourceInput) -> Result<PreparedAccount, AccountError> {
-    let SourceInput::QuotioCustomProvider { source } = input;
-    let identity = source.identity()?;
-    let resolved = source.resolve().await?;
+    let (provider, identity, credential) = match input {
+        SourceInput::QuotioCustomProvider { source } => (
+            Provider::Catalog("clinepass"),
+            source.identity()?,
+            Credential::QuotioCustomProvider { source },
+        ),
+        SourceInput::AmpNative {} => {
+            let source = super::sources::AmpNativeReference::system()?;
+            (
+                Provider::Amp,
+                source.identity()?,
+                Credential::AmpNative { source },
+            )
+        }
+    };
+    let resolved = credential
+        .resolve_reference(provider)
+        .await?
+        .ok_or(AccountError::Unsupported)?;
     Ok(PreparedAccount {
-        provider: Provider::Catalog("clinepass"),
+        provider,
         label: resolved.label,
         identity,
-        credential: Credential::QuotioCustomProvider { source },
+        credential,
     })
 }
+
 pub async fn prepare(
     context: &ProviderContext,
     input: ApiKeyInput,
@@ -163,7 +184,7 @@ pub async fn update_once(
     intent: service::MutationIntent,
 ) -> Result<String, AccountError> {
     service::commit_once(vault, intent, move |document| {
-        document.patch(&id, patch.label.as_deref(), patch.active)?;
+        document.patch(&id, patch.label.as_deref(), patch.active, patch.enabled)?;
         Ok(id)
     })
     .await
@@ -203,7 +224,7 @@ pub async fn update(
     id: String,
     patch: AccountPatch,
 ) -> Result<AccountDto, AccountError> {
-    let account = service::patch(vault, id, patch.label, patch.active).await?;
+    let account = service::patch(vault, id, patch.label, patch.active, patch.enabled).await?;
     Ok(AccountDto::from(&account))
 }
 pub async fn remove(vault: Vault, id: String) -> Result<(), AccountError> {
@@ -351,6 +372,7 @@ mod tests {
                 vault.clone(),
                 second.clone(),
                 AccountPatch {
+                    enabled: None,
                     label: Some("first".into()),
                     active: Some(true)
                 }

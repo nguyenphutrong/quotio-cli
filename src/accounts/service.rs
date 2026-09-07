@@ -80,23 +80,23 @@ pub async fn validate(
     provider: Provider,
     credential: &Credential,
 ) -> Result<ProviderUsage, AccountError> {
-    let resolved;
-    let source = match credential {
-        Credential::QuotioCustomProvider { source } => Some(source),
-        _ => None,
-    };
-    let credential = if let Some(source) = source {
-        if provider != Provider::Catalog("clinepass") {
-            return Err(AccountError::Unsupported);
-        }
-        resolved = source.resolve().await?;
-        &resolved.credential
-    } else {
-        credential
-    };
+    validate_with_amp_endpoint(context, provider, credential, None).await
+}
+async fn validate_with_amp_endpoint(
+    context: &ProviderContext,
+    provider: Provider,
+    credential: &Credential,
+    amp_endpoint: Option<&str>,
+) -> Result<ProviderUsage, AccountError> {
+    let reference = credential;
+    let resolved = reference.resolve_reference(provider).await?;
+    let credential = resolved.as_ref().map_or(credential, |r| &r.credential);
     let ctx = scoped(context, provider, credential)?;
     let usage = match provider {
-        Provider::Amp => AmpApiProvider.fetch(&ctx).await?,
+        Provider::Amp => match amp_endpoint {
+            Some(endpoint) => AmpApiProvider.fetch_api(&ctx, endpoint).await?,
+            None => AmpApiProvider.fetch(&ctx).await?,
+        },
         Provider::Factory => FactoryProvider.fetch(&ctx).await?,
         Provider::Codex => codex_api::fetch(&ctx, credential).await?,
         provider if provider.key_api().is_some() || provider.catalog().is_some() => {
@@ -110,8 +110,11 @@ pub async fn validate(
     {
         return Err(ProviderError::InvalidData.into());
     }
-    if let Some(source) = source
-        && source.resolve().await?.credential != *credential
+    if resolved.is_some()
+        && reference
+            .resolve_reference(provider)
+            .await?
+            .is_none_or(|r| r.credential != *credential)
     {
         return Err(AccountError::Busy);
     }
@@ -290,9 +293,10 @@ pub async fn patch(
     id: String,
     label: Option<String>,
     active: Option<bool>,
+    enabled: Option<bool>,
 ) -> Result<Account, AccountError> {
     let mut tx = begin(vault).await?;
-    tx.document.patch(&id, label.as_deref(), active)?;
+    tx.document.patch(&id, label.as_deref(), active, enabled)?;
     let account = tx
         .document
         .accounts
@@ -350,7 +354,9 @@ pub fn default_label(
         return super::validate_label(label);
     }
     match credential {
-        Credential::QuotioCustomProvider { .. } => Err(AccountError::Input),
+        Credential::QuotioCustomProvider { .. } | Credential::AmpNative { .. } => {
+            Err(AccountError::Input)
+        }
         Credential::CodexOAuth { email, .. } => super::validate_label(email),
         Credential::ApiKey { token, .. } | Credential::CatalogKey { token, .. } => {
             let suffix =
@@ -510,8 +516,16 @@ impl ProviderAdapter for ManagedProvider {
             let account = account.clone();
             drop(tx);
             let scope = match &account.credential {
-                Credential::QuotioCustomProvider { source } => {
-                    serde_json::to_string(&source.resolve().await.ok()?.credential).ok()?
+                Credential::QuotioCustomProvider { .. } | Credential::AmpNative { .. } => {
+                    serde_json::to_string(
+                        &account
+                            .credential
+                            .resolve_reference(self.provider)
+                            .await
+                            .ok()??
+                            .credential,
+                    )
+                    .ok()?
                 }
                 Credential::CodexOAuth { account_id, .. } => account_id.clone(),
                 credential => serde_json::to_string(credential).ok()?,
@@ -540,6 +554,11 @@ impl ProviderAdapter for ManagedProvider {
     fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
         Box::pin(async move {
             self.read(context).await.map_err(|e| match e {
+                AccountError::Provider(ProviderError::Authentication)
+                    if self.origin == super::AccountOrigin::BorrowedNative =>
+                {
+                    ProviderError::OwnerRefreshRequired
+                }
                 AccountError::Provider(e) => e,
                 AccountError::Busy => ProviderError::Transient,
                 AccountError::SourceDisabled => ProviderError::SourceDisabled,
@@ -659,6 +678,24 @@ fn managed(vault: &Vault, account: &Account) -> Arc<dyn ProviderAdapter> {
         provider_id: account.provider.adapter().id(),
     })
 }
+fn native_amp_selection(has_key: bool, url: Option<&str>) -> bool {
+    !has_key
+        && url.is_none_or(|url| {
+            reqwest::Url::parse(url)
+                .ok()
+                .and_then(|url| {
+                    url.host_str()
+                        .map(|host| host.eq_ignore_ascii_case("ampcode.com"))
+                })
+                .unwrap_or(true)
+        })
+}
+pub(crate) fn uses_native_amp_source() -> bool {
+    native_amp_selection(
+        std::env::var_os("AMP_API_KEY").is_some(),
+        std::env::var("AMP_URL").ok().as_deref(),
+    )
+}
 fn choose(
     providers: Vec<Provider>,
     filter: Option<&str>,
@@ -689,7 +726,12 @@ fn choose(
                     })
                     .collect();
                 if provider != Provider::Factory {
-                    if local_sources.contains(&provider) || matching.is_empty() {
+                    if (local_sources.contains(&provider) || matching.is_empty())
+                        && !(uses_native_amp_source()
+                            && matching
+                                .iter()
+                                .any(|a| matches!(a.credential, Credential::AmpNative { .. })))
+                    {
                         selected.push(provider.adapter());
                     }
                     selected.extend(matching.into_iter().map(|a| managed(vault, a)));
@@ -726,6 +768,15 @@ pub async fn adapters(
         return Err(AccountError::Unsupported);
     }
     if filter == Some("local") {
+        if saved && providers == [Provider::Amp] && uses_native_amp_source() {
+            let accounts = discover(Vault::for_usage()?, timeout).await?;
+            if accounts
+                .iter()
+                .any(|a| matches!(a.credential, Credential::AmpNative { .. }))
+            {
+                return Err(AccountError::Unsupported);
+            }
+        }
         return Ok(providers.into_iter().map(Provider::adapter).collect());
     }
     if !saved || !cfg!(any(target_os = "macos", target_os = "linux")) {
@@ -871,6 +922,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_selection_preserves_independent_environment_and_custom_host_sources() {
+        assert!(native_amp_selection(false, None));
+        assert!(native_amp_selection(false, Some("https://ampcode.com/")));
+        assert!(native_amp_selection(
+            false,
+            Some("HTTPS://AMPCODE.COM:443/")
+        ));
+        assert!(native_amp_selection(
+            false,
+            Some("https://ampcode.com/path")
+        ));
+        assert!(native_amp_selection(false, Some("invalid-url")));
+        assert!(!native_amp_selection(true, None));
+        assert!(!native_amp_selection(false, Some("https://custom.example")));
+    }
+    #[tokio::test]
+    async fn amp_native_resolution_reaches_http_and_rejects_rotation_during_response() {
+        for rotate in [false, true] {
+            let dir = std::env::temp_dir().join(random_string().unwrap());
+            std::fs::create_dir(&dir).unwrap();
+            let path = dir.join("secrets.json");
+            std::fs::write(
+                &path,
+                br#"{"apiKey@https://ampcode.com/":"native-first-fixture"}"#,
+            )
+            .unwrap();
+            let credential = Credential::AmpNative {
+                source: super::super::sources::AmpNativeReference {
+                    path: path.clone(),
+                    enabled: true,
+                },
+            };
+            let vault = Vault::new(Arc::new(Memory::default()), dir.join("lock"));
+            let mut tx = vault.begin().unwrap();
+            let id = tx
+                .document
+                .add(
+                    Provider::Amp,
+                    "Fixture",
+                    "native-source".into(),
+                    credential.clone(),
+                )
+                .unwrap();
+            let account = tx.document.accounts[0].clone();
+            tx.commit().unwrap();
+            let adapter = super::managed(&vault, &account);
+            let context = http::fixture::context();
+            let before = adapter.cache_identity(&context).await.unwrap();
+            let change_path = path.clone();
+            let (endpoint, server) = http::fixture::server_status_with_action(vec![(200, serde_json::json!({"ok":true,"result":{"displayText":"Signed in as demo@example.com (Pro)\nAmp Free: 75% remaining today (resets daily)"}}))], move |_| {
+                if rotate { std::fs::write(&change_path, br#"{"apiKey@https://ampcode.com/":"native-second-fixture"}"#).unwrap(); }
+            }).await;
+            let result =
+                validate_with_amp_endpoint(&context, Provider::Amp, &credential, Some(&endpoint))
+                    .await;
+            if rotate {
+                assert!(matches!(result, Err(AccountError::Busy)));
+                assert_ne!(adapter.cache_identity(&context).await.unwrap(), before);
+            } else {
+                let usage = result.unwrap();
+                assert_eq!(usage.account.id, "demo@example.com");
+                assert_eq!(usage.windows[0].metric_id.as_deref(), Some("amp-free"));
+            }
+            let requests = server.await.unwrap();
+            assert!(requests[0].contains("Bearer native-first-fixture"));
+            let mut tx = vault.begin().unwrap();
+            tx.document.patch(&id, None, None, Some(false)).unwrap();
+            tx.commit().unwrap();
+            assert!(adapter.cache_identity(&context).await.is_none());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
     struct MutateDuringQuota {
         vault: Vault,
         id: String,
