@@ -414,3 +414,17 @@ Writing this flag upgrades the vault document to format 4 atomically. Existing
 accounts default to enabled; the prior Amp reference flag remains respected. Older
 binaries reject format 4 instead of ignoring disabled accounts. Adding another
 source or recording a mutation receipt preserves the newer format version.
+
+### Cursor quota endpoints
+
+Cursor collection combines `auth/usage-summary` with the existing current-period
+RPC using one token snapshot. Summary metrics keep the Swift IDs `plan-usage` and
+`on-demand`, the provider's unscaled amounts, membership plan, and exact supplied
+billing-cycle reset. On-demand does not inherit the plan reset. RPC metrics retain
+the current-period and model percentages with separate stable IDs.
+
+Missing counters and zero limits remain unknown. Unlimited is reported only when
+explicitly supplied by the summary. A malformed metric or failed endpoint adds a
+scoped diagnostic without deleting valid sibling data; endpoint deadlines leave
+time to return partial results within the collector budget. Native-source account
+registration and local email/subscription-status metadata are still pending.

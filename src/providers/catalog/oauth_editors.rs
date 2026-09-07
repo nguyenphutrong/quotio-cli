@@ -2,7 +2,7 @@ use super::{AuthKind, Definition, common};
 #[cfg(target_os = "macos")]
 use crate::providers::process;
 use crate::{
-    domain::{ProviderUsage, QuotaWindow},
+    domain::{ProviderUsage, Quota, QuotaWindow, UsageDiagnostic},
     error::ProviderError,
     providers::{FetchFuture, ProviderContext, Secret, http},
 };
@@ -24,6 +24,7 @@ use tokio::{
 
 const CURSOR_USAGE_URL: &str =
     "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage";
+const CURSOR_SUMMARY_URL: &str = "https://api2.cursor.sh/auth/usage-summary";
 const GROK_CREDITS_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const KIMI_CODE_USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
 const CURSOR_KEYCHAIN_SERVICE: &str = "cursor-access-token";
@@ -65,7 +66,9 @@ pub const DEFINITIONS: &[Definition] = &[
 ];
 
 fn cursor(context: &ProviderContext) -> FetchFuture<'_> {
-    Box::pin(async move { fetch_cursor_at(context, CURSOR_USAGE_URL).await })
+    Box::pin(async move {
+        fetch_cursor_complete_at(context, CURSOR_USAGE_URL, CURSOR_SUMMARY_URL).await
+    })
 }
 
 fn grok(context: &ProviderContext) -> FetchFuture<'_> {
@@ -76,11 +79,20 @@ fn kimi(context: &ProviderContext) -> FetchFuture<'_> {
     Box::pin(async move { fetch_kimi_at(context, KIMI_CODE_USAGE_URL).await })
 }
 
+#[cfg(test)]
 async fn fetch_cursor_at(
     context: &ProviderContext,
     endpoint: &str,
 ) -> Result<ProviderUsage, ProviderError> {
     let key = cursor_token(context).await?;
+    fetch_cursor_with_key(context, endpoint, &key).await
+}
+
+async fn fetch_cursor_with_key(
+    context: &ProviderContext,
+    endpoint: &str,
+    key: &Secret,
+) -> Result<ProviderUsage, ProviderError> {
     let now = context.clock.now();
     let root: Value = common::json(
         context
@@ -99,11 +111,176 @@ async fn fetch_cursor_at(
     .await?;
     token_usage(
         "cursor",
-        &key,
+        key,
         "native-oauth",
         "Cursor OAuth token",
         cursor_windows(&root, now)?,
     )
+}
+
+async fn fetch_cursor_complete_at(
+    context: &ProviderContext,
+    endpoint: &str,
+    summary_endpoint: &str,
+) -> Result<ProviderUsage, ProviderError> {
+    // Both endpoints use the same credential snapshot, even if the native login changes.
+    let key = cursor_token(context).await?;
+    let now = context.clock.now();
+    let budget = crate::providers::remaining_fetch_time()
+        .unwrap_or(Duration::from_secs(15))
+        .mul_f64(0.9);
+    let summary = async {
+        let root = common::json(
+            context
+                .http
+                .get(summary_endpoint)
+                .header(
+                    "Authorization",
+                    http::sensitive(&format!("Bearer {}", key.0))?,
+                )
+                .header("Accept", "application/json"),
+            now,
+        )
+        .await?;
+        cursor_summary(&root, &key, now)
+    };
+    let (summary, period) = tokio::join!(
+        tokio::time::timeout(budget, summary),
+        tokio::time::timeout(budget, fetch_cursor_with_key(context, endpoint, &key)),
+    );
+    let summary = summary.unwrap_or(Err(ProviderError::Timeout));
+    let period = period.unwrap_or(Err(ProviderError::Timeout));
+    match (summary, period) {
+        (Ok(mut summary), Ok(period)) => {
+            summary.windows.extend(period.windows);
+            Ok(summary)
+        }
+        (Ok(mut usage), Err(code)) => {
+            usage.diagnostics.push(UsageDiagnostic {
+                source: "cursor_current_period".into(),
+                code,
+            });
+            Ok(usage)
+        }
+        (Err(code), Ok(mut usage)) => {
+            usage.diagnostics.push(UsageDiagnostic {
+                source: "cursor_usage_summary".into(),
+                code,
+            });
+            Ok(usage)
+        }
+        (Err(error), Err(_)) => Err(error),
+    }
+}
+
+fn cursor_summary(
+    root: &Value,
+    key: &Secret,
+    now: OffsetDateTime,
+) -> Result<ProviderUsage, ProviderError> {
+    if !root.is_object()
+        || !["membershipType", "individualUsage", "isUnlimited"]
+            .iter()
+            .any(|field| root.get(field).is_some())
+    {
+        return Err(ProviderError::InvalidData);
+    }
+    let mut account = common::account_identity("cursor", key, "native-oauth");
+    account.label = "Cursor OAuth token".into();
+    account.plan = root
+        .get("membershipType")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() <= 128 && !value.chars().any(char::is_control))
+        .map(|value| {
+            value
+                .split('_')
+                .filter(|word| !word.is_empty())
+                .map(|word| {
+                    let mut chars = word.chars();
+                    chars
+                        .next()
+                        .map(|first| {
+                            first.to_uppercase().to_string() + &chars.as_str().to_lowercase()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+    let mut windows = Vec::new();
+    let mut diagnostics = Vec::new();
+    let reset = match common::date(root.get("billingCycleEnd")) {
+        Ok(reset) => reset,
+        Err(code) => {
+            diagnostics.push(UsageDiagnostic {
+                source: "cursor_billing_cycle".into(),
+                code,
+            });
+            None
+        }
+    };
+    for (field, id, label) in [
+        ("plan", "plan-usage", "Plan usage"),
+        ("onDemand", "on-demand", "On demand"),
+    ] {
+        let Some(value) = root
+            .get("individualUsage")
+            .and_then(|usage| usage.get(field))
+        else {
+            continue;
+        };
+        if value.get("enabled").and_then(Value::as_bool) == Some(false) {
+            continue;
+        }
+        let parsed = (|| {
+            if value.get("enabled").and_then(Value::as_bool) != Some(true) {
+                return Err(ProviderError::InvalidData);
+            }
+            let mut window = common::window(
+                label,
+                common::number(value.get("used"))?,
+                common::number(value.get("limit"))?,
+                common::number(value.get("remaining"))?,
+                "units",
+                if field == "plan" { reset } else { None },
+                "cursor_usage_summary",
+                now,
+            )?;
+            window.metric_id = Some(id.into());
+            Ok(window)
+        })();
+        match parsed {
+            Ok(window) => windows.push(window),
+            Err(code) => diagnostics.push(UsageDiagnostic {
+                source: format!("cursor_{field}"),
+                code,
+            }),
+        }
+    }
+    if windows.is_empty() {
+        let mut window = common::window(
+            "Usage",
+            None,
+            None,
+            None,
+            "units",
+            None,
+            "cursor_usage_summary",
+            now,
+        )?;
+        window.metric_id = Some("cursor-usage".into());
+        if root.get("isUnlimited").and_then(Value::as_bool) == Some(true) {
+            window.quota = Quota::Unlimited;
+        }
+        windows.push(window);
+    }
+    Ok(ProviderUsage {
+        provider: crate::domain::ProviderId("cursor".into()),
+        account,
+        account_ref: None,
+        windows,
+        diagnostics,
+    })
 }
 
 async fn fetch_grok_at(
@@ -200,7 +377,7 @@ fn cursor_windows(root: &Value, now: OffsetDateTime) -> Result<Vec<QuotaWindow>,
         ("apiPercentUsed", "Other Models"),
     ] {
         if let Some(used) = percentage(plan.get(field))? {
-            windows.push(common::window(
+            let mut window = common::window(
                 label,
                 Some(used),
                 Some(100.0),
@@ -209,7 +386,9 @@ fn cursor_windows(root: &Value, now: OffsetDateTime) -> Result<Vec<QuotaWindow>,
                 reset,
                 "cursor_native_oauth",
                 now,
-            )?);
+            )?;
+            window.metric_id = Some(format!("cursor-{field}"));
+            windows.push(window);
         }
     }
     if windows.is_empty() {
@@ -819,6 +998,139 @@ mod tests {
         assert!(lower.contains("connect-protocol-version: 1"));
         assert!(!lower.contains("\r\ncookie:"));
         assert!(request.ends_with("{}"));
+    }
+
+    #[test]
+    fn cursor_summary_preserves_swift_plan_amounts_and_unknown_values() {
+        let key = Secret("fixture".into());
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let usage = cursor_summary(
+            &json!({
+                "membershipType": "pro_student",
+                "billingCycleEnd": "2030-01-02T03:04:05.000Z",
+                "individualUsage": {
+                    "plan": {"enabled": true, "used": 20, "limit": 100, "remaining": 80},
+                    "onDemand": {"enabled": true, "used": 4, "limit": 10, "remaining": 6}
+                }
+            }),
+            &key,
+            now,
+        )
+        .unwrap();
+        assert_eq!(usage.account.plan.as_deref(), Some("Pro Student"));
+        assert_eq!(usage.windows[0].metric_id.as_deref(), Some("plan-usage"));
+        assert_eq!(usage.windows[0].quota, Quota::from_remaining(Some(80.0)));
+        assert_eq!(usage.windows[1].quota, Quota::from_remaining(Some(60.0)));
+        assert!(usage.windows[0].resets_at.is_some());
+        assert!(usage.windows[1].resets_at.is_none());
+        for plan in [
+            json!({"enabled":true}),
+            json!({"enabled":true,"limit":0,"used":0}),
+            json!({"enabled":true,"limit":100}),
+        ] {
+            let usage =
+                cursor_summary(&json!({"individualUsage":{"plan":plan}}), &key, now).unwrap();
+            assert_eq!(usage.windows[0].quota, Quota::Unknown);
+        }
+        let zero = cursor_summary(&json!({"individualUsage":{"plan":{"enabled":true,"used":100,"limit":100,"remaining":0}}}), &key, now).unwrap();
+        assert!(matches!(zero.windows[0].quota, Quota::Exhausted { .. }));
+        let unlimited = cursor_summary(&json!({"isUnlimited":true}), &key, now).unwrap();
+        assert_eq!(unlimited.windows[0].quota, Quota::Unlimited);
+        assert!(unlimited.windows[0].resets_at.is_none());
+        assert!(cursor_summary(&json!({}), &key, now).is_err());
+    }
+
+    #[test]
+    fn cursor_summary_keeps_valid_sibling_and_source_reset() {
+        let key = Secret("fixture".into());
+        let usage = cursor_summary(
+            &json!({
+                "billingCycleEnd":"1970-01-01T00:00:00Z",
+                "individualUsage":{
+                    "plan":{"enabled":true,"used":1,"limit":10},
+                    "onDemand":{"enabled":true,"used":"invalid"}
+                }
+            }),
+            &key,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::days(1),
+        )
+        .unwrap();
+        assert_eq!(usage.windows.len(), 1);
+        assert_eq!(usage.windows[0].resets_at, Some(OffsetDateTime::UNIX_EPOCH));
+        assert_eq!(usage.diagnostics.len(), 1);
+        assert_eq!(usage.diagnostics[0].source, "cursor_onDemand");
+    }
+
+    #[tokio::test]
+    async fn cursor_combines_endpoints_and_preserves_partial_success() {
+        for (summary_status, period_status) in [(200, 200), (500, 200), (200, 500)] {
+            let (summary_url, summary_server) = fixture::server_status(vec![(summary_status, json!({
+                "membershipType":"pro", "individualUsage":{"plan":{"enabled":true,"used":20,"limit":100}}
+            }))]).await;
+            let (period_url, period_server) = fixture::server_status(vec![(
+                period_status,
+                json!({
+                    "planUsage":{"totalPercentUsed":20}
+                }),
+            )])
+            .await;
+            let usage = fetch_cursor_complete_at(&context(), &period_url, &summary_url)
+                .await
+                .unwrap();
+            assert_eq!(
+                usage.windows.len(),
+                if summary_status == 200 && period_status == 200 {
+                    2
+                } else {
+                    1
+                }
+            );
+            assert_eq!(
+                usage.diagnostics.len(),
+                usize::from(summary_status != 200 || period_status != 200)
+            );
+            let request = summary_server.await.unwrap().pop().unwrap();
+            assert!(request.starts_with("GET / HTTP/1.1"));
+            assert!(
+                !request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .contains("cursor-native-token")
+            );
+            assert!(!request.to_ascii_lowercase().contains("\r\ncookie:"));
+            period_server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cursor_keeps_summary_when_period_exceeds_collection_deadline() {
+        let (summary_url, summary_server) =
+            fixture::server(vec![json!({"isUnlimited":true})]).await;
+        let (period_url, period_server) = fixture::server_status_with_async_action(
+            vec![(200, json!({"planUsage":{"totalPercentUsed":20}}))],
+            |_| async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            },
+        )
+        .await;
+        let context = context();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let usage = crate::providers::FETCH_DEADLINE
+            .scope(
+                deadline,
+                tokio::time::timeout_at(
+                    deadline,
+                    fetch_cursor_complete_at(&context, &period_url, &summary_url),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(usage.windows[0].quota, Quota::Unlimited);
+        assert_eq!(usage.diagnostics[0].code, ProviderError::Timeout);
+        summary_server.await.unwrap();
+        period_server.abort();
     }
 
     #[test]
