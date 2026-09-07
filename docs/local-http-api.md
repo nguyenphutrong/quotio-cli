@@ -369,3 +369,11 @@ the legacy `local` alias. The duplicate implicit native adapter is suppressed;
 independently configured AMP_API_KEY or custom AMP_URL local sources retain their
 existing behavior. This does not introduce automatic registration or migrate Swift
 credentials. The app's current binary pin predates this implementation.
+
+## Z.ai quota metadata
+
+Z.ai usage now includes subscription names when the subscription endpoint succeeds.
+A subscription failure is a scoped diagnostic and does not discard valid quota.
+Known quota periods expose the existing Swift metric IDs. TIME_LIMIT uses its
+reported counters; a zero limit remains unknown rather than invented exhaustion.
+The quota endpoint's business error code is validated before accepting its data.

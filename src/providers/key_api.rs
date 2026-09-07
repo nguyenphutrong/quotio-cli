@@ -262,7 +262,12 @@ pub(crate) fn openrouter(
     Ok(windows)
 }
 fn zai(root: &Value, now: OffsetDateTime) -> Result<Vec<QuotaWindow>, ProviderError> {
-    if root.get("success").and_then(Value::as_bool) == Some(false) {
+    if root.get("success").and_then(Value::as_bool) == Some(false)
+        || root
+            .get("code")
+            .and_then(Value::as_i64)
+            .is_some_and(|code| code != 200)
+    {
         return Err(ProviderError::InvalidData);
     }
     let limits = root
@@ -273,6 +278,7 @@ fn zai(root: &Value, now: OffsetDateTime) -> Result<Vec<QuotaWindow>, ProviderEr
     for slot in limits {
         let kind = slot
             .get("type")
+            .or_else(|| slot.get("name"))
             .and_then(Value::as_str)
             .ok_or(ProviderError::InvalidData)?;
         if !matches!(kind, "TOKENS_LIMIT" | "CREDIT_LIMIT" | "TIME_LIMIT") {
@@ -323,7 +329,33 @@ fn zai(root: &Value, now: OffsetDateTime) -> Result<Vec<QuotaWindow>, ProviderEr
                 now,
             )
         };
-        percentage(&mut w, number(slot.get("percentage"))?, false)?;
+        if kind != "TIME_LIMIT" {
+            percentage(&mut w, number(slot.get("percentage"))?, false)?;
+        }
+        w.metric_id = if kind == "TIME_LIMIT" {
+            Some("zai-web-searches".into())
+        } else {
+            match (unit, n) {
+                (Some(3), Some(n)) if n > 0 => {
+                    Some(if n < 24 { "zai-session" } else { "zai-daily" }.into())
+                }
+                (Some(4), Some(n)) if n > 0 => Some(
+                    if n <= 1 {
+                        "zai-daily"
+                    } else if n < 28 {
+                        "zai-weekly"
+                    } else {
+                        "zai-monthly"
+                    }
+                    .into(),
+                ),
+                (Some(5), Some(n)) if n > 0 => Some("zai-monthly".into()),
+                (Some(6), Some(n)) if n > 0 => {
+                    Some(if n < 4 { "zai-weekly" } else { "zai-monthly" }.into())
+                }
+                _ => None,
+            }
+        };
         windows.push(w);
     }
     Ok(windows)
@@ -402,6 +434,61 @@ fn minimax(root: &Value, now: OffsetDateTime) -> Result<Vec<QuotaWindow>, Provid
     Ok(windows)
 }
 impl KeyApiProvider {
+    async fn fetch_zai_at(
+        &self,
+        context: &ProviderContext,
+        quota_endpoint: &str,
+        subscription_endpoint: &str,
+        region: &str,
+    ) -> Result<ProviderUsage, ProviderError> {
+        let subscription = async {
+            let key = context
+                .credentials
+                .get("ZAI_API_KEY")
+                .ok_or(ProviderError::Authentication)?;
+            let value: Value = http::json(
+                context
+                    .http
+                    .get(subscription_endpoint)
+                    .header(
+                        "Authorization",
+                        http::sensitive(&format!("Bearer {}", key.0))?,
+                    )
+                    .header("Accept", "application/json"),
+                context.clock.now(),
+            )
+            .await?;
+            let rows = value
+                .get("data")
+                .and_then(Value::as_array)
+                .ok_or(ProviderError::InvalidData)?;
+            if rows.is_empty() {
+                return Ok(None);
+            }
+            let name = rows[0]
+                .get("productName")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| {
+                    !name.is_empty() && name.len() <= 256 && !name.chars().any(char::is_control)
+                })
+                .ok_or(ProviderError::InvalidData)?;
+            Ok::<_, ProviderError>(Some(name.to_owned()))
+        };
+        let (quota, subscription) = tokio::join!(
+            self.fetch_at(context, quota_endpoint, region),
+            tokio::time::timeout(std::time::Duration::from_secs(5), subscription)
+        );
+        let mut usage = quota?;
+        match subscription.unwrap_or(Err(ProviderError::Timeout)) {
+            Ok(plan) => usage.account.plan = plan,
+            Err(code) => usage.diagnostics.push(UsageDiagnostic {
+                source: "zai_subscription_api".into(),
+                code,
+            }),
+        }
+        Ok(usage)
+    }
     async fn fetch_at(
         &self,
         context: &ProviderContext,
@@ -495,6 +582,16 @@ impl ProviderAdapter for KeyApiProvider {
             if matches!(self.0, Kind::OpenRouter) {
                 return super::openrouter::fetch(context).await;
             }
+            if matches!(self.0, Kind::Zai) {
+                let subscription = match region.as_str() {
+                    "global" => "https://api.z.ai/api/biz/subscription/list",
+                    "cn" => "https://open.bigmodel.cn/api/biz/subscription/list",
+                    _ => return Err(ProviderError::InvalidData),
+                };
+                return self
+                    .fetch_zai_at(context, endpoint, subscription, &region)
+                    .await;
+            }
             self.fetch_at(context, endpoint, &region).await
         })
     }
@@ -587,6 +684,66 @@ mod tests {
         .unwrap();
         assert_eq!(unknown[0].quota, Quota::Unknown);
         assert!(unknown[0].amounts.is_none());
+    }
+    #[tokio::test]
+    async fn zai_subscription_failure_preserves_quota_and_success_preserves_plan() {
+        for success in [true, false] {
+            let (quota_url, quota_server) = http::fixture::server(vec![json!({"success":true,"code":200,"data":{"limits":[{"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":20}]}})]).await;
+            let (plan_url, plan_server) = http::fixture::server_status(vec![(
+                if success { 200 } else { 500 },
+                json!({"data":[{"productName":" GLM Pro "}]}),
+            )])
+            .await;
+            let mut context = http::fixture::context();
+            struct ZaiKey;
+            impl crate::providers::CredentialStore for ZaiKey {
+                fn get(&self, name: &str) -> Option<crate::providers::Secret> {
+                    (name == "ZAI_API_KEY")
+                        .then(|| crate::providers::Secret("fixture-zai-key".into()))
+                }
+            }
+            context.credentials = std::sync::Arc::new(ZaiKey);
+            let usage = KeyApiProvider(Kind::Zai)
+                .fetch_zai_at(&context, &quota_url, &plan_url, "global")
+                .await
+                .unwrap();
+            assert_eq!(usage.windows[0].metric_id.as_deref(), Some("zai-session"));
+            assert_eq!(usage.windows[0].quota, Quota::from_used(Some(20.0)));
+            assert_eq!(usage.account.plan.as_deref(), success.then_some("GLM Pro"));
+            assert_eq!(usage.diagnostics.len(), usize::from(!success));
+            for request in [
+                quota_server.await.unwrap().remove(0),
+                plan_server.await.unwrap().remove(0),
+            ] {
+                assert!(request.contains("Bearer fixture-zai-key"));
+            }
+            assert!(
+                !serde_json::to_string(&usage)
+                    .unwrap()
+                    .contains("fixture-zai-key")
+            );
+        }
+    }
+    #[test]
+    fn zai_search_counts_override_unrelated_percentage_and_zero_limit_stays_unknown() {
+        let windows = zai(
+            &json!({"data":{"limits":[
+                {"name":"TIME_LIMIT","currentValue":2,"usage":10,"percentage":99},
+                {"type":"TIME_LIMIT","currentValue":0,"usage":0}
+            ]}}),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        assert_eq!(windows[0].quota, Quota::from_used(Some(20.0)));
+        assert_eq!(windows[1].quota, Quota::Unknown);
+        assert!(windows.iter().all(|w| w.resets_at.is_none()));
+        assert!(
+            zai(
+                &json!({"code":401,"data":{"limits":[]}}),
+                OffsetDateTime::UNIX_EPOCH
+            )
+            .is_err()
+        );
     }
     #[test]
     fn zai_uses_real_periods_and_separate_mcp_counts() {
