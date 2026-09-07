@@ -134,6 +134,7 @@ fn parse(
         account_ref: None,
         provider: ProviderId("factory".into()),
         account: AccountIdentity {
+            subscription_status: None,
             plan: None,
             id: format!("{}:{}", identity.user_id, identity.org_id),
             label: format!("{} / {}", identity.user_id, identity.org_id),

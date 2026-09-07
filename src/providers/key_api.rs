@@ -562,6 +562,7 @@ impl KeyApiProvider {
             account_ref: None,
             provider: self.id(),
             account: AccountIdentity {
+                subscription_status: None,
                 id: format!("key:{fingerprint}"),
                 label: format!("{} API key", self.0.id()),
                 plan: None,
@@ -678,6 +679,7 @@ mod tests {
                 account_ref: None,
                 provider: ProviderId("openrouter".into()),
                 account: AccountIdentity {
+                    subscription_status: None,
                     id: "key:test".into(),
                     label: "Key".into(),
                     plan: None,

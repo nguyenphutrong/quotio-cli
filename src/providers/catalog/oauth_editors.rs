@@ -118,7 +118,7 @@ async fn fetch_cursor_with_key(
     )
 }
 
-async fn fetch_cursor_complete_at(
+pub(crate) async fn fetch_cursor_complete_at(
     context: &ProviderContext,
     endpoint: &str,
     summary_endpoint: &str,
@@ -173,6 +173,21 @@ async fn fetch_cursor_complete_at(
     }
 }
 
+pub(crate) fn cursor_plan_name(value: &str) -> String {
+    value
+        .split('_')
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().to_string() + &chars.as_str().to_lowercase())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn cursor_summary(
     root: &Value,
     key: &Secret,
@@ -191,22 +206,7 @@ fn cursor_summary(
         .get("membershipType")
         .and_then(Value::as_str)
         .filter(|value| value.len() <= 128 && !value.chars().any(char::is_control))
-        .map(|value| {
-            value
-                .split('_')
-                .filter(|word| !word.is_empty())
-                .map(|word| {
-                    let mut chars = word.chars();
-                    chars
-                        .next()
-                        .map(|first| {
-                            first.to_uppercase().to_string() + &chars.as_str().to_lowercase()
-                        })
-                        .unwrap_or_default()
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        });
+        .map(cursor_plan_name);
     let mut windows = Vec::new();
     let mut diagnostics = Vec::new();
     let reset = match common::date(root.get("billingCycleEnd")) {
@@ -600,13 +600,21 @@ async fn cursor_state_token() -> Result<Option<Secret>, ProviderError> {
 
 #[cfg(target_os = "macos")]
 async fn cursor_sqlite_output(database: std::fs::File) -> Result<Vec<u8>, ProviderError> {
+    cursor_sqlite_query(database, CURSOR_STATE_QUERY).await
+}
+
+#[cfg(target_os = "macos")]
+async fn cursor_sqlite_query(
+    database: std::fs::File,
+    query: &'static str,
+) -> Result<Vec<u8>, ProviderError> {
     let mut child = Command::new("/usr/bin/sqlite3")
         .args([
             "-batch",
             "-noheader",
             "-readonly",
             "file:/dev/fd/0?mode=ro&immutable=1",
-            CURSOR_STATE_QUERY,
+            query,
         ])
         .stdin(Stdio::from(database))
         .stdout(Stdio::piped())
@@ -641,10 +649,83 @@ async fn cursor_state_token() -> Result<Option<Secret>, ProviderError> {
 }
 
 #[cfg(target_os = "macos")]
-fn cursor_state_database_path() -> Option<PathBuf> {
+pub(crate) fn cursor_state_database_path() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|dirs| {
         dirs.home_dir()
             .join("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+    })
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CursorLogin {
+    pub token: String,
+    pub email: Option<String>,
+    pub membership: Option<String>,
+    pub subscription_status: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) async fn cursor_login(path: PathBuf) -> Result<CursorLogin, ProviderError> {
+    let open_path = path.clone();
+    let Some(CursorDatabase {
+        query_file,
+        inspection_file,
+    }) = blocking(move || open_cursor_database(&open_path)).await?
+    else {
+        return Err(ProviderError::CredentialStorage);
+    };
+    let query = "SELECT json_group_array(json_object('key',key,'value',value)) FROM ItemTable WHERE key IN ('cursorAuth/accessToken','cursorAuth/cachedEmail','cursorAuth/stripeMembershipType','cursorAuth/stripeSubscriptionStatus');";
+    let bytes = tokio::time::timeout(
+        CURSOR_SQLITE_TIMEOUT,
+        cursor_sqlite_query(query_file, query),
+    )
+    .await
+    .map_err(|_| ProviderError::Timeout)??;
+    if !blocking(move || cursor_database_remains_safe(&inspection_file, &path)).await? {
+        return Err(ProviderError::CredentialStorage);
+    }
+    cursor_login_from_output(&bytes)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) async fn cursor_login(_: PathBuf) -> Result<CursorLogin, ProviderError> {
+    Err(ProviderError::Unavailable)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn cursor_login_from_output(bytes: &[u8]) -> Result<CursorLogin, ProviderError> {
+    let rows: Vec<Value> = serde_json::from_slice(bytes).map_err(|_| ProviderError::InvalidData)?;
+    let mut values = std::collections::HashMap::new();
+    for row in rows {
+        let key = row
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or(ProviderError::InvalidData)?;
+        let value = match row.get("value").and_then(Value::as_str) {
+            Some(value) => value,
+            None if key != "cursorAuth/accessToken" => continue,
+            None => return Err(ProviderError::InvalidData),
+        };
+        if values.insert(key.to_owned(), value.to_owned()).is_some() {
+            return Err(ProviderError::InvalidData);
+        }
+    }
+    let token = values
+        .remove("cursorAuth/accessToken")
+        .ok_or(ProviderError::Authentication)?;
+    if token.trim().is_empty() || token.len() > 16384 || token.chars().any(char::is_control) {
+        return Err(ProviderError::Authentication);
+    }
+    let mut metadata = |key, max| {
+        values
+            .remove(key)
+            .filter(|v| !v.trim().is_empty() && v.len() <= max && !v.chars().any(char::is_control))
+    };
+    Ok(CursorLogin {
+        token,
+        email: metadata("cursorAuth/cachedEmail", 254),
+        membership: metadata("cursorAuth/stripeMembershipType", 128),
+        subscription_status: metadata("cursorAuth/stripeSubscriptionStatus", 128),
     })
 }
 
@@ -1143,6 +1224,42 @@ mod tests {
             .err(),
             Some(ProviderError::InvalidData)
         );
+    }
+
+    #[test]
+    fn cursor_login_metadata_rejects_duplicates_and_missing_tokens() {
+        let login = cursor_login_from_output(br#"[{"key":"cursorAuth/accessToken","value":"fixture"},{"key":"cursorAuth/cachedEmail","value":"cursor@example.com"},{"key":"cursorAuth/stripeMembershipType","value":"pro_student"},{"key":"cursorAuth/stripeSubscriptionStatus","value":"active"}]"#).unwrap();
+        assert_eq!(login.email.as_deref(), Some("cursor@example.com"));
+        assert_eq!(login.membership.as_deref(), Some("pro_student"));
+        assert_eq!(login.subscription_status.as_deref(), Some("active"));
+        assert!(cursor_login_from_output(br#"[{"key":"cursorAuth/accessToken","value":"one"},{"key":"cursorAuth/accessToken","value":"two"}]"#).is_err());
+        let optional = cursor_login_from_output(br#"[{"key":"cursorAuth/accessToken","value":"fixture"},{"key":"cursorAuth/cachedEmail","value":""},{"key":"cursorAuth/stripeMembershipType","value":null},{"key":"cursorAuth/stripeSubscriptionStatus","value":""}]"#).unwrap();
+        assert!(optional.email.is_none());
+        assert!(optional.membership.is_none());
+        assert!(optional.subscription_status.is_none());
+        assert!(matches!(
+            cursor_login_from_output(b"[]"),
+            Err(ProviderError::Authentication)
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn cursor_login_reads_metadata_without_database_writes() {
+        let dir = std::env::temp_dir().join(crate::accounts::random_string().unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("state with spaces.vscdb");
+        create_cursor_database(&path, "fixture-native");
+        let before = std::fs::read(&path).unwrap();
+        let login = cursor_login(path.clone()).await.unwrap();
+        assert_eq!(login.token, "fixture-native");
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        let link = dir.join("linked.vscdb");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(cursor_login(link).await.is_err());
+        std::fs::write(dir.join("state with spaces.vscdb-wal"), b"fixture").unwrap();
+        assert!(cursor_login(path).await.is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

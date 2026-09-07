@@ -28,7 +28,10 @@ fn scoped(
     if let Credential::CatalogKey { token, settings } = credential {
         let definition = provider
             .catalog()
-            .filter(|d| d.auth == crate::providers::catalog::AuthKind::ApiKey)
+            .filter(|d| {
+                d.auth == crate::providers::catalog::AuthKind::ApiKey
+                    || provider == Provider::Catalog("cursor")
+            })
             .ok_or(AccountError::Unsupported)?;
         keys.insert(definition.key_env.into(), token.clone());
         for (name, value) in settings {
@@ -80,27 +83,34 @@ pub async fn validate(
     provider: Provider,
     credential: &Credential,
 ) -> Result<ProviderUsage, AccountError> {
-    validate_with_amp_endpoint(context, provider, credential, None).await
+    validate_with_endpoint(context, provider, credential, None).await
 }
-async fn validate_with_amp_endpoint(
+async fn validate_with_endpoint(
     context: &ProviderContext,
     provider: Provider,
     credential: &Credential,
-    amp_endpoint: Option<&str>,
+    endpoint_override: Option<&str>,
 ) -> Result<ProviderUsage, AccountError> {
     let reference = credential;
     let resolved = reference.resolve_reference(provider).await?;
     let credentials = resolved
         .as_ref()
         .map_or_else(|| vec![credential.clone()], |r| r.credentials.clone());
-    let usage = validate_credentials(context, provider, &credentials, amp_endpoint).await?;
+    let mut usage =
+        validate_credentials(context, provider, &credentials, endpoint_override).await?;
     if resolved.is_some()
-        && reference
-            .resolve_reference(provider)
-            .await?
-            .is_none_or(|r| r.credentials != credentials)
+        && reference.resolve_reference(provider).await?.as_ref() != resolved.as_ref()
     {
         return Err(AccountError::Busy);
+    }
+    if provider == Provider::Catalog("cursor")
+        && let Some(resolved) = resolved
+    {
+        usage.account.label = resolved.label;
+        if usage.account.plan.is_none() {
+            usage.account.plan = resolved.plan;
+        }
+        usage.account.subscription_status = resolved.subscription_status;
     }
     Ok(usage)
 }
@@ -108,10 +118,10 @@ async fn validate_credentials(
     context: &ProviderContext,
     provider: Provider,
     credentials: &[Credential],
-    amp_endpoint: Option<&str>,
+    endpoint_override: Option<&str>,
 ) -> Result<ProviderUsage, AccountError> {
     if credentials.len() == 1 {
-        return validate_credential(context, provider, &credentials[0], amp_endpoint).await;
+        return validate_credential(context, provider, &credentials[0], endpoint_override).await;
     }
     let budget =
         crate::providers::remaining_fetch_time().unwrap_or(std::time::Duration::from_secs(30));
@@ -128,7 +138,7 @@ async fn validate_credentials(
             key_deadline,
             crate::providers::FETCH_DEADLINE.scope(
                 key_deadline,
-                validate_credential(context, provider, credential, amp_endpoint),
+                validate_credential(context, provider, credential, endpoint_override),
             ),
         )
         .await
@@ -165,14 +175,21 @@ async fn validate_credential(
     context: &ProviderContext,
     provider: Provider,
     credential: &Credential,
-    amp_endpoint: Option<&str>,
+    endpoint_override: Option<&str>,
 ) -> Result<ProviderUsage, AccountError> {
     let ctx = scoped(context, provider, credential)?;
     let usage = match provider {
-        Provider::Amp => match amp_endpoint {
+        Provider::Amp => match endpoint_override {
             Some(endpoint) => AmpApiProvider.fetch_api(&ctx, endpoint).await?,
             None => AmpApiProvider.fetch(&ctx).await?,
         },
+        Provider::Catalog("cursor") if endpoint_override.is_some() => {
+            let endpoint = endpoint_override.unwrap();
+            crate::providers::catalog::oauth_editors::fetch_cursor_complete_at(
+                &ctx, endpoint, endpoint,
+            )
+            .await?
+        }
         Provider::Factory => FactoryProvider.fetch(&ctx).await?,
         Provider::Codex => codex_api::fetch(&ctx, credential).await?,
         provider if provider.key_api().is_some() || provider.catalog().is_some() => {
@@ -422,9 +439,9 @@ pub fn default_label(
         return super::validate_label(label);
     }
     match credential {
-        Credential::QuotioCustomProvider { .. } | Credential::AmpNative { .. } => {
-            Err(AccountError::Input)
-        }
+        Credential::QuotioCustomProvider { .. }
+        | Credential::AmpNative { .. }
+        | Credential::CursorNative { .. } => Err(AccountError::Input),
         Credential::CodexOAuth { email, .. } => super::validate_label(email),
         Credential::ApiKey { token, .. } | Credential::CatalogKey { token, .. } => {
             let suffix =
@@ -596,17 +613,16 @@ impl ProviderAdapter for ManagedProvider {
             let account = account.clone();
             drop(tx);
             let scope = match &account.credential {
-                Credential::QuotioCustomProvider { .. } | Credential::AmpNative { .. } => {
-                    serde_json::to_string(
-                        &account
-                            .credential
-                            .resolve_reference(self.provider)
-                            .await
-                            .ok()??
-                            .credentials,
-                    )
-                    .ok()?
-                }
+                Credential::QuotioCustomProvider { .. }
+                | Credential::AmpNative { .. }
+                | Credential::CursorNative { .. } => serde_json::to_string(
+                    &account
+                        .credential
+                        .resolve_reference(self.provider)
+                        .await
+                        .ok()??,
+                )
+                .ok()?,
                 Credential::CodexOAuth { account_id, .. } => account_id.clone(),
                 credential => serde_json::to_string(credential).ok()?,
             };
@@ -710,6 +726,11 @@ async fn local_sources(requested: &[Provider], timeout: std::time::Duration) -> 
                     .is_some_and(|name| std::env::var_os(name).is_some())
         })
         .collect();
+    if requested.contains(&Provider::Catalog("cursor"))
+        && std::env::var_os("CURSOR_ACCESS_TOKEN").is_some()
+    {
+        sources.push(Provider::Catalog("cursor"));
+    }
     if requested.contains(&Provider::Codex) && executable_available("codex") {
         sources.push(Provider::Codex);
     }
@@ -776,6 +797,16 @@ pub(crate) fn uses_native_amp_source() -> bool {
         std::env::var("AMP_URL").ok().as_deref(),
     )
 }
+fn native_reference_replaces_local(provider: Provider, credential: &Credential) -> bool {
+    match credential {
+        Credential::AmpNative { .. } => provider == Provider::Amp && uses_native_amp_source(),
+        Credential::CursorNative { .. } => {
+            provider == Provider::Catalog("cursor")
+                && std::env::var_os("CURSOR_ACCESS_TOKEN").is_none()
+        }
+        _ => false,
+    }
+}
 fn choose(
     providers: Vec<Provider>,
     filter: Option<&str>,
@@ -807,10 +838,9 @@ fn choose(
                     .collect();
                 if provider != Provider::Factory {
                     if (local_sources.contains(&provider) || matching.is_empty())
-                        && !(uses_native_amp_source()
-                            && matching
-                                .iter()
-                                .any(|a| matches!(a.credential, Credential::AmpNative { .. })))
+                        && !matching
+                            .iter()
+                            .any(|a| native_reference_replaces_local(provider, &a.credential))
                     {
                         selected.push(provider.adapter());
                     }
@@ -848,12 +878,16 @@ pub async fn adapters(
         return Err(AccountError::Unsupported);
     }
     if filter == Some("local") {
-        if saved && providers == [Provider::Amp] && uses_native_amp_source() {
-            let accounts = discover(Vault::for_usage()?, timeout).await?;
-            if accounts
+        if saved
+            && providers
                 .iter()
-                .any(|a| matches!(a.credential, Credential::AmpNative { .. }))
-            {
+                .any(|p| matches!(p, Provider::Amp | Provider::Catalog("cursor")))
+        {
+            let accounts = discover(Vault::for_usage()?, timeout).await?;
+            if accounts.iter().any(|a| {
+                providers.contains(&a.provider)
+                    && native_reference_replaces_local(a.provider, &a.credential)
+            }) {
                 return Err(AccountError::Unsupported);
             }
         }
@@ -1064,8 +1098,7 @@ mod tests {
                 if rotate { std::fs::write(&change_path, br#"{"apiKey@https://ampcode.com/":"native-second-fixture"}"#).unwrap(); }
             }).await;
             let result =
-                validate_with_amp_endpoint(&context, Provider::Amp, &credential, Some(&endpoint))
-                    .await;
+                validate_with_endpoint(&context, Provider::Amp, &credential, Some(&endpoint)).await;
             if rotate {
                 assert!(matches!(result, Err(AccountError::Busy)));
                 assert_ne!(adapter.cache_identity(&context).await.unwrap(), before);
@@ -1083,6 +1116,100 @@ mod tests {
             std::fs::remove_dir_all(dir).unwrap();
         }
     }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn cursor_reference_scopes_requests_and_invalidates_changed_native_login() {
+        for rotate in [false, true] {
+            let dir = std::env::temp_dir().join(random_string().unwrap());
+            std::fs::create_dir(&dir).unwrap();
+            let path = dir.join("state.vscdb");
+            let status = std::process::Command::new("/usr/bin/sqlite3").arg(&path).arg("CREATE TABLE ItemTable (key TEXT, value TEXT); INSERT INTO ItemTable VALUES ('cursorAuth/accessToken','native-first-fixture'),('cursorAuth/cachedEmail','cursor@example.com'),('cursorAuth/stripeMembershipType','pro'),('cursorAuth/stripeSubscriptionStatus','active');").status().unwrap();
+            assert!(status.success());
+            let original = std::fs::read(&path).unwrap();
+            let source = super::super::sources::CursorNativeReference { path: path.clone() };
+            let credential = Credential::CursorNative {
+                source: source.clone(),
+            };
+            assert!(matches!(
+                credential.resolve_reference(Provider::Amp).await,
+                Err(AccountError::Unsupported)
+            ));
+            let vault = Vault::new(Arc::new(Memory::default()), dir.join("lock"));
+            let mut tx = vault.begin().unwrap();
+            let id = tx
+                .document
+                .add(
+                    Provider::Catalog("cursor"),
+                    "Cursor",
+                    source.identity().unwrap(),
+                    credential.clone(),
+                )
+                .unwrap();
+            let account = tx.document.accounts[0].clone();
+            tx.commit().unwrap();
+            let adapter = super::managed(&vault, &account);
+            let context = http::fixture::context();
+            let before = adapter.cache_identity(&context).await.unwrap();
+            let changed_path = path.clone();
+            let payload = serde_json::json!({"membershipType":"pro","isUnlimited":true,"planUsage":{"totalPercentUsed":20}});
+            let (endpoint, server) = http::fixture::server_status_with_action(vec![(200,payload.clone()),(200,payload)], move |_| {
+                if rotate {
+                    assert!(std::process::Command::new("/usr/bin/sqlite3").arg(&changed_path).arg("UPDATE ItemTable SET value='native-second-fixture' WHERE key='cursorAuth/accessToken';").status().unwrap().success());
+                }
+            }).await;
+            let result = validate_with_endpoint(
+                &context,
+                Provider::Catalog("cursor"),
+                &credential,
+                Some(&endpoint),
+            )
+            .await;
+            if rotate {
+                assert!(matches!(result, Err(AccountError::Busy)));
+                assert_ne!(adapter.cache_identity(&context).await.unwrap(), before);
+            } else {
+                let usage = result.unwrap();
+                assert_eq!(usage.account.label, "cursor@example.com");
+                assert_eq!(usage.account.subscription_status.as_deref(), Some("active"));
+                assert_eq!(original, std::fs::read(&path).unwrap());
+                let encoded = serde_json::to_string(&usage).unwrap();
+                assert!(!encoded.contains("native-first-fixture"));
+            }
+            for request in server.await.unwrap() {
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer native-first-fixture")
+                );
+                assert!(
+                    !request
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .contains("native-first-fixture")
+                );
+            }
+            let mut tx = vault.begin().unwrap();
+            tx.document.patch(&id, None, None, Some(false)).unwrap();
+            assert_eq!(
+                tx.document.accounts[0].origin(),
+                super::super::AccountOrigin::BorrowedNative
+            );
+            assert!(
+                !serde_json::to_string(&tx.document)
+                    .unwrap()
+                    .contains("native-first-fixture")
+            );
+            tx.commit().unwrap();
+            assert!(adapter.cache_identity(&context).await.is_none());
+            assert_eq!(
+                adapter.fetch(&context).await.unwrap_err(),
+                ProviderError::SourceDisabled
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn credential_group_keeps_last_success_and_reports_later_key_failure() {
         let (endpoint, server) = http::fixture::server_status(vec![

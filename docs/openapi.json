@@ -1639,6 +1639,10 @@
           },
           "label": {
             "type": "string"
+          },
+          "subscription_status": {
+            "type": "string",
+            "description": "Source-provided subscription status, when available."
           }
         },
         "additionalProperties": false,
@@ -2100,7 +2104,8 @@
                 "kind": {
                   "enum": [
                     "quotio_custom_provider",
-                    "amp_native"
+                    "amp_native",
+                    "cursor_native"
                   ]
                 },
                 "platforms": {
@@ -2705,6 +2710,18 @@
                 "const": "amp_native"
               }
             }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "cursor_native"
+              }
+            },
+            "additionalProperties": false
           }
         ]
       }

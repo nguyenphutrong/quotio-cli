@@ -46,6 +46,8 @@ impl AmpNativeReference {
         .map_err(|_| AccountError::Storage)??
         .ok_or(AccountError::NotFound)?;
         Ok(Resolved {
+            plan: None,
+            subscription_status: None,
             label: "Local Amp account".into(),
             provider: crate::cli::Provider::Amp,
             credentials: vec![Credential::ApiKey {
@@ -56,6 +58,53 @@ impl AmpNativeReference {
         })
     }
 }
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CursorNativeReference {
+    pub path: std::path::PathBuf,
+}
+impl CursorNativeReference {
+    pub fn system() -> Result<Self, AccountError> {
+        #[cfg(target_os = "macos")]
+        {
+            crate::providers::catalog::oauth_editors::cursor_state_database_path()
+                .map(|path| Self { path })
+                .ok_or(AccountError::Unsupported)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(AccountError::Unsupported)
+        }
+    }
+    pub fn identity(&self) -> Result<String, AccountError> {
+        if !self.path.is_absolute() {
+            return Err(AccountError::Input);
+        }
+        Ok(crate::cache::fingerprint(&[
+            "cursor_native",
+            self.path.to_str().ok_or(AccountError::Input)?,
+        ]))
+    }
+    pub async fn resolve(&self) -> Result<Resolved, AccountError> {
+        self.identity()?;
+        let login =
+            crate::providers::catalog::oauth_editors::cursor_login(self.path.clone()).await?;
+        Ok(Resolved {
+            label: login.email.unwrap_or_else(|| "Local Cursor account".into()),
+            plan: login
+                .membership
+                .as_deref()
+                .map(crate::providers::catalog::oauth_editors::cursor_plan_name),
+            subscription_status: login.subscription_status,
+            provider: crate::cli::Provider::Catalog("cursor"),
+            credentials: vec![Credential::CatalogKey {
+                token: login.token,
+                settings: Default::default(),
+            }],
+        })
+    }
+}
+
 impl Credential {
     pub async fn resolve_reference(
         &self,
@@ -77,9 +126,14 @@ impl Credential {
             Self::AmpNative { source } if provider == crate::cli::Provider::Amp => {
                 source.resolve().await.map(Some)
             }
-            Self::QuotioCustomProvider { .. } | Self::AmpNative { .. } => {
-                Err(AccountError::Unsupported)
+            Self::CursorNative { source }
+                if provider == crate::cli::Provider::Catalog("cursor") =>
+            {
+                source.resolve().await.map(Some)
             }
+            Self::QuotioCustomProvider { .. }
+            | Self::AmpNative { .. }
+            | Self::CursorNative { .. } => Err(AccountError::Unsupported),
             _ => Ok(None),
         }
     }
@@ -105,7 +159,10 @@ pub struct CustomProviderReference {
     pub domain: QuotioDomain,
     pub record_id: String,
 }
+#[derive(Clone, Serialize, PartialEq, Eq)]
 pub struct Resolved {
+    pub plan: Option<String>,
+    pub subscription_status: Option<String>,
     pub label: String,
     pub provider: crate::cli::Provider,
     pub credentials: Vec<Credential>,
@@ -216,6 +273,8 @@ impl CustomProviderReference {
             _ => return Err(AccountError::Unsupported),
         };
         Ok(Resolved {
+            plan: None,
+            subscription_status: None,
             label: super::validate_label(&record.name)?,
             provider,
             credentials,
@@ -271,6 +330,19 @@ fn read_preferences(_: QuotioDomain) -> Result<Vec<u8>, AccountError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cursor_source_input_cannot_supply_paths_tokens_or_ownership() {
+        assert!(
+            serde_json::from_str::<crate::accounts::api::SourceInput>(
+                r#"{"kind":"cursor_native"}"#
+            )
+            .is_ok()
+        );
+        for field in ["path", "token", "owned", "source"] {
+            let value = serde_json::json!({"kind":"cursor_native",field:"fixture"});
+            assert!(serde_json::from_value::<crate::accounts::api::SourceInput>(value).is_err());
+        }
+    }
     fn source() -> CustomProviderReference {
         CustomProviderReference {
             domain: QuotioDomain::Production,

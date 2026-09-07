@@ -402,6 +402,7 @@ impl AntigravityProvider {
             account_ref: None,
             provider: self.id(),
             account: AccountIdentity {
+                subscription_status: None,
                 plan: None,
                 id: before.id,
                 label: before.email,

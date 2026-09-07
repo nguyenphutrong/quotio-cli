@@ -284,6 +284,7 @@ mod tests {
                 account_ref: None,
                 provider: crate::domain::ProviderId("mock".into()),
                 account: crate::domain::AccountIdentity {
+                    subscription_status: None,
                     plan: None,
                     id: "demo".into(),
                     label: "Demo".into(),

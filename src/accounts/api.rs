@@ -97,6 +97,7 @@ pub struct PreparedAccount {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceInput {
+    CursorNative {},
     AmpNative {},
     QuotioCustomProvider {
         source: super::sources::CustomProviderReference,
@@ -112,6 +113,15 @@ pub async fn prepare_source(input: SourceInput) -> Result<PreparedAccount, Accou
                 resolved,
             )
         }
+        SourceInput::CursorNative {} => {
+            let source = super::sources::CursorNativeReference::system()?;
+            let resolved = source.resolve().await?;
+            (
+                source.identity()?,
+                Credential::CursorNative { source },
+                resolved,
+            )
+        }
         SourceInput::AmpNative {} => {
             let source = super::sources::AmpNativeReference::system()?;
             let resolved = source.resolve().await?;
@@ -123,9 +133,16 @@ pub async fn prepare_source(input: SourceInput) -> Result<PreparedAccount, Accou
         }
     };
     let provider = resolved.provider;
+    let label = if provider == Provider::Catalog("cursor")
+        && super::validate_label(&resolved.label).is_err()
+    {
+        "Local Cursor account".into()
+    } else {
+        resolved.label
+    };
     Ok(PreparedAccount {
         provider,
-        label: resolved.label,
+        label,
         identity,
         credential,
     })

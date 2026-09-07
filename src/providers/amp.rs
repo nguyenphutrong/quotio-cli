@@ -345,6 +345,7 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
         account_ref: None,
         provider: ProviderId("amp".into()),
         account: AccountIdentity {
+            subscription_status: None,
             plan,
             id: email.into(),
             label: email.into(),

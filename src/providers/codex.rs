@@ -160,6 +160,7 @@ fn parse(
         account_ref: None,
         provider: ProviderId("codex".into()),
         account: AccountIdentity {
+            subscription_status: None,
             plan: account.plan_type,
             id: email.clone(),
             label: email,

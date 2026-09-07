@@ -154,7 +154,7 @@ impl Provider {
         }
     }
     pub fn supports_accounts(self) -> bool {
-        self == Self::Codex || self.api_key_name().is_some()
+        matches!(self, Self::Codex | Self::Catalog("cursor")) || self.api_key_name().is_some()
     }
 
     pub fn description(self) -> &'static str {

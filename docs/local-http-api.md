@@ -428,3 +428,25 @@ explicitly supplied by the summary. A malformed metric or failed endpoint adds a
 scoped diagnostic without deleting valid sibling data; endpoint deadlines leave
 time to return partial results within the collector budget. Native-source account
 registration and local email/subscription-status metadata are still pending.
+
+### Cursor native source
+
+Managed servers accept `POST /v1/account-sources` with
+`{"kind":"cursor_native"}` and an `Idempotency-Key`. On macOS, the backend resolves
+Cursor's standard state database and saves an opaque borrowed-native reference.
+The request cannot supply a path, token or ownership flag. Registration reads the
+local login only and does not validate it against a remote endpoint or trigger OAuth.
+
+Account-ID refresh resolves the token on the node, carries available email, plan
+and `account.subscription_status`, and rechecks the source after HTTP. Changes to
+token or metadata invalidate the shared cache identity. Source metadata may be
+missing without suppressing usable quota. A rejected token requires the native
+owner to log in; the backend never refreshes or writes Cursor's login. A disabled
+reference blocks the equivalent native `local` alias; an explicit environment
+token remains an independent legacy source.
+
+The reader uses bounded, read-only SQLite descriptor queries. Symlinks and unsafe
+database files are rejected. The existing reader currently rejects WAL/SHM
+databases instead of ignoring their pending writes; this remains a native Cursor
+compatibility gap requiring separate validation. Native source registration is
+macOS-only; Linux retains explicit-token usage and encrypted account storage.

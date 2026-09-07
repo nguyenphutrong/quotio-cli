@@ -114,6 +114,7 @@ pub fn account_identity(id: &str, key: &Secret, scope: &str) -> AccountIdentity 
         .map(|b| format!("{b:02x}"))
         .collect();
     AccountIdentity {
+        subscription_status: None,
         id: format!("key:{fingerprint}"),
         label: format!("{id} API key"),
         plan: None,

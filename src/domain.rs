@@ -8,6 +8,8 @@ pub struct ProviderId(pub String);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AccountIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
     pub id: String,
