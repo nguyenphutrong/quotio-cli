@@ -50,9 +50,35 @@ fn window(
     now: OffsetDateTime,
     reset_description: Option<String>,
 ) -> QuotaWindow {
+    let metric_id = match label {
+        "Amp Free daily" => "amp-free".into(),
+        "Megawatt agent subscription" => "amp-agent-usage".into(),
+        "Megawatt orb subscription" => "amp-orb-usage".into(),
+        "Individual credits" => "amp-individual-credits".into(),
+        _ => {
+            let name = label
+                .strip_prefix("Workspace ")
+                .and_then(|v| v.strip_suffix(" credits"))
+                .unwrap_or(label);
+            let digest =
+                ring::digest::digest(&ring::digest::SHA256, name.trim().to_lowercase().as_bytes());
+            format!(
+                "amp-workspace-{}",
+                digest.as_ref()[..8]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            )
+        }
+    };
     QuotaWindow {
-        metric_id: None,
-        consumption: None,
+        metric_id: Some(metric_id),
+        consumption: amounts.as_ref().and_then(|a| {
+            a.limit.map(|limit| Consumption {
+                used: limit - a.remaining,
+                unit: a.unit.clone(),
+            })
+        }),
         reset_description,
         label: label.into(),
         provenance: Provenance {
@@ -151,29 +177,108 @@ fn quota(amounts: &QuotaAmounts) -> Quota {
     )
 }
 pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, ProviderError> {
+    let mut clean = String::new();
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            clean.push(c);
+        }
+    }
+    let input = clean.as_str();
     let identity = input
         .lines()
-        .find_map(|line| line.strip_prefix("Signed in as "))
+        .find_map(|line| line.trim().strip_prefix("Signed in as "))
         .ok_or(ProviderError::Authentication)?;
     let email = identity
         .split(" (")
         .next()
         .filter(|s| s.contains('@') && !s.contains(char::is_whitespace))
         .ok_or(ProviderError::InvalidData)?;
+    let mut plan = identity
+        .split_once(" (")
+        .and_then(|(_, rest)| rest.strip_suffix(')'))
+        .map(str::to_owned);
     let mut windows = Vec::new();
     for raw_line in input.lines() {
         let normalized = raw_line.replace("**", "");
         let line = normalized.trim();
         if let Some(rest) = line.strip_prefix("Amp Free: ") {
-            windows.push(window(
-                "Amp Free daily",
-                Quota::from_remaining(Some(percent(rest)?)),
-                None,
-                now,
-                reset_description(rest),
-            ));
-        } else if let Some(rest) = line.strip_prefix("Amp Megawatt Subscription: agent usage ") {
+            let (quota, amounts, reset) = if let Some((remaining, rest)) = rest.split_once(" / ") {
+                let limit = rest
+                    .split_whitespace()
+                    .next()
+                    .ok_or(ProviderError::InvalidData)?;
+                let amounts = QuotaAmounts {
+                    remaining: number(remaining.trim_start_matches('$'))?,
+                    limit: Some(number(limit.trim_start_matches('$'))?),
+                    unit: "USD".into(),
+                };
+                if amounts
+                    .limit
+                    .is_none_or(|l| l <= 0.0 || amounts.remaining > l)
+                {
+                    return Err(ProviderError::InvalidData);
+                }
+                let reset = rest
+                    .split_once("(replenishes +")
+                    .and_then(|(_, r)| r.split_once("/hour)"))
+                    .and_then(|(rate, _)| number(rate.trim_start_matches('$')).ok())
+                    .map(|rate| format!("replenishes +${rate}/hour"));
+                (quota(&amounts), Some(amounts), reset)
+            } else {
+                (
+                    Quota::from_remaining(Some(percent(rest)?)),
+                    None,
+                    reset_description(rest),
+                )
+            };
+            windows.push(window("Amp Free daily", quota, amounts, now, reset));
+        } else if let Some((name, rest)) = line
+            .strip_prefix("Amp ")
+            .and_then(|s| s.split_once(" Subscription: "))
+        {
+            if name.trim().is_empty() {
+                return Err(ProviderError::InvalidData);
+            }
+            plan = Some(name.trim().into());
+            if !rest.starts_with("agent usage ") {
+                let (agent, orb) = rest.split_once(" and ").ok_or(ProviderError::InvalidData)?;
+                if !(agent.contains("% other usage") || agent.contains("% agent usage"))
+                    || !orb.contains("% orb usage remaining")
+                {
+                    return Err(ProviderError::InvalidData);
+                }
+                windows.push(window(
+                    "Megawatt agent subscription",
+                    Quota::from_remaining(Some(percent(agent)?)),
+                    None,
+                    now,
+                    reset_description(rest),
+                ));
+                windows.push(window(
+                    "Megawatt orb subscription",
+                    Quota::from_remaining(Some(percent(orb)?)),
+                    None,
+                    now,
+                    reset_description(rest),
+                ));
+                continue;
+            }
+            let rest = rest.strip_prefix("agent usage ").unwrap();
             let amounts = dollars(rest)?;
+            if amounts
+                .limit
+                .is_none_or(|l| l <= 0.0 || amounts.remaining > l)
+            {
+                return Err(ProviderError::InvalidData);
+            }
             windows.push(window(
                 "Megawatt agent subscription",
                 quota(&amounts),
@@ -183,6 +288,12 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
             ));
             if let Some((_, rest)) = rest.split_once(", orb usage ") {
                 let amounts = balance(rest, "h")?;
+                if amounts
+                    .limit
+                    .is_none_or(|l| l <= 0.0 || amounts.remaining > l)
+                {
+                    return Err(ProviderError::InvalidData);
+                }
                 windows.push(window(
                     "Megawatt orb subscription",
                     quota(&amounts),
@@ -219,12 +330,21 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
     if windows.is_empty() {
         return Err(ProviderError::InvalidData);
     }
+    if let Some(plan) = &plan {
+        for window in &mut windows {
+            match window.metric_id.as_deref() {
+                Some("amp-agent-usage") => window.label = format!("{plan} agent subscription"),
+                Some("amp-orb-usage") => window.label = format!("{plan} orb subscription"),
+                _ => {}
+            }
+        }
+    }
     Ok(ProviderUsage {
         diagnostics: vec![],
         account_ref: None,
         provider: ProviderId("amp".into()),
         account: AccountIdentity {
-            plan: None,
+            plan,
             id: email.into(),
             label: email.into(),
         },
@@ -322,17 +442,23 @@ fn local_key(path: &Path) -> Result<Option<String>, ProviderError> {
     }
     let value: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| ProviderError::InvalidData)?;
-    let key = value
-        .get("apiKey@https://ampcode.com/")
-        .or_else(|| value.get("apiKey@https://ampcode.com"));
-    match key {
-        None => Ok(None),
-        Some(value) => value
-            .as_str()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
-            .map(|s| Some(s.to_owned()))
-            .ok_or(ProviderError::Authentication),
+    let mut present = false;
+    for name in ["apiKey@https://ampcode.com/", "apiKey@https://ampcode.com"] {
+        if let Some(value) = value.get(name) {
+            present = true;
+            if let Some(token) = value
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && s.len() <= 16_384 && !s.chars().any(char::is_control))
+            {
+                return Ok(Some(token.into()));
+            }
+        }
+    }
+    if present {
+        Err(ProviderError::Authentication)
+    } else {
+        Ok(None)
     }
 }
 impl AmpProvider {
@@ -404,6 +530,73 @@ impl ProviderAdapter for AmpProvider {
 mod tests {
     use super::*;
     const FIXTURE: &str = "Signed in as demo@example.com (demo)\n**Amp Free:** 75% remaining today (resets daily) - https://ampcode.com/settings#amp-free\n**Amp Megawatt Subscription:** agent usage $12 of $20 remaining (60%), orb usage 500.5h of 750h a1.small orb hours remaining (67%) - period 2026-08-19 to 2026-09-19, resets upon renewal in 13 days\n**Individual credits:** $10.25 remaining (set up auto-reload to avoid running out) - https://ampcode.com/settings\n**Workspace Example:** $0 remaining - https://ampcode.com/workspaces/example\n";
+    #[test]
+    fn swift_amount_free_and_named_subscription_keep_ids_consumption_and_reset_description() {
+        let text = "\x1b[32mSigned in as demo@example.com (Pro)\x1b[0m\nAmp Free: $2.50 / $10.00 remaining (replenishes +$0.50/hour)\nAmp Kilowatt Subscription: 60% agent usage and 25% orb usage remaining - resets upon renewal in 2 days\nIndividual credits: $0 remaining\nWorkspace Example: $12.50 remaining";
+        let usage = parse(text, OffsetDateTime::UNIX_EPOCH).unwrap();
+        assert_eq!(usage.account.plan.as_deref(), Some("Kilowatt"));
+        assert_eq!(
+            usage
+                .windows
+                .iter()
+                .map(|w| w.metric_id.as_deref().unwrap())
+                .collect::<Vec<_>>()[..4],
+            [
+                "amp-free",
+                "amp-agent-usage",
+                "amp-orb-usage",
+                "amp-individual-credits"
+            ]
+        );
+        assert_eq!(usage.windows[0].consumption.as_ref().unwrap().used, 7.5);
+        assert_eq!(usage.windows[0].quota, Quota::from_remaining(Some(25.0)));
+        assert_eq!(usage.windows[1].label, "Kilowatt agent subscription");
+        assert_eq!(usage.windows[2].quota, Quota::from_remaining(Some(25.0)));
+        assert!(usage.windows.iter().all(|w| w.resets_at.is_none()));
+        assert_eq!(
+            usage.windows[0].reset_description.as_deref(),
+            Some("replenishes +$0.5/hour")
+        );
+        assert_eq!(
+            usage.windows[1].reset_description.as_deref(),
+            Some("upon renewal in 2 days")
+        );
+        assert_eq!(usage.windows[3].quota, Quota::Unknown);
+        let alternate = parse(
+            &text.replace("Workspace Example:", "Workspace EXAMPLE:"),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        assert_eq!(usage.windows[4].metric_id, alternate.windows[4].metric_id);
+    }
+    #[test]
+    fn rejects_inconsistent_amounts_instead_of_clamping_to_available() {
+        for text in [
+            "Amp Free: $11 / $10 remaining",
+            "Amp Free: $0 / $0 remaining",
+            "Amp Kilowatt Subscription: agent usage $21 of $20 remaining (100%), orb usage 1h of 2h remaining",
+        ] {
+            assert!(
+                parse(
+                    &format!("Signed in as demo@example.com\n{text}"),
+                    OffsetDateTime::UNIX_EPOCH
+                )
+                .is_err()
+            );
+        }
+    }
+    #[test]
+    fn empty_slash_key_can_use_the_native_non_slash_alias_without_writes() {
+        let dir = std::env::temp_dir().join(crate::accounts::random_string().unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("secrets.json");
+        let bytes =
+            br#"{"apiKey@https://ampcode.com/":" ","apiKey@https://ampcode.com":"fixture-key"}"#;
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(local_key(&path).unwrap().as_deref(), Some("fixture-key"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn local_discovery_requires_a_public_host_key() {
         let path =

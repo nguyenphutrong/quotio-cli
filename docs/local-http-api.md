@@ -330,3 +330,19 @@ with a scoped diagnostic. A malformed reset drops only that reset timestamp;
 valid percentages and other windows remain available. An absent reset stays
 absent, and a past source timestamp is retained. This does not add upstream proxy
 support or enable the Swift production backend.
+
+## Amp presentation parity
+
+Amp normalization supports Free percentages or dollar balances, named subscription
+agent/orb percentages or amounts, individual credits and workspace balances. It
+returns plan metadata, stable `amp-free`, `amp-agent-usage`, `amp-orb-usage`,
+`amp-individual-credits` and hashed workspace metric IDs. Amount windows include
+consumption when their limit is known. Credits without a limit retain unknown
+percentage, including a zero balance.
+
+Daily, renewal, billing-period and replenishment information remains a reset
+description. No exact reset timestamp is inferred from that text. Native public-host
+key aliases follow the Swift selection order without modifying the file. Amp native
+source registration and full frontend composition still require implementation;
+this parser work does not activate Swift production or establish live-provider
+acceptance.
