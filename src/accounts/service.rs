@@ -149,7 +149,7 @@ async fn begin_with_timeout(
     .await
     .map_err(|_| AccountError::Busy)?
 }
-async fn refresh_lock(vault: Vault, id: String) -> Result<std::fs::File, AccountError> {
+async fn refresh_lock(vault: Vault, id: String) -> Result<super::vault::VaultLock, AccountError> {
     loop {
         let copy = vault.clone();
         let account = id.clone();

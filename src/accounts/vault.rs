@@ -81,6 +81,22 @@ impl Backend for Keychain {
         }
     }
 }
+pub struct VaultLock {
+    file: File,
+}
+impl Drop for VaultLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // Close-on-exec does not release a lock held by a descriptor copied
+            // during process creation until exec completes. End our lock scope now.
+            unsafe {
+                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
 #[derive(Clone)]
 pub struct Vault {
     backend: Arc<dyn Backend>,
@@ -88,7 +104,7 @@ pub struct Vault {
 }
 pub struct Transaction {
     backend: Arc<dyn Backend>,
-    _lock: File,
+    _lock: VaultLock,
     pub document: Document,
 }
 impl Vault {
@@ -120,7 +136,7 @@ impl Vault {
     pub fn new(backend: Arc<dyn Backend>, lock_path: PathBuf) -> Self {
         Self { backend, lock_path }
     }
-    pub fn refresh_lock(&self, id: &str) -> Result<File, AccountError> {
+    pub fn refresh_lock(&self, id: &str) -> Result<VaultLock, AccountError> {
         if id.is_empty()
             || id.len() > 80
             || !id
@@ -161,7 +177,7 @@ impl Vault {
         })
     }
 }
-fn acquire(path: &std::path::Path) -> Result<File, AccountError> {
+fn acquire(path: &std::path::Path) -> Result<VaultLock, AccountError> {
     let parent = path.parent().ok_or(AccountError::Storage)?;
     std::fs::create_dir_all(parent).map_err(|_| AccountError::Storage)?;
     let mut options = OpenOptions::new();
@@ -193,7 +209,7 @@ fn acquire(path: &std::path::Path) -> Result<File, AccountError> {
     {
         return Err(AccountError::Unsupported);
     }
-    Ok(lock)
+    Ok(VaultLock { file: lock })
 }
 impl Transaction {
     pub fn commit(self) -> Result<(), AccountError> {
@@ -238,6 +254,18 @@ pub(crate) mod tests {
             region: None,
             organization: None,
         }
+    }
+    #[test]
+    fn lock_scope_ends_even_when_a_descriptor_is_duplicated() {
+        let dir = std::env::temp_dir().join(random_string().unwrap());
+        let path = dir.join("lock");
+        let guard = acquire(&path).unwrap();
+        let duplicate = guard.file.try_clone().unwrap();
+        drop(guard);
+        let next = acquire(&path).unwrap();
+        drop(next);
+        drop(duplicate);
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn transactions_select_remove_and_rollback() {
