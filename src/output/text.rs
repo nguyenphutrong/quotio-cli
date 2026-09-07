@@ -49,6 +49,8 @@ pub fn render(report: &UsageReport) -> String {
                         safe(&amounts.unit)
                     )
                 }
+                Quota::Disabled => "disabled".into(),
+                Quota::Limit { amount, ref unit } => format!("limit {amount:.2} {}", safe(unit)),
                 Quota::Unlimited => window.consumption.as_ref().map_or_else(
                     || "unlimited".into(),
                     |amount| format!("unlimited; used {:.2} {}", amount.used, safe(&amount.unit)),

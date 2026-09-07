@@ -19,6 +19,11 @@ pub struct AccountIdentity {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Quota {
+    Disabled,
+    Limit {
+        amount: f64,
+        unit: String,
+    },
     Unlimited,
     Unknown,
     Available {
@@ -52,7 +57,14 @@ impl Quota {
     }
     pub fn is_valid(&self) -> bool {
         match *self {
-            Self::Unknown | Self::Unlimited => true,
+            Self::Unknown | Self::Unlimited | Self::Disabled => true,
+            Self::Limit { amount, ref unit } => {
+                amount.is_finite()
+                    && amount > 0.0
+                    && !unit.trim().is_empty()
+                    && unit.len() <= 32
+                    && !unit.chars().any(char::is_control)
+            }
             Self::Available {
                 used_percent,
                 remaining_percent,

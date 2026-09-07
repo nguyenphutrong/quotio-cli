@@ -25,6 +25,7 @@ use tokio::{
 const CURSOR_USAGE_URL: &str =
     "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage";
 const CURSOR_SUMMARY_URL: &str = "https://api2.cursor.sh/auth/usage-summary";
+const GROK_SETTINGS_URL: &str = "https://cli-chat-proxy.grok.com/v1/settings";
 const GROK_CREDITS_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const KIMI_CODE_USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
 const CURSOR_KEYCHAIN_SERVICE: &str = "cursor-access-token";
@@ -72,7 +73,9 @@ fn cursor(context: &ProviderContext) -> FetchFuture<'_> {
 }
 
 fn grok(context: &ProviderContext) -> FetchFuture<'_> {
-    Box::pin(async move { fetch_grok_at(context, GROK_CREDITS_URL).await })
+    Box::pin(async move {
+        fetch_grok_complete_at(context, GROK_CREDITS_URL, Some(GROK_SETTINGS_URL)).await
+    })
 }
 
 fn kimi(context: &ProviderContext) -> FetchFuture<'_> {
@@ -283,32 +286,71 @@ fn cursor_summary(
     })
 }
 
+#[cfg(test)]
 async fn fetch_grok_at(
     context: &ProviderContext,
     endpoint: &str,
 ) -> Result<ProviderUsage, ProviderError> {
+    fetch_grok_complete_at(context, endpoint, None).await
+}
+
+async fn fetch_grok_complete_at(
+    context: &ProviderContext,
+    endpoint: &str,
+    settings_endpoint: Option<&str>,
+) -> Result<ProviderUsage, ProviderError> {
     let key = grok_token(context).await?;
     let now = context.clock.now();
-    let root: Value = common::json(
-        context
-            .http
-            .get(endpoint)
-            .header(
-                "Authorization",
-                http::sensitive(&format!("Bearer {}", key.0))?,
-            )
-            .header("x-xai-token-auth", "xai-grok-cli")
-            .header("Accept", "application/json"),
-        now,
-    )
-    .await?;
-    token_usage(
-        "grok",
-        &key,
-        "cli-oauth",
-        "Grok OAuth token",
-        grok_windows(&root, now)?,
-    )
+    let authorization = http::sensitive(&format!("Bearer {}", key.0))?;
+    let get = |url: &str| {
+        common::json::<Value>(
+            context
+                .http
+                .get(url)
+                .header("Authorization", authorization.clone())
+                .header("x-xai-token-auth", "xai-grok-cli")
+                .header("Accept", "application/json"),
+            now,
+        )
+    };
+    let settings = async {
+        let Some(endpoint) = settings_endpoint else {
+            return Ok(None);
+        };
+        let root = get(endpoint).await?;
+        let plan = root
+            .get("subscription_tier_display")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.len() <= 128 && !s.chars().any(char::is_control))
+            .ok_or(ProviderError::InvalidData)?;
+        Ok::<_, ProviderError>(Some(plan.to_owned()))
+    };
+    let budget = crate::providers::remaining_fetch_time()
+        .unwrap_or(Duration::from_secs(15))
+        .mul_f64(0.9);
+    let (billing, settings) = tokio::join!(
+        tokio::time::timeout(budget, get(endpoint)),
+        tokio::time::timeout(budget.min(Duration::from_secs(5)), settings),
+    );
+    let root = billing.map_err(|_| ProviderError::Timeout)??;
+    let (windows, mut diagnostics) = grok_windows(&root, now)?;
+    let mut account = common::account_identity("grok", &key, "cli-oauth");
+    account.label = "Grok OAuth token".into();
+    match settings.unwrap_or(Err(ProviderError::Timeout)) {
+        Ok(plan) => account.plan = plan,
+        Err(code) => diagnostics.push(UsageDiagnostic {
+            source: "grok_settings".into(),
+            code,
+        }),
+    }
+    Ok(ProviderUsage {
+        provider: crate::domain::ProviderId("grok".into()),
+        account,
+        account_ref: None,
+        windows,
+        diagnostics,
+    })
 }
 
 async fn fetch_kimi_at(
@@ -397,44 +439,84 @@ fn cursor_windows(root: &Value, now: OffsetDateTime) -> Result<Vec<QuotaWindow>,
     Ok(windows)
 }
 
-fn grok_windows(root: &Value, now: OffsetDateTime) -> Result<Vec<QuotaWindow>, ProviderError> {
+fn grok_windows(
+    root: &Value,
+    now: OffsetDateTime,
+) -> Result<(Vec<QuotaWindow>, Vec<UsageDiagnostic>), ProviderError> {
     let config = root
         .get("config")
-        .filter(|value| value.is_object())
+        .filter(|v| v.is_object())
         .ok_or(ProviderError::InvalidData)?;
-    // Proto JSON may omit zero-valued fields. Without a provider contract that
-    // distinguishes omitted zero from withheld quota, keep this unknown rather
-    // than manufacturing a 0% subscription reading.
-    let used = percentage(config.get("creditUsagePercent"))?.ok_or(ProviderError::InvalidData)?;
-    let period = config
-        .get("currentPeriod")
-        .filter(|value| value.is_object());
-    let label = match period
-        .and_then(|period| period.get("type"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-    {
-        Some("USAGE_PERIOD_TYPE_WEEKLY") => "Weekly",
-        Some("USAGE_PERIOD_TYPE_MONTHLY") => "Monthly",
-        _ => "Credits",
+    let period = config.get("currentPeriod").filter(|v| v.is_object());
+    let (id, label) = match period.and_then(|p| p.get("type")).and_then(Value::as_str) {
+        Some("USAGE_PERIOD_TYPE_WEEKLY") => ("grok-weekly", "Weekly"),
+        Some("USAGE_PERIOD_TYPE_MONTHLY") => ("grok-monthly", "Monthly"),
+        _ => ("grok-credits", "Credits"),
     };
-    let reset = period
-        .and_then(|period| period.get("end"))
-        .or_else(|| config.get("billingPeriodEnd"));
-    let reset = common::date(reset)?;
-    if reset.is_some_and(|reset| reset <= now) {
-        return Err(ProviderError::InvalidData);
-    }
-    Ok(vec![common::window(
+    let mut diagnostics = Vec::new();
+    let mut windows = Vec::new();
+    let mut parse = |result: Result<Option<f64>, ProviderError>, source: &str| match result {
+        Ok(value) => value,
+        Err(code) => {
+            diagnostics.push(UsageDiagnostic {
+                source: source.into(),
+                code,
+            });
+            None
+        }
+    };
+    let used = parse(percentage(config.get("creditUsagePercent")), "grok_credits");
+    let cap = parse(
+        common::number(config.get("onDemandCap").and_then(|v| v.get("val"))),
+        "grok_extra_usage",
+    );
+    let reset = match common::date(
+        period
+            .and_then(|p| p.get("end"))
+            .or_else(|| config.get("billingPeriodEnd")),
+    ) {
+        Ok(reset) => reset,
+        Err(code) => {
+            diagnostics.push(UsageDiagnostic {
+                source: "grok_billing_period".into(),
+                code,
+            });
+            None
+        }
+    };
+    let mut window = common::window(
         label,
-        Some(used),
+        used,
         Some(100.0),
         None,
         "percent",
         reset,
         "grok_cli_oauth",
         now,
-    )?])
+    )?;
+    window.metric_id = Some(id.into());
+    windows.push(window);
+    let mut extra = common::window(
+        "Extra usage",
+        None,
+        None,
+        None,
+        "units",
+        None,
+        "grok_cli_oauth",
+        now,
+    )?;
+    extra.metric_id = Some("grok-extra-usage".into());
+    extra.quota = match cap {
+        Some(0.0) => Quota::Disabled,
+        Some(amount) => Quota::Limit {
+            amount,
+            unit: "units".into(),
+        },
+        None => Quota::Unknown,
+    };
+    windows.push(extra);
+    Ok((windows, diagnostics))
 }
 
 fn kimi_windows(root: &Value, now: OffsetDateTime) -> Result<Vec<QuotaWindow>, ProviderError> {
@@ -1349,6 +1431,111 @@ mod tests {
     }
 
     #[test]
+    fn grok_preserves_caps_unknown_and_partial_billing_fields() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        for cap in [None, Some(0.0), Some(2500.0)] {
+            let mut config = json!({"creditUsagePercent":25,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"1970-01-01T00:00:00Z"}});
+            if let Some(cap) = cap {
+                config["onDemandCap"] = json!({"val":cap});
+            }
+            let (windows, diagnostics) = grok_windows(&json!({"config":config}), now).unwrap();
+            assert_eq!(windows[0].metric_id.as_deref(), Some("grok-weekly"));
+            assert_eq!(windows[0].quota, Quota::from_remaining(Some(75.0)));
+            assert_eq!(windows[0].resets_at, Some(now));
+            assert!(windows[1].resets_at.is_none());
+            assert_eq!(
+                windows[1].quota,
+                match cap {
+                    None => Quota::Unknown,
+                    Some(0.0) => Quota::Disabled,
+                    Some(amount) => Quota::Limit {
+                        amount,
+                        unit: "units".into()
+                    },
+                }
+            );
+            assert!(diagnostics.is_empty());
+        }
+        let (windows, diagnostics) = grok_windows(
+            &json!({"config":{"creditUsagePercent":"invalid","onDemandCap":{"val":2500}}}),
+            now,
+        )
+        .unwrap();
+        assert_eq!(windows[0].quota, Quota::Unknown);
+        assert!(matches!(
+            windows[1].quota,
+            Quota::Limit { amount: 2500.0, .. }
+        ));
+        assert_eq!(diagnostics[0].source, "grok_credits");
+        let (windows, diagnostics) = grok_windows(
+            &json!({"config":{"creditUsagePercent":0,"onDemandCap":{"val":-1}}}),
+            now,
+        )
+        .unwrap();
+        assert_eq!(windows[0].quota, Quota::from_used(Some(0.0)));
+        assert_eq!(windows[1].quota, Quota::Unknown);
+        assert_eq!(diagnostics[0].source, "grok_extra_usage");
+        assert!(
+            !Quota::Limit {
+                amount: f64::NAN,
+                unit: "units".into()
+            }
+            .is_valid()
+        );
+        assert!(
+            !Quota::Limit {
+                amount: 0.0,
+                unit: "units".into()
+            }
+            .is_valid()
+        );
+    }
+
+    #[tokio::test]
+    async fn grok_settings_failures_do_not_remove_billing_quota() {
+        for status in [200, 500] {
+            let (billing, billing_server) = fixture::server(vec![
+                json!({"config":{"creditUsagePercent":25,"onDemandCap":{"val":2500}}}),
+            ])
+            .await;
+            let (settings, settings_server) = fixture::server_status(vec![(
+                status,
+                json!({"subscription_tier_display":"SuperGrok"}),
+            )])
+            .await;
+            let usage = fetch_grok_complete_at(&context(), &billing, Some(&settings))
+                .await
+                .unwrap();
+            assert_eq!(
+                usage.account.plan.as_deref(),
+                if status == 200 {
+                    Some("SuperGrok")
+                } else {
+                    None
+                }
+            );
+            assert_eq!(usage.diagnostics.len(), usize::from(status != 200));
+            assert!(matches!(
+                usage.windows[1].quota,
+                Quota::Limit { amount: 2500.0, .. }
+            ));
+            assert!(
+                !serde_json::to_string(&usage)
+                    .unwrap()
+                    .contains("grok-native-token")
+            );
+            let request = settings_server.await.unwrap().pop().unwrap();
+            assert!(request.starts_with("GET / HTTP/1.1"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("x-xai-token-auth: xai-grok-cli")
+            );
+            billing_server.await.unwrap();
+        }
+    }
+
+    #[test]
     fn grok_native_auth_requires_one_fresh_oidc_entry() {
         let token = json!({
             "https://auth.x.ai::fixture-client": {
@@ -1387,14 +1574,9 @@ mod tests {
 
     #[test]
     fn grok_does_not_make_missing_percent_zero() {
-        assert_eq!(
-            grok_windows(
-                &json!({"config": {"currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY"}}}),
-                OffsetDateTime::UNIX_EPOCH
-            )
-            .err(),
-            Some(ProviderError::InvalidData)
-        );
+        let (windows, _) = grok_windows(&json!({"config":{}}), OffsetDateTime::UNIX_EPOCH).unwrap();
+        assert_eq!(windows[0].quota, Quota::Unknown);
+        assert_eq!(windows[1].quota, Quota::Unknown);
     }
 
     #[tokio::test]

@@ -450,3 +450,18 @@ database files are rejected. The existing reader currently rejects WAL/SHM
 databases instead of ignoring their pending writes; this remains a native Cursor
 compatibility gap requiring separate validation. Native source registration is
 macOS-only; Linux retains explicit-token usage and encrypted account storage.
+
+### Grok plan and extra usage
+
+Grok usage reads billing and settings with the same token snapshot. The settings
+response supplies the subscription display name; errors remain scoped diagnostics
+and do not discard billing data. Weekly/monthly credit metrics have stable IDs,
+and reset timestamps are kept exactly as supplied, including elapsed periods.
+Missing percentages remain unknown.
+
+`grok-extra-usage` reports a supplied zero cap as `quota.state: disabled`, a positive
+cap as `quota.state: limit` with `amount` and unscaled `unit: units`, and a missing
+cap as unknown. This is a configured spending limit, not remaining credit. No
+balance, reset or usage amount is invented. Malformed sibling fields retain valid
+quota with diagnostics. Multi-account native source registration and owned OAuth
+refresh remain pending; this change does not refresh or write native Grok files.

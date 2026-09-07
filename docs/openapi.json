@@ -1740,6 +1740,41 @@
                 "const": "unlimited"
               }
             }
+          },
+          {
+            "type": "object",
+            "required": [
+              "state"
+            ],
+            "properties": {
+              "state": {
+                "const": "disabled"
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "state",
+              "amount",
+              "unit"
+            ],
+            "properties": {
+              "state": {
+                "const": "limit"
+              },
+              "amount": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "unit": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32
+              }
+            },
+            "additionalProperties": false
           }
         ]
       },
