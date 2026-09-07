@@ -153,7 +153,7 @@ pub fn capability(provider: Provider) -> ProviderCapability {
         } else {
             vec![]
         },
-        source_references: if provider == Provider::Catalog("clinepass") {
+        source_references: if matches!(provider, Provider::Catalog("clinepass") | Provider::Zai) {
             vec![SourceCapability {
                 kind: "quotio_custom_provider",
                 platforms: vec!["macos"],

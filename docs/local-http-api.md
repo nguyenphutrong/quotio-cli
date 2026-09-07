@@ -377,3 +377,16 @@ A subscription failure is a scoped diagnostic and does not discard valid quota.
 Known quota periods expose the existing Swift metric IDs. TIME_LIMIT uses its
 reported counters; a zero limit remains unknown rather than invented exhaustion.
 The quota endpoint's business error code is validated before accepting its data.
+
+## Z.ai custom-provider source
+
+The `quotio_custom_provider` source also accepts an enabled `glm-api-key` record.
+Only HTTPS api.z.ai on its standard port is accepted for these Swift-derived
+references. Configured custom origins and the China origin are unsupported for
+this source; the existing independent CLI region option is unchanged.
+
+Keys stay in the owner's configuration. Backend refresh tries them in configuration
+order and retains the last valid quota, while preserving failed-key diagnostics.
+Changing the key list invalidates its cache identity. Per-key work shares the
+Collector deadline, so a later key timeout does not erase an earlier successful
+result. Optional subscription metadata uses part of that same budget.

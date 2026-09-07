@@ -90,7 +90,83 @@ async fn validate_with_amp_endpoint(
 ) -> Result<ProviderUsage, AccountError> {
     let reference = credential;
     let resolved = reference.resolve_reference(provider).await?;
-    let credential = resolved.as_ref().map_or(credential, |r| &r.credential);
+    let credentials = resolved
+        .as_ref()
+        .map_or_else(|| vec![credential.clone()], |r| r.credentials.clone());
+    let usage = validate_credentials(context, provider, &credentials, amp_endpoint).await?;
+    if resolved.is_some()
+        && reference
+            .resolve_reference(provider)
+            .await?
+            .is_none_or(|r| r.credentials != credentials)
+    {
+        return Err(AccountError::Busy);
+    }
+    Ok(usage)
+}
+async fn validate_credentials(
+    context: &ProviderContext,
+    provider: Provider,
+    credentials: &[Credential],
+    amp_endpoint: Option<&str>,
+) -> Result<ProviderUsage, AccountError> {
+    if credentials.len() == 1 {
+        return validate_credential(context, provider, &credentials[0], amp_endpoint).await;
+    }
+    let budget =
+        crate::providers::remaining_fetch_time().unwrap_or(std::time::Duration::from_secs(30));
+    let reserve = (budget / 10).min(std::time::Duration::from_millis(100));
+    let deadline = tokio::time::Instant::now() + budget.saturating_sub(reserve);
+    let mut selected = None;
+    let mut failures = Vec::new();
+    let mut last_error = AccountError::Input;
+    for (index, credential) in credentials.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let key_deadline =
+            tokio::time::Instant::now() + remaining / ((credentials.len() - index) as u32);
+        let result = tokio::time::timeout_at(
+            key_deadline,
+            crate::providers::FETCH_DEADLINE.scope(
+                key_deadline,
+                validate_credential(context, provider, credential, amp_endpoint),
+            ),
+        )
+        .await
+        .unwrap_or(Err(AccountError::Provider(ProviderError::Timeout)));
+        match result {
+            Ok(mut usage) => {
+                if credentials.len() > 1 {
+                    for mut diagnostic in std::mem::take(&mut usage.diagnostics) {
+                        diagnostic.source =
+                            format!("{}_key_{}:{}", provider.id(), index + 1, diagnostic.source);
+                        failures.push(diagnostic);
+                    }
+                }
+                selected = Some(usage);
+            }
+            Err(error) => {
+                let code = match &error {
+                    AccountError::Provider(code) => *code,
+                    _ => ProviderError::Authentication,
+                };
+                failures.push(crate::domain::UsageDiagnostic {
+                    source: format!("{}_key_{}", provider.id(), index + 1),
+                    code,
+                });
+                last_error = error;
+            }
+        }
+    }
+    let mut usage = selected.ok_or(last_error)?;
+    usage.diagnostics.extend(failures);
+    Ok(usage)
+}
+async fn validate_credential(
+    context: &ProviderContext,
+    provider: Provider,
+    credential: &Credential,
+    amp_endpoint: Option<&str>,
+) -> Result<ProviderUsage, AccountError> {
     let ctx = scoped(context, provider, credential)?;
     let usage = match provider {
         Provider::Amp => match amp_endpoint {
@@ -109,14 +185,6 @@ async fn validate_with_amp_endpoint(
         || usage.windows.iter().any(|w| !w.quota.is_valid())
     {
         return Err(ProviderError::InvalidData.into());
-    }
-    if resolved.is_some()
-        && reference
-            .resolve_reference(provider)
-            .await?
-            .is_none_or(|r| r.credential != *credential)
-    {
-        return Err(AccountError::Busy);
     }
     Ok(usage)
 }
@@ -523,7 +591,7 @@ impl ProviderAdapter for ManagedProvider {
                             .resolve_reference(self.provider)
                             .await
                             .ok()??
-                            .credential,
+                            .credentials,
                     )
                     .ok()?
                 }
@@ -994,6 +1062,80 @@ mod tests {
             assert!(adapter.cache_identity(&context).await.is_none());
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+    #[tokio::test]
+    async fn credential_group_keeps_last_success_and_reports_later_key_failure() {
+        let (endpoint, server) = http::fixture::server_status(vec![
+            (200, serde_json::json!({"ok":true,"result":{"displayText":"Signed in as first@example.com\nAmp Free: 20% remaining"}})),
+            (200, serde_json::json!({"ok":true,"result":{"displayText":"Signed in as last@example.com\nAmp Free: 80% remaining"}})),
+            (401, serde_json::json!({"error":"fixture"})),
+        ]).await;
+        let credentials = ["first", "last", "rejected"].map(|token| Credential::ApiKey {
+            token: token.into(),
+            region: None,
+            organization: None,
+        });
+        let result = validate_credentials(
+            &http::fixture::context(),
+            Provider::Amp,
+            &credentials,
+            Some(&endpoint),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.account.id, "last@example.com");
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].source, "amp_key_3");
+        assert_eq!(server.await.unwrap().len(), 3);
+    }
+    #[tokio::test]
+    async fn group_retains_success_when_a_later_key_exceeds_collector_budget() {
+        struct GroupFixture(String);
+        impl ProviderAdapter for GroupFixture {
+            fn id(&self) -> ProviderId {
+                ProviderId("amp".into())
+            }
+            fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
+                Box::pin(async move {
+                    let credentials = ["first", "slow"].map(|token| Credential::ApiKey {
+                        token: token.into(),
+                        region: None,
+                        organization: None,
+                    });
+                    validate_credentials(context, Provider::Amp, &credentials, Some(&self.0))
+                        .await
+                        .map_err(|e| match e {
+                            AccountError::Provider(e) => e,
+                            _ => ProviderError::Internal,
+                        })
+                })
+            }
+        }
+        let response = serde_json::json!({"ok":true,"result":{"displayText":"Signed in as demo@example.com\nAmp Free: 70% remaining"}});
+        let (endpoint, server) = http::fixture::server_status_with_async_action(
+            vec![(200, response.clone()), (200, response)],
+            |index| async move {
+                if index == 1 {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
+            },
+        )
+        .await;
+        let report = Collector {
+            context: http::fixture::context(),
+        }
+        .collect(CollectRequest {
+            providers: vec![Arc::new(GroupFixture(endpoint))],
+            timeout: std::time::Duration::from_millis(600),
+            cancellation: Cancellation::default(),
+        })
+        .await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(report.providers.len(), 1);
+        assert_eq!(report.providers[0].account.id, "demo@example.com");
+        assert_eq!(report.failures[0].code, ProviderError::Timeout);
+        assert_eq!(report.providers[0].diagnostics[0].source, "amp_key_2");
     }
     struct MutateDuringQuota {
         vault: Vault,

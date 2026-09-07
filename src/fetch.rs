@@ -40,6 +40,7 @@ impl Collector {
             let cancellation = request.cancellation.clone();
             let timeout = request.timeout;
             let handle = tasks.spawn(async move {
+                let deadline = tokio::time::Instant::now() + timeout;
                 let work = async {
                     for attempt in 0..3 {
                         match adapter.fetch(&context).await {
@@ -52,10 +53,11 @@ impl Collector {
                     }
                     unreachable!()
                 };
+                let work = FETCH_DEADLINE.scope(deadline, work);
                 tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => Err(ProviderError::Cancelled),
-                    result = tokio::time::timeout(timeout, work) => result.unwrap_or(Err(ProviderError::Timeout)),
+                    result = tokio::time::timeout_at(deadline, work) => result.unwrap_or(Err(ProviderError::Timeout)),
                 }
             });
             // Preserve request order and associate even a panicking task with its provider.

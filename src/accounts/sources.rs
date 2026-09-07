@@ -47,11 +47,12 @@ impl AmpNativeReference {
         .ok_or(AccountError::NotFound)?;
         Ok(Resolved {
             label: "Local Amp account".into(),
-            credential: Credential::ApiKey {
+            provider: crate::cli::Provider::Amp,
+            credentials: vec![Credential::ApiKey {
                 token,
                 region: None,
                 organization: None,
-            },
+            }],
         })
     }
 }
@@ -62,9 +63,16 @@ impl Credential {
     ) -> Result<Option<Resolved>, AccountError> {
         match self {
             Self::QuotioCustomProvider { source }
-                if provider == crate::cli::Provider::Catalog("clinepass") =>
+                if matches!(
+                    provider,
+                    crate::cli::Provider::Catalog("clinepass") | crate::cli::Provider::Zai
+                ) =>
             {
-                source.resolve().await.map(Some)
+                let resolved = source.resolve().await?;
+                if resolved.provider != provider {
+                    return Err(AccountError::Unsupported);
+                }
+                Ok(Some(resolved))
             }
             Self::AmpNative { source } if provider == crate::cli::Provider::Amp => {
                 source.resolve().await.map(Some)
@@ -99,7 +107,8 @@ pub struct CustomProviderReference {
 }
 pub struct Resolved {
     pub label: String,
-    pub credential: Credential,
+    pub provider: crate::cli::Provider,
+    pub credentials: Vec<Credential>,
 }
 #[derive(Deserialize)]
 struct Record {
@@ -107,6 +116,8 @@ struct Record {
     name: String,
     #[serde(rename = "type")]
     kind: String,
+    #[serde(rename = "base-url")]
+    base_url: Option<String>,
     #[serde(rename = "is-enabled")]
     enabled: Option<bool>,
     #[serde(rename = "api-keys")]
@@ -151,32 +162,66 @@ impl CustomProviderReference {
         if matching.next().is_some() {
             return Err(AccountError::Corrupt);
         }
-        // Extend only when that provider's source and quota contracts are tested.
-        if record.kind != "clinepass" {
-            return Err(AccountError::Unsupported);
-        }
         if record.enabled == Some(false) {
             return Err(AccountError::SourceDisabled);
         }
-        let token = record
-            .keys
-            .as_deref()
-            .unwrap_or_default()
-            .first()
-            .ok_or(AccountError::Input)?
-            .token
-            .trim();
-        if token.is_empty() || token.len() > 16_384 || token.chars().any(char::is_control) {
-            return Err(AccountError::Input);
-        }
+        let keys = record.keys.as_deref().unwrap_or_default();
+        let valid = |token: &str| {
+            !token.trim().is_empty()
+                && token.len() <= 16_384
+                && !token.chars().any(char::is_control)
+        };
+        let (provider, credentials) = match record.kind.as_str() {
+            "clinepass" => {
+                let token = keys.first().ok_or(AccountError::Input)?.token.trim();
+                if !valid(token) {
+                    return Err(AccountError::Input);
+                }
+                (
+                    crate::cli::Provider::Catalog("clinepass"),
+                    vec![Credential::CatalogKey {
+                        token: token.into(),
+                        settings: Default::default(),
+                    }],
+                )
+            }
+            "glm-api-key" => {
+                let url = record
+                    .base_url
+                    .as_deref()
+                    .and_then(|v| reqwest::Url::parse(v).ok())
+                    .ok_or(AccountError::Settings)?;
+                if url.scheme() != "https"
+                    || url.host_str() != Some("api.z.ai")
+                    || url.port_or_known_default() != Some(443)
+                    || !url.username().is_empty()
+                    || url.password().is_some()
+                {
+                    return Err(AccountError::Unsupported);
+                }
+                if !keys.iter().any(|key| valid(&key.token)) {
+                    return Err(AccountError::Input);
+                }
+                (
+                    crate::cli::Provider::Zai,
+                    keys.iter()
+                        .map(|key| Credential::ApiKey {
+                            token: key.token.trim().into(),
+                            region: Some("global".into()),
+                            organization: None,
+                        })
+                        .collect(),
+                )
+            }
+            _ => return Err(AccountError::Unsupported),
+        };
         Ok(Resolved {
             label: super::validate_label(&record.name)?,
-            credential: Credential::CatalogKey {
-                token: token.into(),
-                settings: Default::default(),
-            },
+            provider,
+            credentials,
         })
     }
+
     pub async fn resolve(&self) -> Result<Resolved, AccountError> {
         self.identity()?;
         let source = self.clone();
@@ -254,7 +299,7 @@ mod tests {
             enabled: true,
         };
         std::fs::write(&path, br#"{"apiKey@https://ampcode.com/":"fixture-first"}"#).unwrap();
-        let first = source.resolve().await.unwrap().credential;
+        let first = source.resolve().await.unwrap().credentials;
         let identity = source.identity().unwrap();
         let vault = Vault::new(Arc::new(Memory::default()), dir.join("lock"));
         let intent = MutationIntent::new("native-fixture", identity.clone()).unwrap();
@@ -289,7 +334,7 @@ mod tests {
             br#"{"apiKey@https://ampcode.com/":"fixture-second"}"#,
         )
         .unwrap();
-        assert!(source.resolve().await.unwrap().credential != first);
+        assert!(source.resolve().await.unwrap().credentials != first);
         let bytes = std::fs::read(&path).unwrap();
         let mut tx = vault.begin().unwrap();
         tx.document.patch(&id, None, None, Some(false)).unwrap();
@@ -319,13 +364,38 @@ mod tests {
         }
     }
     #[test]
+    fn glm_group_preserves_key_order_and_rejects_non_zai_origins() {
+        let source = source();
+        let mut value = records();
+        value[0]["type"] = "glm-api-key".into();
+        value[0]["base-url"] = "https://api.z.ai/api/paas/v4".into();
+        let result = source.parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(result.provider, crate::cli::Provider::Zai);
+        assert_eq!(result.credentials.len(), 2);
+        assert!(
+            matches!(&result.credentials[1], Credential::ApiKey { token, region, .. } if token == "fixture-second" && region.as_deref() == Some("global"))
+        );
+        for url in [
+            "https://open.bigmodel.cn",
+            "https://custom.example",
+            "http://api.z.ai",
+            "https://secret@api.z.ai",
+        ] {
+            value[0]["base-url"] = url.into();
+            assert!(matches!(
+                source.parse(&serde_json::to_vec(&value).unwrap()),
+                Err(AccountError::Unsupported)
+            ));
+        }
+    }
+    #[test]
     fn reference_preserves_group_identity_and_selects_first_key() {
         let source = source();
         let bytes = serde_json::to_vec(&records()).unwrap();
         let resolved = source.parse(&bytes).unwrap();
         assert_eq!(resolved.label, "Cline group");
         assert!(
-            matches!(resolved.credential, Credential::CatalogKey{token,..} if token == "fixture-first")
+            matches!(&resolved.credentials[0], Credential::CatalogKey{token,..} if token == "fixture-first")
         );
         assert!(
             !serde_json::to_string(&source)

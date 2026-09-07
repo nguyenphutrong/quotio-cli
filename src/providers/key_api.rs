@@ -441,6 +441,13 @@ impl KeyApiProvider {
         subscription_endpoint: &str,
         region: &str,
     ) -> Result<ProviderUsage, ProviderError> {
+        let key = context
+            .credentials
+            .get("ZAI_API_KEY")
+            .ok_or(ProviderError::Authentication)?;
+        if key.0.trim().is_empty() || key.0.len() > 16_384 || key.0.chars().any(char::is_control) {
+            return Err(ProviderError::Authentication);
+        }
         let subscription = async {
             let key = context
                 .credentials
@@ -477,7 +484,13 @@ impl KeyApiProvider {
         };
         let (quota, subscription) = tokio::join!(
             self.fetch_at(context, quota_endpoint, region),
-            tokio::time::timeout(std::time::Duration::from_secs(5), subscription)
+            tokio::time::timeout(
+                crate::providers::remaining_fetch_time()
+                    .map(|remaining| remaining / 2)
+                    .unwrap_or(std::time::Duration::from_secs(5))
+                    .min(std::time::Duration::from_secs(5)),
+                subscription
+            )
         );
         let mut usage = quota?;
         match subscription.unwrap_or(Err(ProviderError::Timeout)) {
@@ -499,7 +512,7 @@ impl KeyApiProvider {
             .credentials
             .get(self.0.key())
             .ok_or(ProviderError::Authentication)?;
-        if key.0.trim().is_empty() || key.0.chars().any(char::is_control) {
+        if key.0.trim().is_empty() || key.0.len() > 16_384 || key.0.chars().any(char::is_control) {
             return Err(ProviderError::Authentication);
         }
         let root: Value = http::json(

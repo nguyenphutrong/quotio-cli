@@ -103,25 +103,26 @@ pub enum SourceInput {
     },
 }
 pub async fn prepare_source(input: SourceInput) -> Result<PreparedAccount, AccountError> {
-    let (provider, identity, credential) = match input {
-        SourceInput::QuotioCustomProvider { source } => (
-            Provider::Catalog("clinepass"),
-            source.identity()?,
-            Credential::QuotioCustomProvider { source },
-        ),
+    let (identity, credential, resolved) = match input {
+        SourceInput::QuotioCustomProvider { source } => {
+            let resolved = source.resolve().await?;
+            (
+                source.identity()?,
+                Credential::QuotioCustomProvider { source },
+                resolved,
+            )
+        }
         SourceInput::AmpNative {} => {
             let source = super::sources::AmpNativeReference::system()?;
+            let resolved = source.resolve().await?;
             (
-                Provider::Amp,
                 source.identity()?,
                 Credential::AmpNative { source },
+                resolved,
             )
         }
     };
-    let resolved = credential
-        .resolve_reference(provider)
-        .await?
-        .ok_or(AccountError::Unsupported)?;
+    let provider = resolved.provider;
     Ok(PreparedAccount {
         provider,
         label: resolved.label,

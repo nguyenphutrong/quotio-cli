@@ -19,6 +19,15 @@ use crate::{
 use std::{future::Future, pin::Pin, sync::Arc};
 use time::OffsetDateTime;
 
+tokio::task_local! {
+    pub(crate) static FETCH_DEADLINE: tokio::time::Instant;
+}
+pub(crate) fn remaining_fetch_time() -> Option<std::time::Duration> {
+    FETCH_DEADLINE
+        .try_with(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+        .ok()
+}
+
 pub trait Clock: Send + Sync {
     fn now(&self) -> OffsetDateTime;
 }
