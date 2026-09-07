@@ -135,6 +135,7 @@ fn parse(
             bucket_windows.push((
                 order,
                 QuotaWindow {
+                    note: None,
                     metric_id: None,
                     consumption: None,
                     reset_description: None,

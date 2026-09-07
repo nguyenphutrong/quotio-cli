@@ -1032,13 +1032,20 @@ async fn warp_at(
                                     requestsUsedSinceLastRefresh
                                 }
                                 bonusGrants {
+                                    createdAt
+                                    reason
+                                    userFacingMessage
                                     requestCreditsGranted
                                     requestCreditsRemaining
                                     expiration
                                 }
                                 workspaces {
+                                    uid
                                     bonusGrantsInfo {
                                         grants {
+                                            createdAt
+                                            reason
+                                            userFacingMessage
                                             requestCreditsGranted
                                             requestCreditsRemaining
                                             expiration
@@ -1054,8 +1061,8 @@ async fn warp_at(
                     "requestContext": {
                         "clientContext": {},
                         "osContext": {
-                            "category": "macOS",
-                            "name": "macOS",
+                            "category": warp_platform(),
+                            "name": warp_platform(),
                             "version": "0"
                         }
                     }
@@ -1064,20 +1071,34 @@ async fn warp_at(
         now,
     )
     .await?;
-    let windows = warp_windows(&root, now)?;
-    common::usage("warp", &key, "account", windows)
+    let (windows, diagnostics) = warp_windows(&root, now)?;
+    let mut usage = common::usage("warp", &key, "account", windows)?;
+    usage.diagnostics = diagnostics;
+    Ok(usage)
 }
 
+fn warp_platform() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "macOS",
+        "linux" => "Linux",
+        other => other,
+    }
+}
 fn warp_windows(
     root: &Value,
     now: time::OffsetDateTime,
-) -> Result<Vec<QuotaWindow>, ProviderError> {
+) -> Result<(Vec<QuotaWindow>, Vec<crate::domain::UsageDiagnostic>), ProviderError> {
+    use crate::domain::{Quota, UsageDiagnostic};
+    let mut diagnostics = Vec::new();
     if root
         .get("errors")
         .and_then(Value::as_array)
         .is_some_and(|errors| !errors.is_empty())
     {
-        return Err(ProviderError::InvalidData);
+        diagnostics.push(UsageDiagnostic {
+            source: "warp_graphql".into(),
+            code: ProviderError::InvalidData,
+        });
     }
     let user = root
         .pointer("/data/user/user")
@@ -1087,87 +1108,116 @@ fn warp_windows(
         .get("requestLimitInfo")
         .and_then(Value::as_object)
         .ok_or(ProviderError::InvalidData)?;
-    let unlimited = info
-        .get("isUnlimited")
-        .and_then(Value::as_bool)
-        .ok_or(ProviderError::InvalidData)?;
-    let used = required_number(info, "requestsUsedSinceLastRefresh")?;
-    let reset = common::date(info.get("nextRefreshTime"))?;
-    let mut windows = if unlimited {
-        vec![common::window(
-            "Requests (unlimited)",
-            Some(used),
-            None,
-            None,
-            "requests",
-            None,
-            "warp_graphql",
-            now,
-        )?]
+    let unlimited = info.get("isUnlimited").and_then(Value::as_bool) == Some(true);
+    let used = common::number(info.get("requestsUsedSinceLastRefresh"))?;
+    let limit = if unlimited {
+        None
     } else {
-        let limit = required_number(info, "requestLimit")?;
-        if limit <= 0.0 || used > limit {
-            return Err(ProviderError::InvalidData);
-        }
-        vec![common::window(
-            "Requests",
-            Some(used),
-            Some(limit),
-            None,
-            "requests",
-            reset,
-            "warp_graphql",
-            now,
-        )?]
+        common::number(info.get("requestLimit"))?
     };
-
-    let mut grants = Vec::new();
-    if let Some(user_grants) = user.get("bonusGrants") {
+    let mut primary = common::window(
+        "Requests",
+        used,
+        limit,
+        None,
+        "requests",
+        if unlimited {
+            None
+        } else {
+            common::date(info.get("nextRefreshTime"))?
+        },
+        "warp_graphql",
+        now,
+    )?;
+    primary.metric_id = Some("warp-usage".into());
+    if unlimited {
+        primary.quota = Quota::Unlimited;
+    }
+    let mut windows = vec![primary];
+    let mut grants: Vec<(String, &Value)> = Vec::new();
+    if let Some(entries) = user.get("bonusGrants").filter(|v| !v.is_null()) {
         grants.extend(
-            user_grants
+            entries
                 .as_array()
                 .ok_or(ProviderError::InvalidData)?
-                .iter(),
+                .iter()
+                .map(|grant| ("user".into(), grant)),
         );
     }
-    if let Some(workspaces) = user.get("workspaces") {
-        for workspace in workspaces.as_array().ok_or(ProviderError::InvalidData)? {
-            let workspace = workspace.as_object().ok_or(ProviderError::InvalidData)?;
-            let Some(info) = workspace.get("bonusGrantsInfo") else {
-                continue;
-            };
-            let grants_info = info.as_object().ok_or(ProviderError::InvalidData)?;
-            let grants_array = grants_info
-                .get("grants")
-                .and_then(Value::as_array)
+    if let Some(workspaces) = user.get("workspaces").filter(|v| !v.is_null()) {
+        for (index, workspace) in workspaces
+            .as_array()
+            .ok_or(ProviderError::InvalidData)?
+            .iter()
+            .enumerate()
+        {
+            let scope = workspace
+                .get("uid")
+                .and_then(Value::as_str)
+                .map(|uid| format!("workspace:{uid}"))
+                .unwrap_or_else(|| format!("workspace:{index}"));
+            if let Some(entries) = workspace
+                .pointer("/bonusGrantsInfo/grants")
+                .filter(|v| !v.is_null())
+            {
+                grants.extend(
+                    entries
+                        .as_array()
+                        .ok_or(ProviderError::InvalidData)?
+                        .iter()
+                        .map(|grant| (scope.clone(), grant)),
+                );
+            }
+        }
+    }
+    let mut occurrences = std::collections::HashMap::<String, usize>::new();
+    for (index, (scope, grant)) in grants.into_iter().enumerate() {
+        let parsed = (|| {
+            let object = grant.as_object().ok_or(ProviderError::InvalidData)?;
+            let total = common::number(object.get("requestCreditsGranted"))?
                 .ok_or(ProviderError::InvalidData)?;
-            grants.extend(grants_array.iter());
+            let remaining = common::number(object.get("requestCreditsRemaining"))?
+                .ok_or(ProviderError::InvalidData)?;
+            if total <= 0.0 || remaining > total {
+                return Err(ProviderError::InvalidData);
+            }
+            let mut window = common::window(
+                &format!("Bonus credits {}", index + 1),
+                Some(total - remaining),
+                Some(total),
+                Some(remaining),
+                "credits",
+                common::date(object.get("expiration"))?,
+                "warp_graphql",
+                now,
+            )?;
+            let identity = crate::cache::fingerprint(&[
+                &scope,
+                &object.get("createdAt").unwrap_or(&Value::Null).to_string(),
+                &object.get("reason").unwrap_or(&Value::Null).to_string(),
+                &object.get("expiration").unwrap_or(&Value::Null).to_string(),
+                &total.to_string(),
+            ]);
+            let occurrence = occurrences.entry(identity.clone()).or_default();
+            window.metric_id = Some(format!("warp-bonus-{identity}-{}", *occurrence));
+            *occurrence += 1;
+            window.note = object
+                .get("userFacingMessage")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && s.len() <= 1024)
+                .map(str::to_owned);
+            Ok(window)
+        })();
+        match parsed {
+            Ok(window) => windows.push(window),
+            Err(code) => diagnostics.push(UsageDiagnostic {
+                source: format!("warp_bonus_{}", index + 1),
+                code,
+            }),
         }
     }
-    for (index, grant) in grants.into_iter().enumerate() {
-        let grant = grant.as_object().ok_or(ProviderError::InvalidData)?;
-        let total = common::number(grant.get("requestCreditsGranted"))?;
-        let remaining = common::number(grant.get("requestCreditsRemaining"))?;
-        if total.is_none() && remaining.is_none() {
-            continue;
-        }
-        let total = total.ok_or(ProviderError::InvalidData)?;
-        let remaining = remaining.ok_or(ProviderError::InvalidData)?;
-        if total <= 0.0 || remaining > total {
-            return Err(ProviderError::InvalidData);
-        }
-        windows.push(common::window(
-            &format!("Bonus credits {}", index + 1),
-            Some(total - remaining),
-            Some(total),
-            Some(remaining),
-            "credits",
-            common::date(grant.get("expiration"))?,
-            "warp_graphql",
-            now,
-        )?);
-    }
-    Ok(windows)
+    Ok((windows, diagnostics))
 }
 
 #[cfg(test)]
@@ -1464,6 +1514,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn warp_preserves_unlimited_grant_notes_and_scope_identity() {
+        let grant = json!({"createdAt":"2026-01-01T00:00:00Z","reason":"fixture","expiration":"2027-01-01T00:00:00Z","userFacingMessage":"Bonus allowance","requestCreditsGranted":100,"requestCreditsRemaining":80});
+        let mut root = json!({"data":{"user":{"user":{"requestLimitInfo":{"isUnlimited":true,"requestsUsedSinceLastRefresh":7},"bonusGrants":[grant.clone()],"workspaces":[{"uid":"workspace-a","bonusGrantsInfo":{"grants":[grant]}}]}}}});
+        let (windows, failures) = warp_windows(&root, time::OffsetDateTime::UNIX_EPOCH).unwrap();
+        assert!(failures.is_empty());
+        assert_eq!(windows[0].quota, crate::domain::Quota::Unlimited);
+        assert!(windows[0].resets_at.is_none());
+        assert_eq!(windows[0].consumption.as_ref().unwrap().used, 7.0);
+        assert_eq!(windows[1].note.as_deref(), Some("Bonus allowance"));
+        assert_ne!(windows[1].metric_id, windows[2].metric_id);
+        root["data"]["user"]["user"]["bonusGrants"][0]["requestCreditsRemaining"] = 70.into();
+        let (updated, _) = warp_windows(&root, time::OffsetDateTime::UNIX_EPOCH).unwrap();
+        assert_eq!(windows[1].metric_id, updated[1].metric_id);
+    }
+    #[test]
+    fn warp_keeps_valid_requests_when_bonus_or_graphql_field_fails() {
+        let root = json!({"errors":[{"message":"fixture"}],"data":{"user":{"user":{"requestLimitInfo":{"isUnlimited":false,"requestLimit":10,"requestsUsedSinceLastRefresh":2},"bonusGrants":[{}]}}}});
+        let (windows, failures) = warp_windows(&root, time::OffsetDateTime::UNIX_EPOCH).unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(
+            windows[0].quota,
+            crate::domain::Quota::from_used(Some(20.0))
+        );
+        assert_eq!(failures.len(), 2);
+    }
     #[tokio::test]
     async fn warp_maps_request_and_bonus_credit_windows_from_a_fixture() {
         let (base, server) = http::fixture::server(vec![json!({
@@ -1493,6 +1569,7 @@ mod tests {
         assert_eq!(usage.windows[0].amounts.as_ref().unwrap().remaining, 75.0);
         assert_eq!(usage.windows[1].amounts.as_ref().unwrap().remaining, 10.0);
         let request = server.await.unwrap().pop().unwrap();
+        assert!(request.contains(&format!("\"category\":\"{}\"", warp_platform())));
         assert!(request.starts_with("POST /graphql/v2?op=GetRequestLimitInfo "));
         assert!(request.contains("GetRequestLimitInfo"));
         assert!(

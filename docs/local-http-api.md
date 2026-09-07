@@ -390,3 +390,13 @@ order and retains the last valid quota, while preserving failed-key diagnostics.
 Changing the key list invalidates its cache identity. Per-key work shares the
 Collector deadline, so a later key timeout does not erase an earlier successful
 result. Optional subscription metadata uses part of that same budget.
+
+## Unlimited quota and Warp grants
+
+Quota can have `state: unlimited`, distinct from unknown and a finite 100 percent
+balance. Warp keeps reported usage alongside that state. Grant notes are returned
+in window `note`; grant IDs include their scope and stable allocation metadata,
+not remaining usage. Distinct grants are retained when the response provides no
+reliable unique ID to prove duplication. Invalid grant data or partial GraphQL
+errors retain valid request quota with diagnostics. Request context names the
+current node platform. These changes do not migrate or read Swift's Warp vault.

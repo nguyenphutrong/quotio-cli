@@ -56,6 +56,7 @@ pub fn window(
         .map(|(l, r)| Quota::from_remaining(Some(r / l * 100.0)))
         .unwrap_or(Quota::Unknown);
     Ok(QuotaWindow {
+        note: None,
         metric_id: None,
         label: label.into(),
         quota,

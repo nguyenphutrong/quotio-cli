@@ -107,6 +107,7 @@ fn window(
         .map(|(cap, left)| Quota::from_remaining(Some(left / cap * 100.0)))
         .unwrap_or(Quota::Unknown);
     QuotaWindow {
+        note: None,
         metric_id: None,
         label: label.into(),
         quota,

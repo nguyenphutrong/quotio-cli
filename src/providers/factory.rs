@@ -89,6 +89,7 @@ fn parse(
                 Confidence::Exact
             };
             windows.push(QuotaWindow {
+                note: None,
                 metric_id: None,
                 consumption: None,
                 reset_description: None,
@@ -109,6 +110,7 @@ fn parse(
             return Err(ProviderError::InvalidData);
         }
         windows.push(QuotaWindow {
+            note: None,
             metric_id: None,
             consumption: None,
             reset_description: None,

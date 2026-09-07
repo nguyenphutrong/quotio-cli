@@ -17,6 +17,7 @@ pub struct AccountIdentity {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Quota {
+    Unlimited,
     Unknown,
     Available {
         used_percent: f64,
@@ -49,7 +50,7 @@ impl Quota {
     }
     pub fn is_valid(&self) -> bool {
         match *self {
-            Self::Unknown => true,
+            Self::Unknown | Self::Unlimited => true,
             Self::Available {
                 used_percent,
                 remaining_percent,
@@ -96,6 +97,8 @@ pub struct Consumption {
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct QuotaWindow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metric_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

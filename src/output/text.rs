@@ -49,6 +49,10 @@ pub fn render(report: &UsageReport) -> String {
                         safe(&amounts.unit)
                     )
                 }
+                Quota::Unlimited => window.consumption.as_ref().map_or_else(
+                    || "unlimited".into(),
+                    |amount| format!("unlimited; used {:.2} {}", amount.used, safe(&amount.unit)),
+                ),
                 Quota::Unknown => "usage unknown; remaining unknown".into(),
                 Quota::Available {
                     used_percent,

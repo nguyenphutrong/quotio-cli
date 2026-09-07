@@ -1724,6 +1724,18 @@
               "used_percent",
               "remaining_percent"
             ]
+          },
+          {
+            "type": "object",
+            "required": [
+              "state"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "state": {
+                "const": "unlimited"
+              }
+            }
           }
         ]
       },
@@ -1839,6 +1851,10 @@
           "metric_id": {
             "type": "string",
             "description": "Stable backend metric identifier when supplied; clients use it instead of interpreting the label."
+          },
+          "note": {
+            "type": "string",
+            "description": "Source-provided display details, such as a bonus grant message."
           }
         },
         "additionalProperties": false,
