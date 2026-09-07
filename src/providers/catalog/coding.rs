@@ -1132,6 +1132,7 @@ fn warp_windows(
     primary.metric_id = Some("warp-usage".into());
     if unlimited {
         primary.quota = Quota::Unlimited;
+        primary.provenance.confidence = crate::domain::Confidence::Exact;
     }
     let mut windows = vec![primary];
     let mut grants: Vec<(String, &Value)> = Vec::new();

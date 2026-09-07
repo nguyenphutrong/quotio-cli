@@ -274,6 +274,7 @@ fn cursor_summary(
         window.metric_id = Some("cursor-usage".into());
         if root.get("isUnlimited").and_then(Value::as_bool) == Some(true) {
             window.quota = Quota::Unlimited;
+            window.provenance.confidence = crate::domain::Confidence::Exact;
         }
         windows.push(window);
     }
@@ -515,6 +516,9 @@ fn grok_windows(
         },
         None => Quota::Unknown,
     };
+    if cap.is_some() {
+        extra.provenance.confidence = crate::domain::Confidence::Exact;
+    }
     windows.push(extra);
     Ok((windows, diagnostics))
 }
@@ -1453,6 +1457,10 @@ mod tests {
                         unit: "units".into()
                     },
                 }
+            );
+            assert_eq!(
+                serde_json::to_value(&windows[1].provenance.confidence).unwrap(),
+                if cap.is_some() { "exact" } else { "unknown" }
             );
             assert!(diagnostics.is_empty());
         }
