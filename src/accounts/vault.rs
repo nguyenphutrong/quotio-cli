@@ -157,7 +157,7 @@ impl Vault {
                 }
                 let doc: Document =
                     serde_json::from_slice(&bytes).map_err(|_| AccountError::Corrupt)?;
-                if !matches!(doc.version, 1..=3)
+                if !matches!(doc.version, 1..=4)
                     || (doc.version == 1 && !doc.mutation_receipts.is_empty())
                     || (doc.version < 3
                         && doc.accounts.iter().any(|a| {
@@ -167,6 +167,7 @@ impl Vault {
                                     | super::Credential::AmpNative { .. }
                             )
                         }))
+                    || (doc.version < 4 && doc.accounts.iter().any(|a| !a.enabled))
                     || doc.mutation_receipts.len() > 4096
                 {
                     return Err(AccountError::Corrupt);
@@ -269,6 +270,41 @@ pub(crate) mod tests {
         let next = acquire(&path).unwrap();
         drop(next);
         drop(duplicate);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn owned_enabled_state_requires_format_four_and_survives_new_sources() {
+        let memory = Arc::new(Memory::default());
+        let dir = std::env::temp_dir().join(random_string().unwrap());
+        let vault = Vault::new(memory.clone(), dir.join("lock"));
+        let mut tx = vault.begin().unwrap();
+        let id = tx
+            .document
+            .add(Provider::Amp, "Owned", "owned".into(), credential())
+            .unwrap();
+        tx.document.patch(&id, None, None, Some(false)).unwrap();
+        assert_eq!(tx.document.version, 4);
+        tx.document
+            .add(
+                Provider::Amp,
+                "Native",
+                "native".into(),
+                crate::accounts::Credential::AmpNative {
+                    source: crate::accounts::sources::AmpNativeReference {
+                        path: dir.join("secrets.json"),
+                        enabled: true,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(tx.document.version, 4);
+        tx.commit().unwrap();
+        assert!(!vault.begin().unwrap().document.accounts[0].enabled());
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&memory.read().unwrap().unwrap()).unwrap();
+        value["version"] = 3.into();
+        memory.write(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(matches!(vault.begin(), Err(AccountError::Corrupt)));
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]

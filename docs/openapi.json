@@ -2316,7 +2316,7 @@
               "boolean",
               "null"
             ],
-            "description": "Enable or disable an Amp native reference without changing the native login."
+            "description": "Enable or disable quota collection for an account without changing its provider login or source configuration."
           }
         },
         "additionalProperties": false

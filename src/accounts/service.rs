@@ -491,6 +491,9 @@ impl ManagedProvider {
             .ok_or(AccountError::NotFound)?
             .clone();
         drop(tx);
+        if !account.enabled() {
+            return Err(AccountError::SourceDisabled);
+        }
         let credential = account.credential;
         if self.provider != Provider::Codex {
             let usage = self
@@ -513,14 +516,16 @@ impl ManagedProvider {
         }
         let guard = refresh_lock(self.vault.clone(), self.id.clone()).await?;
         let tx = begin(self.vault.clone()).await?;
-        let latest = tx
+        let account = tx
             .document
             .accounts
             .iter()
             .find(|a| a.id == self.id && a.provider == self.provider)
-            .ok_or(AccountError::NotFound)?
-            .credential
-            .clone();
+            .ok_or(AccountError::NotFound)?;
+        if !account.enabled() {
+            return Err(AccountError::SourceDisabled);
+        }
+        let latest = account.credential.clone();
         drop(tx);
         if credential != latest {
             drop(guard);
@@ -542,9 +547,13 @@ impl ManagedProvider {
             return Err(AccountError::Busy);
         }
         account.credential = updated.clone();
+        let enabled = account.enabled();
         // Persist rotation without holding the global vault lock during network IO.
         commit(tx).await?;
         drop(guard);
+        if !enabled {
+            return Err(AccountError::SourceDisabled);
+        }
         let usage = self
             .operations
             .quota(context, self.provider, &updated)
@@ -563,7 +572,7 @@ impl ManagedProvider {
             .iter()
             .find(|a| a.id == self.id && a.provider == self.provider)
             .ok_or(AccountError::NotFound)?;
-        if current.credential != *credential {
+        if !current.enabled() || current.credential != *credential {
             return Err(AccountError::Busy);
         }
         Ok(usage)
@@ -581,6 +590,9 @@ impl ProviderAdapter for ManagedProvider {
                 .accounts
                 .iter()
                 .find(|a| a.id == self.id && a.provider == self.provider)?;
+            if !account.enabled() {
+                return None;
+            }
             let account = account.clone();
             drop(tx);
             let scope = match &account.credential {
@@ -923,6 +935,9 @@ mod tests {
         refresh_fails: bool,
         quota_fails: bool,
         refreshes: AtomicUsize,
+        quota_calls: AtomicUsize,
+        wait_for_refresh: std::sync::atomic::AtomicBool,
+        release_refresh: tokio::sync::Notify,
         stall_first_refresh: std::sync::atomic::AtomicBool,
     }
     impl Operations for Fake {
@@ -933,6 +948,7 @@ mod tests {
             k: &'a Credential,
         ) -> OperationFuture<'a, ProviderUsage> {
             Box::pin(async move {
+                self.quota_calls.fetch_add(1, Ordering::SeqCst);
                 if p == Provider::Codex && self.delay {
                     self.started.notify_one();
                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -961,6 +977,10 @@ mod tests {
         ) -> OperationFuture<'a, Credential> {
             Box::pin(async move {
                 self.refreshes.fetch_add(1, Ordering::SeqCst);
+                if self.wait_for_refresh.load(Ordering::SeqCst) {
+                    self.started.notify_one();
+                    self.release_refresh.notified().await;
+                }
                 if self.stall_first_refresh.load(Ordering::SeqCst)
                     && matches!(k,Credential::CodexOAuth{account_id,..} if account_id=="codex-id")
                 {
@@ -1265,6 +1285,9 @@ mod tests {
             refresh_fails,
             quota_fails,
             refreshes: AtomicUsize::new(0),
+            quota_calls: AtomicUsize::new(0),
+            wait_for_refresh: std::sync::atomic::AtomicBool::new(false),
+            release_refresh: tokio::sync::Notify::new(),
             stall_first_refresh: std::sync::atomic::AtomicBool::new(false),
         });
         (vault, fake, codex, amp, path)
@@ -1290,6 +1313,59 @@ mod tests {
             std::fs::remove_file(entry.unwrap().path()).unwrap();
         }
         std::fs::remove_dir(path).unwrap();
+    }
+    #[tokio::test]
+    async fn disabled_owned_accounts_skip_quota_cache_and_refresh() {
+        let (vault, fake, codex, amp, path) = setup(0, false, false, false);
+        for (id, provider) in [(codex, Provider::Codex), (amp, Provider::Amp)] {
+            let mut tx = vault.begin().unwrap();
+            tx.document.patch(&id, None, None, Some(false)).unwrap();
+            tx.commit().unwrap();
+            let adapter = managed(vault.clone(), fake.clone(), id, provider);
+            let context = http::fixture::context();
+            assert!(adapter.cache_identity(&context).await.is_none());
+            assert!(matches!(
+                adapter.read(&context).await,
+                Err(AccountError::SourceDisabled)
+            ));
+        }
+        assert_eq!(fake.refreshes.load(Ordering::SeqCst), 0);
+        cleanup(path);
+    }
+    #[tokio::test]
+    async fn disabling_during_refresh_preserves_rotation_without_starting_quota() {
+        let (vault, fake, id, _, path) = setup(0, false, false, false);
+        fake.wait_for_refresh.store(true, Ordering::SeqCst);
+        let adapter = managed(vault.clone(), fake.clone(), id.clone(), Provider::Codex);
+        let running = tokio::spawn(async move { adapter.read(&http::fixture::context()).await });
+        fake.started.notified().await;
+        patch(vault.clone(), id, None, None, Some(false))
+            .await
+            .unwrap();
+        fake.release_refresh.notify_one();
+        assert!(matches!(
+            running.await.unwrap(),
+            Err(AccountError::SourceDisabled)
+        ));
+        assert_eq!(fake.quota_calls.load(Ordering::SeqCst), 0);
+        let tx = vault.begin().unwrap();
+        assert!(!tx.document.accounts[0].enabled());
+        assert!(
+            matches!(&tx.document.accounts[0].credential, Credential::CodexOAuth { refresh_token, .. } if refresh_token == "rotated")
+        );
+        drop(tx);
+        cleanup(path);
+    }
+    #[tokio::test]
+    async fn disabling_during_quota_discards_the_result() {
+        let (vault, fake, id, _, path) = setup(3600, true, false, false);
+        let adapter = managed(vault.clone(), fake.clone(), id.clone(), Provider::Codex);
+        let running = tokio::spawn(async move { adapter.read(&http::fixture::context()).await });
+        fake.started.notified().await;
+        patch(vault, id, None, None, Some(false)).await.unwrap();
+        assert!(matches!(running.await.unwrap(), Err(AccountError::Busy)));
+        assert_eq!(fake.refreshes.load(Ordering::SeqCst), 0);
+        cleanup(path);
     }
     #[tokio::test]
     async fn ordinary_codex_fetch_does_not_lock_out_other_providers() {

@@ -400,3 +400,17 @@ not remaining usage. Distinct grants are retained when the response provides no
 reliable unique ID to prove duplication. Invalid grant data or partial GraphQL
 errors retain valid request quota with diagnostics. Request context names the
 current node platform. These changes do not migrate or read Swift's Warp vault.
+
+### Account quota selection
+
+`PATCH /v1/accounts/{id}` accepts `enabled` for owned accounts and borrowed
+references. Disabling an account prevents new quota requests and credential refresh,
+removes its cache identity, and discards a quota result that finishes after disabling.
+It does not change the provider login or the source owner's configuration. A token
+rotation already accepted by the provider is still persisted to avoid losing the
+replacement credential; its quota result is discarded while disabled.
+
+Writing this flag upgrades the vault document to format 4 atomically. Existing
+accounts default to enabled; the prior Amp reference flag remains respected. Older
+binaries reject format 4 instead of ignoring disabled accounts. Adding another
+source or recording a mutation receipt preserves the newer format version.

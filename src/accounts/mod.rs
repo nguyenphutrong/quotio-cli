@@ -84,6 +84,9 @@ pub enum Credential {
     },
 }
 pub use crate::domain::AccountOrigin;
+fn enabled_default() -> bool {
+    true
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Account {
     pub id: String,
@@ -91,6 +94,8 @@ pub struct Account {
     pub label: String,
     pub identity: String,
     pub active: bool,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
     pub credential: Credential,
 }
 #[derive(Serialize)]
@@ -104,10 +109,11 @@ pub struct AccountInfo<'a> {
 }
 impl Account {
     pub fn enabled(&self) -> bool {
-        match &self.credential {
-            Credential::AmpNative { source } => source.enabled,
-            _ => true,
-        }
+        self.enabled
+            && match &self.credential {
+                Credential::AmpNative { source } => source.enabled,
+                _ => true,
+            }
     }
     pub fn origin(&self) -> AccountOrigin {
         match self.credential {
@@ -172,7 +178,7 @@ impl Document {
             credential,
             Credential::QuotioCustomProvider { .. } | Credential::AmpNative { .. }
         ) {
-            self.version = 3;
+            self.version = self.version.max(3);
         }
         self.accounts.push(Account {
             id: id.clone(),
@@ -181,6 +187,7 @@ impl Document {
             identity,
             active,
             credential,
+            enabled: true,
         });
         Ok(id)
     }
@@ -248,10 +255,11 @@ impl Document {
                 .iter_mut()
                 .find(|a| a.id == id)
                 .ok_or(AccountError::NotFound)?;
-            match &mut account.credential {
-                Credential::AmpNative { source } => source.enabled = enabled,
-                _ => return Err(AccountError::Unsupported),
+            account.enabled = enabled;
+            if let Credential::AmpNative { source } = &mut account.credential {
+                source.enabled = enabled;
             }
+            self.version = 4;
         }
         if active == Some(false) {
             return Err(AccountError::Unsupported);
