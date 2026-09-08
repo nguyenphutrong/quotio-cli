@@ -153,9 +153,13 @@ fn balance(input: &str, unit: &str) -> Result<QuotaAmounts, ProviderError> {
     })
 }
 fn dollars(input: &str) -> Result<QuotaAmounts, ProviderError> {
-    let rest = input.strip_prefix('$').ok_or(ProviderError::InvalidData)?;
-    let (remaining, rest) = rest.split_once(' ').ok_or(ProviderError::InvalidData)?;
+    let input = input.trim_start();
+    let rest = input.strip_prefix('$').unwrap_or(input);
+    let (remaining, rest) = rest
+        .split_once(char::is_whitespace)
+        .ok_or(ProviderError::InvalidData)?;
     let limit = rest
+        .trim_start()
         .strip_prefix("of $")
         .map(|rest| {
             rest.split_once(' ')
@@ -210,15 +214,15 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
     for raw_line in input.lines() {
         let normalized = raw_line.replace("**", "");
         let line = normalized.trim();
-        if let Some(rest) = line.strip_prefix("Amp Free: ") {
-            let (quota, amounts, reset) = if let Some((remaining, rest)) = rest.split_once(" / ") {
-                let limit = rest
-                    .split_whitespace()
-                    .next()
-                    .ok_or(ProviderError::InvalidData)?;
+        if let Some(rest) = line.strip_prefix("Amp Free:") {
+            let rest = rest.trim_start();
+            let (quota, amounts, reset) = if let Some((remaining, limit)) = rest
+                .split_once("remaining")
+                .and_then(|(amounts, _)| amounts.split_once('/'))
+            {
                 let amounts = QuotaAmounts {
-                    remaining: number(remaining.trim_start_matches('$'))?,
-                    limit: Some(number(limit.trim_start_matches('$'))?),
+                    remaining: number(remaining.trim().strip_prefix('$').unwrap_or(remaining.trim()))?,
+                    limit: Some(number(limit.trim().strip_prefix('$').unwrap_or(limit.trim()))?),
                     unit: "USD".into(),
                 };
                 if amounts
@@ -303,7 +307,7 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
                     reset_description(rest),
                 ));
             }
-        } else if let Some(rest) = line.strip_prefix("Individual credits: ") {
+        } else if let Some(rest) = line.strip_prefix("Individual credits:") {
             let amounts = dollars(rest)?;
             windows.push(window(
                 "Individual credits",
@@ -313,7 +317,7 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
                 None,
             ));
         } else if let Some(rest) = line.strip_prefix("Workspace ") {
-            let (name, rest) = rest.split_once(": ").ok_or(ProviderError::InvalidData)?;
+            let (name, rest) = rest.split_once(':').ok_or(ProviderError::InvalidData)?;
             let amounts = dollars(rest)?;
             windows.push(window(
                 &format!("Workspace {name} credits"),
@@ -572,6 +576,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(usage.windows[4].metric_id, alternate.windows[4].metric_id);
+    }
+    #[test]
+    fn flexible_amount_spacing_and_optional_credit_currency_preserve_uncertainty() {
+        for separator in ["/", " /", "/ ", "  /  ", "\t/\t"] {
+            for currency in ["", "$"] {
+                let text = format!(
+                    "Signed in as demo@example.com\nAmp Free:\t$2.50{separator}$10.00 remaining (replenishes +$0.50/hour)\nIndividual credits:\t{currency}1,234.50\tremaining\nWorkspace Example:{currency}12.50 remaining"
+                );
+                let usage = parse(&text, OffsetDateTime::UNIX_EPOCH).unwrap();
+                assert_eq!(usage.windows.len(), 3);
+                assert_eq!(usage.windows[0].quota, Quota::from_remaining(Some(25.0)));
+                assert_eq!(usage.windows[0].reset_description.as_deref(), Some("replenishes +$0.5/hour"));
+                assert_eq!(usage.windows[1].amounts.as_ref().unwrap().remaining, 1234.5);
+                assert_eq!(usage.windows[2].amounts.as_ref().unwrap().remaining, 12.5);
+                for window in &usage.windows[1..] {
+                    assert_eq!(window.quota, Quota::Unknown);
+                    assert!(window.amounts.as_ref().unwrap().limit.is_none());
+                    assert!(window.reset_description.is_none());
+                }
+                assert!(usage.windows.iter().all(|window| window.resets_at.is_none()));
+            }
+        }
+    }
+    #[test]
+    fn flexible_amounts_still_reject_invalid_values() {
+        for value in ["-1", "NaN", "inf", "1e999", "bad", "$$1"] {
+            for line in [
+                format!("Individual credits: {value} remaining"),
+                format!("Workspace Example: {value} remaining"),
+                format!("Amp Free: {value}/$10 remaining"),
+                format!("Amp Free: $1/{value} remaining"),
+            ] {
+                assert!(parse(
+                    &format!("Signed in as demo@example.com\n{line}"),
+                    OffsetDateTime::UNIX_EPOCH,
+                ).is_err(), "accepted {line}");
+            }
+        }
     }
     #[test]
     fn rejects_inconsistent_amounts_instead_of_clamping_to_available() {
