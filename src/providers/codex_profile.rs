@@ -43,13 +43,12 @@ fn tokens(value: &Value) -> Option<u64> {
     {
         return Some(total);
     }
-    let input = alias(value, &["input_tokens", "inputTokens"])
-        .and_then(count)
-        .unwrap_or(0);
-    let output = alias(value, &["output_tokens", "outputTokens"])
-        .and_then(count)
-        .unwrap_or(0);
-    input.checked_add(output).filter(|total| *total > 0)
+    let input = alias(value, &["input_tokens", "inputTokens"]).and_then(count);
+    let output = alias(value, &["output_tokens", "outputTokens"]).and_then(count);
+    match (input, output) {
+        (None, None) => None,
+        (input, output) => input.unwrap_or(0).checked_add(output.unwrap_or(0)),
+    }
 }
 fn date(value: &str) -> Option<String> {
     let day: String = value.chars().take(10).collect();
@@ -174,6 +173,61 @@ mod tests {
             !serde_json::to_string(&result)
                 .unwrap()
                 .contains("provider-secret")
+        );
+    }
+
+    #[test]
+    fn split_token_zeros_are_known_buckets_in_both_formats() {
+        let now = datetime!(2026-09-07 0:00 UTC);
+        for array_format in [false, true] {
+            let entries: Vec<_> = (0..31)
+                .map(|index| {
+                    let day = (now - time::Duration::days(index)).date().to_string();
+                    let value = if index == 30 {
+                        json!({"input_tokens":100,"output_tokens":50})
+                    } else {
+                        match index % 3 {
+                            0 => json!({"input_tokens":0,"output_tokens":0}),
+                            1 => json!({"inputTokens":"0"}),
+                            _ => json!({"input_tokens":"invalid","outputTokens":0.0}),
+                        }
+                    };
+                    (day, value)
+                })
+                .chain([
+                    ("2026-09-08".into(), json!({})),
+                    (
+                        "2026-09-09".into(),
+                        json!({"input_tokens":-1,"output_tokens":"invalid"}),
+                    ),
+                ])
+                .collect();
+            let buckets = if array_format {
+                Value::Array(
+                    entries
+                        .into_iter()
+                        .map(|(day, mut value)| {
+                            value["date"] = json!(day);
+                            value
+                        })
+                        .collect(),
+                )
+            } else {
+                Value::Object(entries.into_iter().collect())
+            };
+            let result = parse(json!({"stats":{"daily_usage_buckets":buckets}}), now).unwrap();
+            assert_eq!(result.daily_usage.len(), 31);
+            assert_eq!(result.daily_usage[0].tokens, 150);
+            assert!(
+                result.daily_usage[1..]
+                    .iter()
+                    .all(|bucket| bucket.tokens == 0)
+            );
+            assert_eq!(result.latest_30_buckets_tokens, 0);
+        }
+        assert_eq!(
+            tokens(&json!({"input_tokens":u64::MAX,"output_tokens":1})),
+            None
         );
     }
 
