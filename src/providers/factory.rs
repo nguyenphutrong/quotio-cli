@@ -16,7 +16,9 @@ struct Identity {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Response {
-    limits: Limits,
+    uses_token_rate_limits_billing: Option<bool>,
+    #[serde(default)]
+    limits: serde_json::Value,
     extra_usage_balance_cents: Option<f64>,
 }
 #[derive(Deserialize)]
@@ -48,23 +50,62 @@ fn parse(
     {
         return Err(ProviderError::InvalidData);
     }
-    if response.limits.standard.is_none() && response.limits.core.is_none() {
+    let windows = parse_windows(response, now)?;
+    Ok(ProviderUsage {
+        codex_profile: None,
+        codex_reset_credits: None,
+        diagnostics: vec![],
+        account_ref: None,
+        provider: ProviderId("factory".into()),
+        account: AccountIdentity {
+            subscription_status: None,
+            plan: None,
+            id: format!("{}:{}", identity.user_id, identity.org_id),
+            label: format!("{} / {}", identity.user_id, identity.org_id),
+        },
+        windows,
+    })
+}
+fn parse_windows(
+    response: Response,
+    now: OffsetDateTime,
+) -> Result<Vec<QuotaWindow>, ProviderError> {
+    if response.uses_token_rate_limits_billing == Some(false) {
+        return Ok(vec![QuotaWindow {
+            note: Some("legacy-billing".into()),
+            metric_id: Some("factory-billing-mode".into()),
+            consumption: None,
+            reset_description: None,
+            label: "Billing mode".into(),
+            quota: Quota::Unknown,
+            amounts: None,
+            resets_at: None,
+            fetched_at: now,
+            provenance: Provenance {
+                source: "factory_billing_limits".into(),
+                confidence: Confidence::Unknown,
+            },
+        }]);
+    }
+    let limits: Limits =
+        serde_json::from_value(response.limits).map_err(|_| ProviderError::InvalidData)?;
+    if limits.standard.is_none() && limits.core.is_none() {
         return Err(ProviderError::InvalidData);
     }
     let mut windows = Vec::new();
-    for (name, pool) in [
-        ("Standard", response.limits.standard),
-        ("Droid Core", response.limits.core),
+    for (name, id, pool) in [
+        ("Standard", "standard", limits.standard),
+        ("Droid Core", "core", limits.core),
     ] {
         let pool = pool.unwrap_or(Pool {
             five_hour: None,
             weekly: None,
             monthly: None,
         });
-        for (label, window) in [
-            ("5 hours", pool.five_hour),
-            ("weekly", pool.weekly),
-            ("monthly", pool.monthly),
+        for (label, period, window) in [
+            ("5 hours", "five-hour", pool.five_hour),
+            ("weekly", "weekly", pool.weekly),
+            ("monthly", "monthly", pool.monthly),
         ] {
             let (used, resets_at) = match window {
                 Some(window) => (
@@ -90,7 +131,7 @@ fn parse(
             };
             windows.push(QuotaWindow {
                 note: None,
-                metric_id: None,
+                metric_id: Some(format!("factory-{id}-{period}")),
                 consumption: None,
                 reset_description: None,
                 label: format!("{name} {label}"),
@@ -111,7 +152,7 @@ fn parse(
         }
         windows.push(QuotaWindow {
             note: None,
-            metric_id: None,
+            metric_id: Some("factory-extra-balance".into()),
             consumption: None,
             reset_description: None,
             label: "Extra usage credits".into(),
@@ -129,20 +170,7 @@ fn parse(
             },
         });
     }
-    Ok(ProviderUsage {
-        codex_profile: None,
-        codex_reset_credits: None,
-        diagnostics: vec![],
-        account_ref: None,
-        provider: ProviderId("factory".into()),
-        account: AccountIdentity {
-            subscription_status: None,
-            plan: None,
-            id: format!("{}:{}", identity.user_id, identity.org_id),
-            label: format!("{} / {}", identity.user_id, identity.org_id),
-        },
-        windows,
-    })
+    Ok(windows)
 }
 impl FactoryProvider {
     async fn fetch_api(
@@ -250,6 +278,22 @@ mod tests {
         let now = OffsetDateTime::parse("2026-09-05T00:00:00Z", &Rfc3339).unwrap();
         let usage = parse(identity(), response, now).unwrap();
         assert_eq!(usage.windows.len(), 7);
+        assert_eq!(
+            usage
+                .windows
+                .iter()
+                .map(|w| w.metric_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "factory-standard-five-hour",
+                "factory-standard-weekly",
+                "factory-standard-monthly",
+                "factory-core-five-hour",
+                "factory-core-weekly",
+                "factory-core-monthly",
+                "factory-extra-balance",
+            ]
+        );
         assert_eq!(usage.windows[0].quota, Quota::from_used(Some(20.0)));
         assert_eq!(usage.windows[1].quota, Quota::Unknown);
         assert_eq!(usage.windows[5].quota, Quota::from_used(Some(100.0)));
@@ -257,14 +301,72 @@ mod tests {
     }
     #[test]
     fn malformed_response_and_missing_pools_fail() {
-        assert!(
-            serde_json::from_value::<Response>(
-                serde_json::json!({"limits":{"standard":{"fiveHour":{"usedPercent":"bad"}}}})
-            )
-            .is_err()
-        );
+        let response = serde_json::from_value::<Response>(
+            serde_json::json!({"limits":{"standard":{"fiveHour":{"usedPercent":"bad"}}}}),
+        )
+        .unwrap();
+        assert!(parse(identity(), response, OffsetDateTime::UNIX_EPOCH).is_err());
         let response = serde_json::from_value(serde_json::json!({"limits":{}})).unwrap();
         assert!(parse(identity(), response, OffsetDateTime::UNIX_EPOCH).is_err());
+    }
+    #[tokio::test]
+    async fn legacy_billing_ignores_missing_or_stale_limits_and_keeps_identity_fence() {
+        for limits in [
+            serde_json::Value::Null,
+            serde_json::json!({"standard":{"fiveHour":{"usedPercent":90,"windowEnd":"2000-01-01T00:00:00Z"}}}),
+            serde_json::json!({"standard":"stale"}),
+        ] {
+            for changed in [false, true] {
+                let before = serde_json::json!({"userId":"demo-user","orgId":"demo-org"});
+                let after = if changed {
+                    serde_json::json!({"userId":"demo-user","orgId":"other-org"})
+                } else {
+                    before.clone()
+                };
+                let mut response = serde_json::json!({"usesTokenRateLimitsBilling":false,"extraUsageBalanceCents":1234});
+                if !limits.is_null() {
+                    response["limits"] = limits.clone();
+                }
+                let (base, task) = http::fixture::server(vec![before, response, after]).await;
+                let result = FactoryProvider
+                    .fetch_api(&http::fixture::context(), &base, &base)
+                    .await;
+                if changed {
+                    assert_eq!(result.unwrap_err(), ProviderError::InvalidData);
+                } else {
+                    let usage = result.unwrap();
+                    assert_eq!(usage.account.id, "demo-user:demo-org");
+                    assert_eq!(usage.windows.len(), 1);
+                    assert_eq!(
+                        usage.windows[0].metric_id.as_deref(),
+                        Some("factory-billing-mode")
+                    );
+                    assert_eq!(usage.windows[0].note.as_deref(), Some("legacy-billing"));
+                    assert_eq!(usage.windows[0].quota, Quota::Unknown);
+                    assert!(usage.windows[0].amounts.is_none());
+                }
+                assert_eq!(task.await.unwrap().len(), 3);
+            }
+        }
+    }
+    #[test]
+    fn token_billing_still_requires_limits_and_preserves_partial_unknowns() {
+        for mode in [serde_json::Value::Null, serde_json::json!(true)] {
+            for limits in [serde_json::Value::Null, serde_json::json!({})] {
+                let response = serde_json::from_value(
+                    serde_json::json!({"usesTokenRateLimitsBilling":mode,"limits":limits}),
+                )
+                .unwrap();
+                assert_eq!(
+                    parse(identity(), response, OffsetDateTime::UNIX_EPOCH).unwrap_err(),
+                    ProviderError::InvalidData
+                );
+            }
+            let response = serde_json::from_value(serde_json::json!({"usesTokenRateLimitsBilling":mode,"limits":{"core":{"monthly":{"usedPercent":25}}}})).unwrap();
+            let usage = parse(identity(), response, OffsetDateTime::UNIX_EPOCH).unwrap();
+            assert!(usage.windows[..5].iter().all(|w| w.quota == Quota::Unknown));
+            assert_eq!(usage.windows[5].quota, Quota::from_used(Some(25.0)));
+        }
     }
     #[tokio::test]
     async fn identity_and_org_are_checked_across_requests() {
