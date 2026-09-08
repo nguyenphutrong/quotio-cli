@@ -36,7 +36,7 @@ pub(super) fn account_code(error: &AccountError) -> &'static str {
 fn account_error(error: AccountError) -> ApiError {
     let status = match error {
         AccountError::NotFound => StatusCode::NOT_FOUND,
-        AccountError::Busy | AccountError::Duplicate | AccountError::CallbackPort => {
+        AccountError::Busy | AccountError::Duplicate | AccountError::CallbackPort | AccountError::IdempotencyConflict => {
             StatusCode::CONFLICT
         }
         AccountError::Storage | AccountError::Corrupt | AccountError::CommitUncertain => {

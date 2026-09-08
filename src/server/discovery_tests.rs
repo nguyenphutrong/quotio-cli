@@ -143,3 +143,26 @@ async fn discovery_rest_registers_opaque_exact_entries_without_credentials() {
     server.abort();
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn oauth_begin_rest_returns_conflict_for_changed_idempotent_body() {
+    let (state, dir, _) = tests::fixture().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let token = "synthetic-management-token-1234567890";
+    let app = router(state, Arc::new(security::Policy::new(address, true, None, &[], Some(token.into())).unwrap()));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for (label, status) in [("Fixture", 201), ("Changed", 409)] {
+        let response = client.post(format!("http://{address}/v1/auth/sessions"))
+            .bearer_auth(token).header("Idempotency-Key", "oauth-conflict")
+            .json(&json!({"provider":"codex","label":label,"callback_mode":"relay"}))
+            .send().await.unwrap();
+        assert_eq!(response.status(), status);
+        if status == 409 {
+            assert!(response.text().await.unwrap().contains("idempotency_conflict"));
+        }
+    }
+    server.abort();
+    std::fs::remove_dir_all(dir).unwrap();
+}
