@@ -828,10 +828,14 @@ async fn local_sources(requested: &[Provider], timeout: std::time::Duration) -> 
                     .is_some_and(|name| std::env::var_os(name).is_some())
         })
         .collect();
-    if requested.contains(&Provider::Catalog("cursor"))
-        && std::env::var_os("CURSOR_ACCESS_TOKEN").is_some()
-    {
-        sources.push(Provider::Catalog("cursor"));
+    for (provider, token) in [
+        (Provider::Catalog("cursor"), "CURSOR_ACCESS_TOKEN"),
+        (Provider::Catalog("claude"), "CLAUDE_OAUTH_ACCESS_TOKEN"),
+        (Provider::Catalog("copilot"), "COPILOT_API_TOKEN"),
+    ] {
+        if requested.contains(&provider) && std::env::var_os(token).is_some() {
+            sources.push(provider);
+        }
     }
     if requested.contains(&Provider::Codex) && executable_available("codex") {
         sources.push(Provider::Codex);
@@ -998,6 +1002,15 @@ pub async fn adapters(
     timeout: std::time::Duration,
     filter: Option<&str>,
 ) -> Result<Vec<Arc<dyn ProviderAdapter>>, AccountError> {
+    adapters_with_vault(providers, saved, timeout, filter, Vault::for_usage).await
+}
+async fn adapters_with_vault(
+    providers: Vec<Provider>,
+    saved: bool,
+    timeout: std::time::Duration,
+    filter: Option<&str>,
+    vault: impl Fn() -> Result<Vault, AccountError>,
+) -> Result<Vec<Arc<dyn ProviderAdapter>>, AccountError> {
     if filter.is_some() && providers.len() != 1 {
         return Err(AccountError::Unsupported);
     }
@@ -1006,11 +1019,13 @@ pub async fn adapters(
             && providers.iter().any(|p| {
                 matches!(
                     p,
-                    Provider::Codex | Provider::Amp | Provider::Catalog("cursor" | "grok")
+                    Provider::Codex
+                        | Provider::Amp
+                        | Provider::Catalog("cursor" | "grok" | "claude" | "copilot")
                 )
             })
         {
-            let accounts = discover(Vault::for_usage()?, timeout).await?;
+            let accounts = discover(vault()?, timeout).await?;
             if accounts.iter().any(|a| {
                 providers.contains(&a.provider)
                     && native_reference_replaces_local(a.provider, &a.credential)
@@ -1032,7 +1047,7 @@ pub async fn adapters(
         }
         return Ok(providers.into_iter().map(Provider::adapter).collect());
     }
-    let vault = Vault::for_usage()?;
+    let vault = vault()?;
     let (accounts, local_sources) = tokio::join!(discover(vault.clone(), timeout), async {
         if filter.is_none() {
             local_sources(&providers, timeout).await
@@ -1196,6 +1211,115 @@ mod tests {
                 }
                 Ok(k)
             })
+        }
+    }
+
+    #[test]
+    fn claude_and_copilot_selection_uses_isolated_environment() {
+        let dir = std::env::temp_dir().join(random_string().unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        for independent in [false, true] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "accounts::service::tests::claude_and_copilot_selection_child",
+                    "--nocapture",
+                ])
+                .env("HOME", &dir)
+                .env("QUOTIO_SELECTION_FIXTURE", &dir)
+                .env_remove("CLAUDE_OAUTH_ACCESS_TOKEN")
+                .env_remove("COPILOT_API_TOKEN");
+            if independent {
+                command
+                    .env("CLAUDE_OAUTH_ACCESS_TOKEN", "independent-claude-fixture")
+                    .env("COPILOT_API_TOKEN", "independent-copilot-fixture");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn claude_and_copilot_selection_child() {
+        let Ok(dir) = std::env::var("QUOTIO_SELECTION_FIXTURE") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let missing = dir.join("missing-native-credentials");
+        assert!(!missing.exists());
+        for (provider, token, credential) in [
+            (
+                Provider::Catalog("claude"),
+                "CLAUDE_OAUTH_ACCESS_TOKEN",
+                Credential::ClaudeNative {
+                    source: super::super::sources::ClaudeNativeReference {
+                        location: super::super::sources::ClaudeLocation::CodeFile,
+                        path: Some(missing.clone()),
+                    },
+                },
+            ),
+            (
+                Provider::Catalog("copilot"),
+                "COPILOT_API_TOKEN",
+                Credential::CopilotNative {
+                    source: super::super::sources::CopilotNativeReference {
+                        location: super::super::sources::CopilotLocation::Apps,
+                        path: Some(missing.clone()),
+                        entry_key: "github.com:fixture".into(),
+                    },
+                },
+            ),
+        ] {
+            let independent = std::env::var_os(token).is_some();
+            for enabled in [false, true] {
+                let vault = Vault::new(Arc::new(Memory::default()), dir.join("selection.lock"));
+                let mut tx = vault.begin().unwrap();
+                let id = tx
+                    .document
+                    .add(provider, "Native", "source".into(), credential.clone())
+                    .unwrap();
+                tx.document.patch(&id, None, None, Some(enabled)).unwrap();
+                tx.commit().unwrap();
+
+                // A disabled reference must block the local alias before native reads,
+                // even when its source is missing. An independent token remains usable.
+                let local = adapters_with_vault(
+                    vec![provider],
+                    true,
+                    Duration::from_secs(1),
+                    Some("local"),
+                    || Ok(vault.clone()),
+                )
+                .await;
+                if independent {
+                    let local = local.unwrap();
+                    assert_eq!(local.len(), 1);
+                    assert_eq!(local[0].account_ref().unwrap().id, "local");
+                } else {
+                    assert!(matches!(local, Err(AccountError::Unsupported)));
+                }
+
+                let selected =
+                    adapters_with_vault(vec![provider], true, Duration::from_secs(1), None, || {
+                        Ok(vault.clone())
+                    })
+                    .await
+                    .unwrap();
+                let ids: Vec<_> = selected
+                    .iter()
+                    .map(|a| a.account_ref().unwrap().id)
+                    .collect();
+                assert_eq!(ids.contains(&"local".to_string()), independent);
+                assert_eq!(ids.len(), if independent { 2 } else { 1 });
+                assert!(ids.contains(&id));
+            }
         }
     }
 
