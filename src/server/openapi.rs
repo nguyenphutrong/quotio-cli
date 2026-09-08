@@ -259,6 +259,7 @@ mod tests {
             "operation",
         );
         let account = crate::accounts::api::AccountDto {
+            source_kind: None,
             enabled: true,
             origin: crate::accounts::AccountOrigin::Owned,
             id: "synthetic-account".into(),

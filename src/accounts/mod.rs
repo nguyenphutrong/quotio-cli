@@ -59,6 +59,9 @@ pub enum AccountError {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Credential {
+    GrokNative {
+        source: sources::GrokNativeReference,
+    },
     CursorNative {
         source: sources::CursorNativeReference,
     },
@@ -121,7 +124,7 @@ impl Account {
     pub fn origin(&self) -> AccountOrigin {
         match self.credential {
             Credential::QuotioCustomProvider { .. } => AccountOrigin::BorrowedProxy,
-            Credential::AmpNative { .. } | Credential::CursorNative { .. } => {
+            Credential::AmpNative { .. } | Credential::CursorNative { .. } | Credential::GrokNative { .. } => {
                 AccountOrigin::BorrowedNative
             }
             _ => AccountOrigin::Owned,
@@ -184,6 +187,7 @@ impl Document {
             Credential::QuotioCustomProvider { .. }
                 | Credential::AmpNative { .. }
                 | Credential::CursorNative { .. }
+                | Credential::GrokNative { .. }
         ) {
             self.version = self.version.max(3);
         }

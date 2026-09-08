@@ -2031,6 +2031,15 @@
           },
           "enabled": {
             "type": "boolean"
+          },
+          "source_kind": {
+            "type": "string",
+            "enum": [
+              "grok_native",
+              "cursor_native",
+              "amp_native",
+              "quotio_custom_provider"
+            ]
           }
         },
         "additionalProperties": false,
@@ -2140,7 +2149,8 @@
                   "enum": [
                     "quotio_custom_provider",
                     "amp_native",
-                    "cursor_native"
+                    "cursor_native",
+                    "grok_native"
                   ]
                 },
                 "platforms": {
@@ -2754,6 +2764,24 @@
             "properties": {
               "kind": {
                 "const": "cursor_native"
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "entry_key"
+            ],
+            "properties": {
+              "kind": {
+                "const": "grok_native"
+              },
+              "entry_key": {
+                "type": "string",
+                "maxLength": 256,
+                "pattern": "^(https://auth\\.x\\.ai::[A-Za-z0-9-]+|https://accounts\\.x\\.ai/sign-in)$"
               }
             },
             "additionalProperties": false

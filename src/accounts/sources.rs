@@ -105,6 +105,54 @@ impl CursorNativeReference {
     }
 }
 
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GrokNativeReference {
+    pub path: std::path::PathBuf,
+    pub entry_key: String,
+}
+impl GrokNativeReference {
+    pub fn system(entry_key: String) -> Result<Self, AccountError> {
+        let source = Self {
+            path: crate::providers::catalog::oauth_editors::grok_auth_path()
+                .ok_or(AccountError::Unsupported)?,
+            entry_key,
+        };
+        source.identity()?;
+        Ok(source)
+    }
+    pub fn identity(&self) -> Result<String, AccountError> {
+        let key = &self.entry_key;
+        if !self.path.is_absolute() || key.len() > 256
+            || !(key == "https://accounts.x.ai/sign-in"
+                || key.strip_prefix("https://auth.x.ai::").is_some_and(|id|
+                    !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')))
+        {
+            return Err(AccountError::Input);
+        }
+        Ok(crate::cache::fingerprint(&[
+            "grok_native", self.path.to_str().ok_or(AccountError::Input)?, key,
+        ]))
+    }
+    pub async fn resolve(&self) -> Result<Resolved, AccountError> {
+        self.identity()?;
+        let source = self.clone();
+        let token = tokio::time::timeout(std::time::Duration::from_secs(10),
+            tokio::task::spawn_blocking(move ||
+                crate::providers::catalog::oauth_editors::grok_entry_token(
+                    &source.path, &source.entry_key, time::OffsetDateTime::now_utc())))
+            .await.map_err(|_| AccountError::Busy)?
+            .map_err(|_| AccountError::Storage)??;
+        Ok(Resolved {
+            label: format!("Grok {}", &self.identity()?[..8]),
+            provider: crate::cli::Provider::Catalog("grok"),
+            plan: None,
+            subscription_status: None,
+            credentials: vec![Credential::CatalogKey { token: token.0, settings: Default::default() }],
+        })
+    }
+}
+
 impl Credential {
     pub async fn resolve_reference(
         &self,
@@ -126,6 +174,9 @@ impl Credential {
             Self::AmpNative { source } if provider == crate::cli::Provider::Amp => {
                 source.resolve().await.map(Some)
             }
+            Self::GrokNative { source } if provider == crate::cli::Provider::Catalog("grok") => {
+                source.resolve().await.map(Some)
+            }
             Self::CursorNative { source }
                 if provider == crate::cli::Provider::Catalog("cursor") =>
             {
@@ -133,6 +184,7 @@ impl Credential {
             }
             Self::QuotioCustomProvider { .. }
             | Self::AmpNative { .. }
+            | Self::GrokNative { .. }
             | Self::CursorNative { .. } => Err(AccountError::Unsupported),
             _ => Ok(None),
         }
@@ -330,6 +382,19 @@ fn read_preferences(_: QuotioDomain) -> Result<Vec<u8>, AccountError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn grok_registration_only_accepts_an_explicit_safe_entry() {
+        let base = serde_json::json!({"kind":"grok_native", "entry_key":"https://auth.x.ai::fixture"});
+        assert!(serde_json::from_value::<crate::accounts::api::SourceInput>(base.clone()).is_ok());
+        for field in ["path", "token", "owned", "source", "refresh_token"] {
+            let mut value = base.clone();
+            value[field] = "fixture".into();
+            assert!(serde_json::from_value::<crate::accounts::api::SourceInput>(value).is_err());
+        }
+        for key in ["", "../../secret", "https://other.example::id", "https://auth.x.ai::"] {
+            assert!(GrokNativeReference::system(key.into()).is_err());
+        }
+    }
     #[test]
     fn cursor_source_input_cannot_supply_paths_tokens_or_ownership() {
         assert!(

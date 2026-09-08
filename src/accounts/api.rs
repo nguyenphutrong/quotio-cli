@@ -12,6 +12,8 @@ pub struct AccountDto {
     pub active: bool,
     pub origin: super::AccountOrigin,
     pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<&'static str>,
 }
 impl From<&super::Account> for AccountDto {
     fn from(account: &super::Account) -> Self {
@@ -22,6 +24,13 @@ impl From<&super::Account> for AccountDto {
             active: account.active,
             origin: account.origin(),
             enabled: account.enabled(),
+            source_kind: match account.credential {
+                Credential::GrokNative { .. } => Some("grok_native"),
+                Credential::CursorNative { .. } => Some("cursor_native"),
+                Credential::AmpNative { .. } => Some("amp_native"),
+                Credential::QuotioCustomProvider { .. } => Some("quotio_custom_provider"),
+                _ => None,
+            },
         }
     }
 }
@@ -97,6 +106,7 @@ pub struct PreparedAccount {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceInput {
+    GrokNative { entry_key: String },
     CursorNative {},
     AmpNative {},
     QuotioCustomProvider {
@@ -112,6 +122,11 @@ pub async fn prepare_source(input: SourceInput) -> Result<PreparedAccount, Accou
                 Credential::QuotioCustomProvider { source },
                 resolved,
             )
+        }
+        SourceInput::GrokNative { entry_key } => {
+            let source = super::sources::GrokNativeReference::system(entry_key)?;
+            let resolved = source.resolve().await?;
+            (source.identity()?, Credential::GrokNative { source }, resolved)
         }
         SourceInput::CursorNative {} => {
             let source = super::sources::CursorNativeReference::system()?;

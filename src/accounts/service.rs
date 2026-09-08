@@ -30,7 +30,7 @@ fn scoped(
             .catalog()
             .filter(|d| {
                 d.auth == crate::providers::catalog::AuthKind::ApiKey
-                    || provider == Provider::Catalog("cursor")
+                    || matches!(provider, Provider::Catalog("cursor" | "grok"))
             })
             .ok_or(AccountError::Unsupported)?;
         keys.insert(definition.key_env.into(), token.clone());
@@ -189,6 +189,11 @@ async fn validate_credential(
                 &ctx, endpoint, endpoint,
             )
             .await?
+        }
+        Provider::Catalog("grok") if endpoint_override.is_some() => {
+            crate::providers::catalog::oauth_editors::fetch_grok_complete_at(
+                &ctx, endpoint_override.unwrap(), None,
+            ).await?
         }
         Provider::Factory => FactoryProvider.fetch(&ctx).await?,
         Provider::Codex => codex_api::fetch(&ctx, credential).await?,
@@ -441,6 +446,7 @@ pub fn default_label(
     match credential {
         Credential::QuotioCustomProvider { .. }
         | Credential::AmpNative { .. }
+        | Credential::GrokNative { .. }
         | Credential::CursorNative { .. } => Err(AccountError::Input),
         Credential::CodexOAuth { email, .. } => super::validate_label(email),
         Credential::ApiKey { token, .. } | Credential::CatalogKey { token, .. } => {
@@ -615,6 +621,7 @@ impl ProviderAdapter for ManagedProvider {
             let scope = match &account.credential {
                 Credential::QuotioCustomProvider { .. }
                 | Credential::AmpNative { .. }
+                | Credential::GrokNative { .. }
                 | Credential::CursorNative { .. } => serde_json::to_string(
                     &account
                         .credential
@@ -800,6 +807,9 @@ pub(crate) fn uses_native_amp_source() -> bool {
 fn native_reference_replaces_local(provider: Provider, credential: &Credential) -> bool {
     match credential {
         Credential::AmpNative { .. } => provider == Provider::Amp && uses_native_amp_source(),
+        Credential::GrokNative { .. } => {
+            provider == Provider::Catalog("grok") && std::env::var_os("GROK_OAUTH_TOKEN").is_none()
+        }
         Credential::CursorNative { .. } => {
             provider == Provider::Catalog("cursor")
                 && std::env::var_os("CURSOR_ACCESS_TOKEN").is_none()
@@ -1206,6 +1216,61 @@ mod tests {
                 adapter.fetch(&context).await.unwrap_err(),
                 ProviderError::SourceDisabled
             );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_references_fence_rotation_and_keep_entries_separate() {
+        for rotate in [false, true] {
+            let dir = std::env::temp_dir().join(random_string().unwrap());
+            std::fs::create_dir(&dir).unwrap();
+            let path = dir.join("auth.json");
+            let data = serde_json::json!({
+                "https://auth.x.ai::first": {"key":"fixture-first", "expires_at":"2099-01-01T00:00:00Z"},
+                "https://auth.x.ai::second": {"key":"fixture-second", "expires_at":"2099-01-01T00:00:00Z"}
+            });
+            std::fs::write(&path, data.to_string()).unwrap();
+            let source = super::super::sources::GrokNativeReference { path: path.clone(), entry_key: "https://auth.x.ai::first".into() };
+            let mut second = source.clone();
+            second.entry_key = "https://auth.x.ai::second".into();
+            assert_ne!(source.identity().unwrap(), second.identity().unwrap());
+            assert!(source.resolve().await.unwrap().credentials != second.resolve().await.unwrap().credentials);
+            let credential = Credential::GrokNative { source: source.clone() };
+            let vault = Vault::new(Arc::new(Memory::default()), dir.join("lock"));
+            let mut tx = vault.begin().unwrap();
+            let id = tx.document.add(Provider::Catalog("grok"), "First", source.identity().unwrap(), credential.clone()).unwrap();
+            let account = tx.document.accounts[0].clone();
+            tx.commit().unwrap();
+            let adapter = super::managed(&vault, &account);
+            let context = http::fixture::context();
+            let before = adapter.cache_identity(&context).await.unwrap();
+            let changed = path.clone();
+            let original = std::fs::read(&path).unwrap();
+            let (endpoint, server) = http::fixture::server_status_with_action(vec![(200, serde_json::json!({"config":{"creditUsagePercent":20}}))], move |_| {
+                if rotate {
+                    let mut data = data.clone();
+                    data["https://auth.x.ai::first"]["key"] = "fixture-rotated".into();
+                    std::fs::write(&changed, data.to_string()).unwrap();
+                }
+            }).await;
+            let result = validate_with_endpoint(&context, Provider::Catalog("grok"), &credential, Some(&endpoint)).await;
+            if rotate {
+                assert!(matches!(result, Err(AccountError::Busy)));
+                assert_ne!(adapter.cache_identity(&context).await.unwrap(), before);
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(original, std::fs::read(&path).unwrap());
+            }
+            assert!(server.await.unwrap()[0].contains("Bearer fixture-first"));
+            let mut tx = vault.begin().unwrap();
+            assert!(!serde_json::to_string(&tx.document).unwrap().contains("fixture-first"));
+            tx.document.patch(&id, None, None, Some(false)).unwrap();
+            tx.commit().unwrap();
+            assert!(adapter.cache_identity(&context).await.is_none());
+            assert_eq!(adapter.fetch(&context).await.unwrap_err(), ProviderError::SourceDisabled);
+            std::fs::remove_file(&path).unwrap();
+            assert!(source.resolve().await.is_err());
             std::fs::remove_dir_all(dir).unwrap();
         }
     }

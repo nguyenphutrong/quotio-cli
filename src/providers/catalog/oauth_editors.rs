@@ -295,7 +295,7 @@ async fn fetch_grok_at(
     fetch_grok_complete_at(context, endpoint, None).await
 }
 
-async fn fetch_grok_complete_at(
+pub(crate) async fn fetch_grok_complete_at(
     context: &ProviderContext,
     endpoint: &str,
     settings_endpoint: Option<&str>,
@@ -1051,8 +1051,16 @@ async fn grok_token(context: &ProviderContext) -> Result<Secret, ProviderError> 
     blocking(move || grok_native_token(&path, now)).await
 }
 
-fn grok_auth_path() -> Option<PathBuf> {
+pub(crate) fn grok_auth_path() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".grok/auth.json"))
+}
+
+pub(crate) fn grok_entry_token(path: &Path, entry_key: &str, now: OffsetDateTime) -> Result<Secret, ProviderError> {
+    let bytes = read_regular_file(path, MAX_NATIVE_FILE_BYTES)?;
+    let root: Value = serde_json::from_slice(&bytes).map_err(|_| ProviderError::Authentication)?;
+    let entry = root.get(entry_key).ok_or(ProviderError::Authentication)?;
+    let selected = serde_json::json!({entry_key: entry});
+    grok_native_token_from_bytes(&serde_json::to_vec(&selected).map_err(|_| ProviderError::Authentication)?, now)
 }
 
 fn grok_native_token(path: &Path, now: OffsetDateTime) -> Result<Secret, ProviderError> {

@@ -166,6 +166,7 @@ impl Vault {
                                 super::Credential::QuotioCustomProvider { .. }
                                     | super::Credential::AmpNative { .. }
                                     | super::Credential::CursorNative { .. }
+                                    | super::Credential::GrokNative { .. }
                             )
                         }))
                     || (doc.version < 4 && doc.accounts.iter().any(|a| !a.enabled))
