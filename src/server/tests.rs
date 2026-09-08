@@ -220,6 +220,21 @@ async fn codex_source_rest_child() {
         .build()
         .unwrap();
     let base = format!("http://{address}");
+    for input in [
+        json!({"kind":"claude_native","location":"desktop"}),
+        json!({"kind":"claude_native","location":"code_file","path":"/tmp/untrusted"}),
+        json!({"kind":"claude_native","location":"code_file","refresh_token":"fixture"}),
+    ] {
+        let response = client
+            .post(format!("{base}/v1/account-sources"))
+            .bearer_auth(token)
+            .header("Idempotency-Key", "invalid-claude-source")
+            .json(&input)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+    }
     let input = json!({"kind":"codex_native"});
     let unauth = client
         .post(format!("{base}/v1/account-sources"))

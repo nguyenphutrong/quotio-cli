@@ -2053,6 +2053,7 @@
               "cursor_native",
               "amp_native",
               "codex_native",
+              "claude_native",
               "quotio_custom_provider"
             ]
           }
@@ -2166,6 +2167,7 @@
                     "quotio_custom_provider",
                     "amp_native",
                     "codex_native",
+                    "claude_native",
                     "cursor_native",
                     "grok_native"
                   ]
@@ -2727,6 +2729,19 @@
       },
       "AccountSourceInput": {
         "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "location"],
+            "properties": {
+              "kind": {"const": "claude_native"},
+              "location": {
+                "type": "string",
+                "enum": ["code_file", "code_keychain"],
+                "description": "code_file pins ~/.claude/.credentials.json. code_keychain reads Claude Code-credentials on macOS only. Read-only; no refresh or fallback. Desktop is unsupported."
+              }
+            }
+          },
           {
             "type": "object",
             "additionalProperties": false,

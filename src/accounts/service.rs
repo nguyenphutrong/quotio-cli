@@ -44,7 +44,7 @@ fn scoped(
             .catalog()
             .filter(|d| {
                 d.auth == crate::providers::catalog::AuthKind::ApiKey
-                    || matches!(provider, Provider::Catalog("cursor" | "grok"))
+                    || matches!(provider, Provider::Catalog("cursor" | "grok" | "claude"))
             })
             .ok_or(AccountError::Unsupported)?;
         keys.insert(definition.key_env.into(), token.clone());
@@ -209,6 +209,13 @@ async fn validate_credential(
                 &ctx,
                 endpoint_override.unwrap(),
                 None,
+            )
+            .await?
+        }
+        Provider::Catalog("claude") if endpoint_override.is_some() => {
+            crate::providers::catalog::oauth_primary::fetch_claude_at(
+                &ctx,
+                endpoint_override.unwrap(),
             )
             .await?
         }
@@ -468,6 +475,7 @@ pub fn default_label(
         Credential::QuotioCustomProvider { .. }
         | Credential::AmpNative { .. }
         | Credential::CodexNative { .. }
+        | Credential::ClaudeNative { .. }
         | Credential::GrokNative { .. }
         | Credential::CursorNative { .. } => Err(AccountError::Input),
         Credential::GrokOAuth { .. } => Ok("Grok owned account".into()),
@@ -693,6 +701,7 @@ impl ProviderAdapter for ManagedProvider {
                 Credential::QuotioCustomProvider { .. }
                 | Credential::AmpNative { .. }
                 | Credential::CodexNative { .. }
+                | Credential::ClaudeNative { .. }
                 | Credential::GrokNative { .. }
                 | Credential::CursorNative { .. } => serde_json::to_string(
                     &account
@@ -880,6 +889,10 @@ pub(crate) fn uses_native_amp_source() -> bool {
 }
 pub(crate) fn native_reference_replaces_local(provider: Provider, credential: &Credential) -> bool {
     match credential {
+        Credential::ClaudeNative { .. } => {
+            provider == Provider::Catalog("claude")
+                && std::env::var_os("CLAUDE_OAUTH_ACCESS_TOKEN").is_none()
+        }
         Credential::CodexNative { source } => {
             provider == Provider::Codex
                 && super::sources::CodexNativeReference::system(
@@ -1185,6 +1198,78 @@ mod tests {
         assert!(native_amp_selection(false, Some("invalid-url")));
         assert!(!native_amp_selection(true, None));
         assert!(!native_amp_selection(false, Some("https://custom.example")));
+    }
+    #[tokio::test]
+    async fn claude_native_http_fences_rotation_and_disable() {
+        for rotate in [false, true] {
+            let dir = std::env::temp_dir().join(random_string().unwrap());
+            std::fs::create_dir(&dir).unwrap();
+            let path = dir.join("credentials.json");
+            let original = br#"{"claudeAiOauth":{"accessToken":"native-first-fixture","refreshToken":"owner-only","scopes":["user:profile"]}}"#;
+            std::fs::write(&path, original).unwrap();
+            let credential = Credential::ClaudeNative {
+                source: super::super::sources::ClaudeNativeReference {
+                    location: super::super::sources::ClaudeLocation::CodeFile,
+                    path: Some(path.clone()),
+                },
+            };
+            let provider = Provider::Catalog("claude");
+            let vault = Vault::new(Arc::new(Memory::default()), dir.join("lock"));
+            let mut tx = vault.begin().unwrap();
+            let id = tx
+                .document
+                .add(provider, "Fixture", "source".into(), credential.clone())
+                .unwrap();
+            let account = tx.document.accounts[0].clone();
+            assert_eq!(
+                account.origin(),
+                crate::domain::AccountOrigin::BorrowedNative
+            );
+            assert!(
+                !serde_json::to_string(&tx.document)
+                    .unwrap()
+                    .contains("owner-only")
+            );
+            tx.commit().unwrap();
+            let adapter = super::managed(&vault, &account);
+            let context = http::fixture::context();
+            let before = adapter.cache_identity(&context).await.unwrap();
+            let changed = path.clone();
+            let (endpoint, server) = http::fixture::server_status_with_action(
+                vec![(200, serde_json::json!({"five_hour":{"utilization":25}}))],
+                move |_| {
+                    if rotate {
+                        std::fs::write(
+                            &changed,
+                            br#"{"claudeAiOauth":{"accessToken":"native-second-fixture"}}"#,
+                        )
+                        .unwrap();
+                    }
+                },
+            )
+            .await;
+            let result =
+                validate_with_endpoint(&context, provider, &credential, Some(&endpoint)).await;
+            if rotate {
+                assert!(matches!(result, Err(AccountError::Busy)));
+                assert_ne!(adapter.cache_identity(&context).await.unwrap(), before);
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+            }
+            let requests = server.await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("GET "));
+            assert!(requests[0].contains("Bearer native-first-fixture"));
+            assert!(!requests[0].contains("owner-only"));
+            let mut tx = vault.begin().unwrap();
+            tx.document.patch(&id, None, None, Some(false)).unwrap();
+            tx.commit().unwrap();
+            assert!(adapter.cache_identity(&context).await.is_none());
+            std::fs::remove_file(&path).unwrap();
+            assert!(credential.resolve_reference(provider).await.is_err());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
     #[tokio::test]
     async fn codex_native_http_is_read_only_and_fences_source_and_account_changes() {

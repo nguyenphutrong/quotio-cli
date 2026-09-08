@@ -1,6 +1,75 @@
-//! Explicit references to Quotio's proxy configuration. No discovery or writes.
+//! Explicit native and proxy references. No discovery or writes.
 use super::{AccountError, Credential};
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeLocation {
+    CodeFile,
+    CodeKeychain,
+}
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeNativeReference {
+    pub location: ClaudeLocation,
+    pub path: Option<std::path::PathBuf>,
+}
+impl ClaudeNativeReference {
+    pub fn system(location: ClaudeLocation) -> Result<Self, AccountError> {
+        let path = match location {
+            ClaudeLocation::CodeFile => Some(
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .ok_or(AccountError::NotFound)?
+                    .join(".claude/.credentials.json"),
+            ),
+            ClaudeLocation::CodeKeychain => {
+                if !cfg!(target_os = "macos") {
+                    return Err(AccountError::Unsupported);
+                }
+                None
+            }
+        };
+        let source = Self { location, path };
+        source.identity()?;
+        Ok(source)
+    }
+    pub fn identity(&self) -> Result<String, AccountError> {
+        let location = match (self.location, &self.path) {
+            (ClaudeLocation::CodeFile, Some(path))
+                if path.is_absolute()
+                    && !path
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir)) =>
+            {
+                path.to_str().ok_or(AccountError::Input)?
+            }
+            (ClaudeLocation::CodeKeychain, None) => "Claude Code-credentials",
+            _ => return Err(AccountError::Input),
+        };
+        Ok(crate::cache::fingerprint(&["claude_native", location]))
+    }
+    pub async fn resolve(&self) -> Result<Resolved, AccountError> {
+        self.identity()?;
+        let token =
+            crate::providers::catalog::oauth_primary::claude_reference_token(self.path.clone())
+                .await?;
+        Ok(Resolved {
+            label: match self.location {
+                ClaudeLocation::CodeFile => "Claude Code file",
+                ClaudeLocation::CodeKeychain => "Claude Code Keychain",
+            }
+            .into(),
+            provider: crate::cli::Provider::Catalog("claude"),
+            plan: None,
+            subscription_status: None,
+            credentials: vec![Credential::CatalogKey {
+                token: token.0,
+                settings: Default::default(),
+            }],
+        })
+    }
+}
 
 fn enabled_default() -> bool {
     true
@@ -242,6 +311,11 @@ impl Credential {
         provider: crate::cli::Provider,
     ) -> Result<Option<Resolved>, AccountError> {
         match self {
+            Self::ClaudeNative { source }
+                if provider == crate::cli::Provider::Catalog("claude") =>
+            {
+                source.resolve().await.map(Some)
+            }
             Self::CodexNative { source } if provider == crate::cli::Provider::Codex => {
                 source.resolve().await.map(Some)
             }
@@ -270,6 +344,7 @@ impl Credential {
             }
             Self::QuotioCustomProvider { .. }
             | Self::CodexNative { .. }
+            | Self::ClaudeNative { .. }
             | Self::AmpNative { .. }
             | Self::GrokNative { .. }
             | Self::CursorNative { .. } => Err(AccountError::Unsupported),
@@ -469,6 +544,60 @@ fn read_preferences(_: QuotioDomain) -> Result<Vec<u8>, AccountError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn claude_native_registration_rejects_paths_credentials_and_desktop() {
+        use crate::accounts::api::SourceInput;
+        let base = serde_json::json!({"kind":"claude_native","location":"code_file"});
+        assert!(serde_json::from_value::<SourceInput>(base.clone()).is_ok());
+        for field in [
+            "path",
+            "token",
+            "refresh_token",
+            "owned",
+            "source",
+            "enabled",
+        ] {
+            let mut value = base.clone();
+            value[field] = "fixture".into();
+            assert!(serde_json::from_value::<SourceInput>(value).is_err());
+        }
+        for location in ["desktop", "../../secret", "default"] {
+            let mut value = base.clone();
+            value["location"] = location.into();
+            assert!(serde_json::from_value::<SourceInput>(value).is_err());
+        }
+    }
+    #[tokio::test]
+    async fn claude_native_rejects_hostile_files_without_fallback() {
+        let dir = std::env::temp_dir().join(super::super::random_string().unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("credentials.json");
+        let source = ClaudeNativeReference {
+            location: ClaudeLocation::CodeFile,
+            path: Some(path.clone()),
+        };
+        assert!(source.resolve().await.is_err());
+        for bytes in [b"{}".to_vec(), vec![b' '; 1024 * 1024 + 1]] {
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(source.resolve().await.is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        std::fs::remove_file(&path).unwrap();
+        #[cfg(unix)]
+        {
+            let other = dir.join("other.json");
+            std::fs::write(&other, br#"{"claudeAiOauth":{"accessToken":"fixture"}}"#).unwrap();
+            std::os::unix::fs::symlink(&other, &path).unwrap();
+            assert!(source.resolve().await.is_err());
+        }
+        assert!(matches!(
+            Credential::ClaudeNative { source }
+                .resolve_reference(crate::cli::Provider::Amp)
+                .await,
+            Err(AccountError::Unsupported)
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn codex_registration_only_accepts_standard_location_selectors() {
         use crate::accounts::api::SourceInput;

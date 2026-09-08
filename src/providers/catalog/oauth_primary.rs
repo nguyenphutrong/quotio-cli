@@ -242,6 +242,15 @@ fn claude_token_from_bytes(bytes: &[u8]) -> Result<Option<Secret>, ProviderError
     }
 }
 
+pub(crate) async fn claude_reference_token(path: Option<PathBuf>) -> Result<Secret, ProviderError> {
+    let bytes = match path {
+        Some(path) => native_file(path).await?,
+        None => native_keychain("Claude Code-credentials", None).await?,
+    }
+    .ok_or(ProviderError::Authentication)?;
+    claude_token_from_bytes(&bytes)?.ok_or(ProviderError::Authentication)
+}
+
 async fn native_claude_token() -> Result<Secret, ProviderError> {
     let mut last = ProviderError::Authentication;
     match native_keychain("Claude Code-credentials", None).await {
@@ -384,7 +393,7 @@ fn claude_windows(value: &Value, now: OffsetDateTime) -> Result<Vec<QuotaWindow>
     Ok(windows)
 }
 
-async fn fetch_claude_at(
+pub(crate) async fn fetch_claude_at(
     context: &ProviderContext,
     endpoint: &str,
 ) -> Result<ProviderUsage, ProviderError> {
