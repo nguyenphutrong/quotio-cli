@@ -25,7 +25,7 @@ pub struct Request {
 pub enum Reference {
     Grok(GrokNativeReference),
     Copilot(CopilotNativeReference),
-    Custom(CustomProviderReference, PreferencesReader),
+    Custom(CustomProviderReference, PreferencesReader, Provider),
 }
 impl Reference {
     pub async fn resolve(self) -> Result<super::api::PreparedAccount, AccountError> {
@@ -46,7 +46,7 @@ impl Reference {
                     resolved.provider,
                 )
             }
-            Self::Custom(source, read) => {
+            Self::Custom(source, read, provider) => {
                 let selected = source.clone();
                 let resolved = tokio::time::timeout(
                     Duration::from_secs(10),
@@ -55,6 +55,9 @@ impl Reference {
                 .await
                 .map_err(|_| AccountError::Busy)?
                 .map_err(|_| AccountError::Storage)??;
+                if resolved.provider != provider {
+                    return Err(AccountError::Input);
+                }
                 (
                     source.identity()?,
                     super::Credential::QuotioCustomProvider { source },
@@ -272,7 +275,7 @@ fn custom_references(
             record_id: id.into(),
         };
         if source.identity().is_ok() {
-            result.push(Reference::Custom(source, read));
+            result.push(Reference::Custom(source, read, provider));
         }
     }
     Ok(result)
@@ -394,6 +397,23 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn custom_reference_rejects_provider_rotation_after_inspection() {
+        let mut registry = Registry {
+            preferences: |_| Ok(br#"[{"id":"11111111-1111-1111-1111-111111111111","type":"clinepass","name":"Fixture","api-keys":[{"api-key":"fixture"}]}]"#.to_vec()),
+            ..Default::default()
+        };
+        // The reader returns a valid Z.ai record when registration re-reads it.
+        fn rotated(_: QuotioDomain) -> Result<Vec<u8>, AccountError> {
+            Ok(br#"[{"id":"11111111-1111-1111-1111-111111111111","type":"glm-api-key","name":"Fixture","base-url":"https://api.z.ai","api-keys":[{"api-key":"fixture"}]}]"#.to_vec())
+        }
+        let request = serde_json::from_value(json!({"provider":"clinepass","kind":"quotio_custom_provider","domain":"production","inspect":true})).unwrap();
+        let discovered = registry.inspect(request).unwrap();
+        let reference = registry.get(discovered["candidates"][0]["source"]["discovery_ref"].as_str().unwrap()).unwrap();
+        let Reference::Custom(source, _, provider) = reference else { panic!("custom reference expected") };
+        assert_eq!(source.parse(&rotated(source.domain).unwrap()).unwrap().provider, Provider::Zai);
+        assert!(matches!(Reference::Custom(source, rotated, provider).resolve().await, Err(AccountError::Input)));
     }
     #[test]
     fn discovery_references_expire_and_are_bounded() {
