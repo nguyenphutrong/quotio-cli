@@ -69,10 +69,19 @@ pub(crate) fn parse(
     }
     Ok(usage)
 }
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_ENDPOINTS: (String, String, String);
+}
+
 pub async fn fetch(
     context: &ProviderContext,
     credential: &Credential,
 ) -> Result<ProviderUsage, ProviderError> {
+    #[cfg(test)]
+    if let Ok((quota, inventory, profile)) = TEST_ENDPOINTS.try_with(Clone::clone) {
+        return fetch_at(context, credential, &quota, &inventory, &profile).await;
+    }
     fetch_at(
         context,
         credential,
@@ -140,6 +149,15 @@ async fn supplemental(
     endpoint: &str,
     inventory: bool,
 ) -> Result<Value, ProviderError> {
+    let cap = std::time::Duration::from_secs(4);
+    let budget = super::remaining_fetch_time().map_or(cap, |remaining| {
+        // Leave time for the account adapter to verify identity and return the quota.
+        let reserve = (remaining / 10).min(std::time::Duration::from_millis(100));
+        remaining.saturating_sub(reserve).min(cap)
+    });
+    if budget.is_zero() {
+        return Err(ProviderError::Timeout);
+    }
     let mut request = context
         .http
         .get(endpoint)
@@ -150,16 +168,13 @@ async fn supplemental(
         .header("ChatGPT-Account-Id", http::sensitive(account_id)?)
         .header("Accept", "application/json")
         .header("Originator", "Codex Desktop")
-        .timeout(std::time::Duration::from_secs(4));
+        .timeout(budget);
     if inventory {
         request = request.header("OpenAI-Beta", "codex-1");
     }
-    tokio::time::timeout(
-        std::time::Duration::from_secs(4),
-        http::json(request, context.clock.now()),
-    )
-    .await
-    .map_err(|_| ProviderError::Timeout)?
+    tokio::time::timeout(budget, http::json(request, context.clock.now()))
+        .await
+        .map_err(|_| ProviderError::Timeout)?
 }
 
 fn parse_inventory(
@@ -365,6 +380,83 @@ mod tests {
             task.await.unwrap();
             profile_task.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn collector_short_budget_preserves_quota_through_fetch() {
+        use crate::{
+            fetch::{CollectRequest, Collector},
+            providers::{FetchFuture, ProviderAdapter},
+        };
+        use std::{sync::Arc, time::Duration};
+
+        struct Adapter {
+            endpoints: (String, String, String),
+            credential: Credential,
+        }
+        impl ProviderAdapter for Adapter {
+            fn id(&self) -> ProviderId {
+                ProviderId("codex".into())
+            }
+            fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
+                Box::pin(TEST_ENDPOINTS.scope(self.endpoints.clone(), async move {
+                    let usage = fetch(context, &self.credential).await?;
+                    // Model the account adapter's post-fetch identity verification.
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Ok(usage)
+                }))
+            }
+        }
+        let (quota, quota_task) = http::fixture::server(vec![
+            json!({"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000}}}),
+        ]).await;
+        let (inventory, inventory_task) =
+            http::fixture::server_status_with_async_action(vec![(200, json!({}))], |_| async {
+                tokio::time::sleep(Duration::from_secs(30)).await
+            })
+            .await;
+        let (profile, profile_task) =
+            http::fixture::server_status_with_async_action(vec![(200, json!({}))], |_| async {
+                tokio::time::sleep(Duration::from_secs(30)).await
+            })
+            .await;
+        let report = Collector {
+            context: http::fixture::context(),
+        }
+        .collect(CollectRequest {
+            providers: vec![Arc::new(Adapter {
+                endpoints: (quota, inventory, profile),
+                credential: Credential::CodexOAuth {
+                    access_token: "synthetic-token".into(),
+                    refresh_token: "refresh".into(),
+                    id_token: "id".into(),
+                    account_id: "workspace-a".into(),
+                    email: "demo@example.com".into(),
+                    expires_at: 0,
+                },
+            })],
+            timeout: Duration::from_millis(500),
+            cancellation: Default::default(),
+        })
+        .await;
+        inventory_task.abort();
+        profile_task.abort();
+        quota_task.await.unwrap();
+        assert_eq!(report.providers.len(), 1, "{:#?}", report.failures);
+        let usage = &report.providers[0];
+        assert_eq!(usage.windows.len(), 1);
+        assert_eq!(usage.account.id, "workspace-a");
+        assert!(usage.codex_reset_credits.is_none());
+        assert!(usage.codex_profile.is_none());
+        assert_eq!(usage.diagnostics.len(), 2);
+        assert_eq!(usage.diagnostics[0].source, "codex_reset_credits");
+        assert_eq!(usage.diagnostics[1].source, "codex_profile");
+        assert!(
+            usage
+                .diagnostics
+                .iter()
+                .all(|d| d.code == ProviderError::Timeout)
+        );
     }
 
     #[tokio::test]
