@@ -14,6 +14,40 @@ use std::{
 };
 use tracing_subscriber::{filter::Targets, layer::SubscriberExt, util::SubscriberInitExt};
 
+fn account_timeout(command: &quotio::cli::AccountCommand) -> Duration {
+    if matches!(
+        command,
+        quotio::cli::AccountCommand::Add {
+            provider: Provider::Catalog("copilot"),
+            ..
+        }
+    ) {
+        // Device expiry is at most one hour, plus startup and persistence time.
+        Duration::from_secs(3720)
+    } else {
+        Duration::from_secs(180)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn copilot_terminal_deadline_does_not_truncate_device_expiry() {
+        for (provider, expected) in [("copilot", 3720), ("codex", 180), ("claude", 180)] {
+            let cli =
+                Cli::try_parse_from(["quotio", "accounts", "add", "--provider", provider]).unwrap();
+            let Command::Accounts(args) = cli.command else {
+                panic!("account command");
+            };
+            assert_eq!(
+                account_timeout(&args.command),
+                Duration::from_secs(expected)
+            );
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -138,11 +172,12 @@ async fn run() -> ExitCode {
                 clock: Arc::new(SystemClock),
                 credentials: Arc::new(EnvironmentCredentials),
             };
+            let timeout = account_timeout(&args.command);
             let result = tokio::select! {
                 // Register Ctrl-C before an account command can disable terminal echo.
                 biased;
                 _=tokio::signal::ctrl_c()=>Err(quotio::accounts::AccountError::Cancelled),
-                result=tokio::time::timeout(Duration::from_secs(180),quotio::accounts::command::run(args.command,&context))=>result.unwrap_or(Err(quotio::accounts::AccountError::Cancelled)),
+                result=tokio::time::timeout(timeout,quotio::accounts::command::run(args.command,&context))=>result.unwrap_or(Err(quotio::accounts::AccountError::Cancelled)),
             };
             match result {
                 Ok(text) => (text, 0),
