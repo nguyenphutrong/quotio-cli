@@ -1146,7 +1146,15 @@ fn choose(
         match &accounts {
             Ok(accounts) => {
                 let matching: Vec<_> = accounts.iter().filter(|a| a.provider == provider).collect();
-                if (local_sources.contains(&provider) || matching.is_empty())
+                let independent_antigravity_state = provider == Provider::Antigravity
+                    && matching.iter().any(|a| {
+                        matches!(&a.credential,
+                        Credential::AntigravityNative { source }
+                        if source.location == super::sources::AntigravityLocation::StateDb)
+                    });
+                if (local_sources.contains(&provider)
+                    || matching.is_empty()
+                    || independent_antigravity_state)
                     && !matching
                         .iter()
                         .any(|a| native_reference_replaces_local(provider, &a.credential))
@@ -1443,7 +1451,7 @@ mod tests {
     fn claude_and_copilot_selection_uses_isolated_environment() {
         let dir = std::env::temp_dir().join(random_string().unwrap());
         std::fs::create_dir(&dir).unwrap();
-        for independent in [false, true] {
+        for mode in 0..3 {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command
                 .args([
@@ -1460,7 +1468,7 @@ mod tests {
                 .env_remove("ANTIGRAVITY_AUTH_FILE")
                 .env_remove("FACTORY_API_KEY")
                 .env_remove("DEVIN_DESKTOP_API_KEY");
-            if independent {
+            if mode > 0 {
                 command
                     .env("CLAUDE_OAUTH_ACCESS_TOKEN", "independent-claude-fixture")
                     .env("COPILOT_API_TOKEN", "independent-copilot-fixture")
@@ -1471,6 +1479,11 @@ mod tests {
                     )
                     .env("FACTORY_API_KEY", "independent-factory-fixture")
                     .env("DEVIN_DESKTOP_API_KEY", "independent-desktop-fixture");
+            }
+            if mode == 2 {
+                command
+                    .env_remove("ANTIGRAVITY_ACCESS_TOKEN")
+                    .env("ANTIGRAVITY_AUTH_FILE", dir.join("independent-auth.json"));
             }
             let output = command.output().unwrap();
             assert!(
@@ -1491,6 +1504,36 @@ mod tests {
         let dir = std::path::PathBuf::from(dir);
         let missing = dir.join("missing-native-credentials");
         assert!(!missing.exists());
+        // Selection must not probe the real Keychain. state_db is independent of
+        // the default Keychain alias, even without an environment credential.
+        let vault = Vault::new(
+            Arc::new(Memory::default()),
+            dir.join("state-selection.lock"),
+        );
+        let mut tx = vault.begin().unwrap();
+        tx.document
+            .add(
+                Provider::Antigravity,
+                "State",
+                "state".into(),
+                Credential::AntigravityNative {
+                    source: super::super::sources::AntigravityNativeReference {
+                        location: super::super::sources::AntigravityLocation::StateDb,
+                        path: Some(missing.join("Library/Application Support/Antigravity/User/globalStorage/state.vscdb")),
+                    },
+                },
+            )
+            .unwrap();
+        let accounts = tx.document.accounts.clone();
+        drop(tx);
+        let selected =
+            choose(vec![Provider::Antigravity], None, Ok(accounts), &vault, &[]).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert!(
+            selected
+                .iter()
+                .any(|adapter| adapter.account_ref().unwrap().id == "local")
+        );
         for (provider, token, credential) in [
             (
                 Provider::Antigravity,
@@ -1553,7 +1596,9 @@ mod tests {
                 },
             ),
         ] {
-            let independent = std::env::var_os(token).is_some();
+            let independent = std::env::var_os(token).is_some()
+                || (provider == Provider::Antigravity
+                    && std::env::var_os("ANTIGRAVITY_AUTH_FILE").is_some());
             for enabled in [false, true] {
                 let vault = Vault::new(Arc::new(Memory::default()), dir.join("selection.lock"));
                 let mut tx = vault.begin().unwrap();
