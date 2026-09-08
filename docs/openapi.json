@@ -2403,7 +2403,7 @@
         "type": "object",
         "properties": {
           "provider": {
-            "const": "codex"
+            "enum": ["codex", "claude"]
           },
           "label": {
             "type": [
@@ -2426,20 +2426,19 @@
       },
       "CallbackInput": {
         "type": "object",
+        "description": "Submit exactly one Codex callback_url or Claude manual code. Codes and tokens are never returned.",
         "properties": {
-          "callback_url": {
-            "type": "string",
-            "format": "uri"
-          }
+          "callback_url": { "type": "string", "format": "uri" },
+          "code": { "type": "string", "maxLength": 8192 }
         },
         "additionalProperties": false,
-        "required": [
-          "callback_url"
-        ]
+        "oneOf": [ { "required": ["callback_url"] }, { "required": ["code"] } ]
       },
       "Session": {
         "type": "object",
         "properties": {
+          "provider": { "enum": ["codex", "claude"] },
+          "workflow": { "enum": ["browser_callback", "manual_code"] },
           "id": {
             "type": "string"
           },

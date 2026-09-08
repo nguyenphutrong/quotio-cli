@@ -62,6 +62,15 @@ pub enum AccountError {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Credential {
+    ClaudeOAuth {
+        access_token: String,
+        refresh_token: String,
+        account_id: String,
+        email: String,
+        expires_at: i64,
+        #[serde(default)]
+        refresh_pending: bool,
+    },
     DevinDesktopNative {
         source: sources::DevinDesktopNativeReference,
     },
@@ -193,6 +202,8 @@ pub struct Document {
     pub mutation_receipts: std::collections::BTreeMap<String, MutationReceipt>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub factory_refresh_owners: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub claude_refresh_owners: std::collections::BTreeMap<String, String>,
 }
 impl Document {
     pub fn empty() -> Self {
@@ -201,6 +212,7 @@ impl Document {
             accounts: vec![],
             mutation_receipts: Default::default(),
             factory_refresh_owners: Default::default(),
+            claude_refresh_owners: Default::default(),
         }
     }
     // Retain token lineage after rotation/removal so registration cannot bypass a fence.
@@ -209,6 +221,21 @@ impl Document {
         id: &str,
         credential: &Credential,
     ) -> Result<(), AccountError> {
+        if let Credential::ClaudeOAuth { refresh_token, .. } = credential {
+            let fingerprint = crate::cache::fingerprint(&["claude_owned", refresh_token]);
+            if self.claude_refresh_owners.get(&fingerprint).is_some_and(|owner| owner != id)
+                || self.accounts.iter().any(|account| {
+                    account.id != id && matches!(&account.credential,
+                        Credential::ClaudeOAuth { refresh_token: existing, .. } if existing == refresh_token)
+                })
+            {
+                return Err(AccountError::Duplicate);
+            }
+            self.claude_refresh_owners
+                .insert(fingerprint, id.to_owned());
+            self.version = self.version.max(6);
+            return Ok(());
+        }
         let Credential::FactoryOAuth { refresh_token, .. } = credential else {
             return Ok(());
         };

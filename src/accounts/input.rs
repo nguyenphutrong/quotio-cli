@@ -107,15 +107,26 @@ impl Drop for HiddenEcho {
     }
 }
 #[cfg(unix)]
-async fn read_hidden(fd: std::os::fd::RawFd, provider: &str) -> Result<String, AccountError> {
+async fn read_hidden(fd: std::os::fd::RawFd, prompt: &str) -> Result<String, AccountError> {
     use std::io::Write;
     let input = Input::new(fd)?;
     let _echo = HiddenEcho::new(&input.file)?;
     let mut stderr = std::io::stderr();
-    write!(stderr, "{provider} API key (hidden): ")
+    write!(stderr, "{prompt} (hidden): ")
         .and_then(|_| stderr.flush())
         .map_err(|_| AccountError::Input)?;
     input.read().await
+}
+
+pub async fn read_oauth_code() -> Result<String, AccountError> {
+    #[cfg(unix)]
+    {
+        read_hidden(libc::STDIN_FILENO, "Authorization code").await
+    }
+    #[cfg(not(unix))]
+    {
+        Err(AccountError::Unsupported)
+    }
 }
 
 pub async fn read_api_key(provider: &str, token_stdin: bool) -> Result<String, AccountError> {
@@ -125,7 +136,7 @@ pub async fn read_api_key(provider: &str, token_stdin: bool) -> Result<String, A
         (false, true) => {
             #[cfg(unix)]
             {
-                read_hidden(libc::STDIN_FILENO, provider).await
+                read_hidden(libc::STDIN_FILENO, &format!("{provider} API key")).await
             }
             #[cfg(not(unix))]
             {

@@ -17,6 +17,8 @@ use tokio::{
     net::TcpListener,
 };
 
+pub(crate) mod claude;
+
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const REDIRECT: &str = "http://localhost:1455/auth/callback";
@@ -241,8 +243,16 @@ pub enum SessionStatus {
     Cancelled,
     Expired,
 }
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum Workflow {
+    BrowserCallback,
+    ManualCode,
+}
 #[derive(Clone, Serialize)]
 pub struct SessionDto {
+    pub provider: crate::cli::Provider,
+    pub workflow: Workflow,
     pub id: String,
     pub url: String,
     pub expires_at: i64,
@@ -253,6 +263,8 @@ pub struct SessionDto {
     pub error_code: Option<&'static str>,
 }
 struct PendingSession {
+    provider: crate::cli::Provider,
+    workflow: Workflow,
     authorization: Option<Authorization>,
     url: String,
     label: Option<String>,
@@ -293,6 +305,8 @@ impl OAuthSessionManager {
     }
     fn dto(id: String, session: &PendingSession) -> SessionDto {
         SessionDto {
+            provider: session.provider,
+            workflow: session.workflow,
             id,
             url: session.url.clone(),
             expires_at: session.expires_at,
@@ -339,6 +353,22 @@ impl OAuthSessionManager {
         label: Option<String>,
         mode: OAuthMode,
     ) -> Result<SessionDto, AccountError> {
+        self.begin_for(crate::cli::Provider::Codex, label, mode)
+            .await
+    }
+    pub async fn begin_for(
+        &self,
+        provider: crate::cli::Provider,
+        label: Option<String>,
+        mode: OAuthMode,
+    ) -> Result<SessionDto, AccountError> {
+        let workflow = match provider {
+            crate::cli::Provider::Codex => Workflow::BrowserCallback,
+            crate::cli::Provider::Catalog("claude") if matches!(mode, OAuthMode::Relay) => {
+                Workflow::ManualCode
+            }
+            _ => return Err(AccountError::Unsupported),
+        };
         if let Some(label) = &label {
             super::validate_label(label)?;
         }
@@ -351,7 +381,11 @@ impl OAuthSessionManager {
         } else {
             None
         };
-        let authorization = begin_authorization()?;
+        let authorization = if workflow == Workflow::ManualCode {
+            claude::begin()?
+        } else {
+            begin_authorization()?
+        };
         let id = random_string()?;
         let expires_at = self
             .context
@@ -369,6 +403,8 @@ impl OAuthSessionManager {
         sessions.sessions.insert(
             id.clone(),
             PendingSession {
+                provider,
+                workflow,
                 authorization: Some(authorization),
                 url,
                 label,
@@ -496,11 +532,12 @@ impl OAuthSessionManager {
         credential: Result<Credential, AccountError>,
         label: Option<String>,
     ) -> Result<SessionDto, AccountError> {
+        let provider = self.get(id).await?.provider;
         let result = async {
             let credential = credential?;
             let usage = tokio::time::timeout(
                 Duration::from_secs(30),
-                service::validate(&self.context, crate::cli::Provider::Codex, &credential),
+                service::validate(&self.context, provider, &credential),
             )
             .await
             .map_err(|_| AccountError::Cancelled)??;
@@ -508,7 +545,7 @@ impl OAuthSessionManager {
             let _guard = service::mutation_guard(&self.commit_guard).await?;
             let account_id = service::add(
                 self.vault.clone(),
-                crate::cli::Provider::Codex,
+                provider,
                 label,
                 credential,
                 usage.account.id,
@@ -539,7 +576,24 @@ impl OAuthSessionManager {
             }
         }
     }
+    pub async fn manual_code(&self, id: &str, code: &str) -> Result<SessionDto, AccountError> {
+        if self.get(id).await?.workflow != Workflow::ManualCode {
+            return Err(AccountError::Unsupported);
+        }
+        let (authorization, label) = self.claim(id).await?;
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            claude::exchange(&self.context, authorization, code),
+        )
+        .await
+        .map_err(|_| AccountError::Cancelled)
+        .and_then(|r| r);
+        self.finish(id, result, label).await
+    }
     pub async fn callback(&self, id: &str, full_url: &str) -> Result<SessionDto, AccountError> {
+        if self.get(id).await?.workflow != Workflow::BrowserCallback {
+            return Err(AccountError::Unsupported);
+        }
         let (authorization, label) = self.claim(id).await?;
         self.finish(
             id,
@@ -855,6 +909,68 @@ mod session_tests {
         );
     }
 
+    #[tokio::test]
+    async fn claude_manual_workflow_is_typed_and_single_use() {
+        let manager = manager();
+        assert!(
+            manager
+                .begin_for(
+                    crate::cli::Provider::Catalog("claude"),
+                    None,
+                    OAuthMode::Loopback
+                )
+                .await
+                .is_err()
+        );
+        let session = manager
+            .begin_for(
+                crate::cli::Provider::Catalog("claude"),
+                None,
+                OAuthMode::Relay,
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.workflow, Workflow::ManualCode);
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(!json.contains("verifier"));
+        assert!(
+            manager
+                .callback(&session.id, "http://localhost:1455/auth/callback?code=x")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            manager.get(&session.id).await.unwrap().status,
+            SessionStatus::Waiting
+        );
+        assert!(
+            manager
+                .manual_code(&session.id, "code#wrong-state")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            manager.get(&session.id).await.unwrap().status,
+            SessionStatus::Failed
+        );
+        assert!(matches!(
+            manager.manual_code(&session.id, "code").await,
+            Err(AccountError::Busy)
+        ));
+        let session = manager
+            .begin_for(
+                crate::cli::Provider::Catalog("claude"),
+                None,
+                OAuthMode::Relay,
+            )
+            .await
+            .unwrap();
+        manager.cancel(&session.id).await.unwrap();
+        assert!(matches!(
+            manager.manual_code(&session.id, "code").await,
+            Err(AccountError::Busy)
+        ));
+    }
     #[tokio::test]
     async fn relay_sessions_are_bounded() {
         let manager = manager();

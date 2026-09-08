@@ -355,6 +355,8 @@ mod tests {
             crate::accounts::oauth::SessionStatus::Expired,
         ] {
             let session = crate::accounts::oauth::SessionDto {
+                provider: crate::cli::Provider::Codex,
+                workflow: crate::accounts::oauth::Workflow::BrowserCallback,
                 id: "runtime-session".into(),
                 url: "https://auth.openai.com/oauth/authorize".into(),
                 expires_at: 1,

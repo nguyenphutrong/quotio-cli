@@ -287,15 +287,13 @@ fn relay() -> OAuthMode {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct CallbackInput {
-    callback_url: String,
+    callback_url: Option<String>,
+    code: Option<String>,
 }
 pub(super) async fn begin(
     State(state): State<Arc<ApiState>>,
     ApiJson(input): ApiJson<SessionInput>,
 ) -> Result<(StatusCode, Json<SessionDto>), ApiError> {
-    if input.provider != Provider::Codex {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "native_login_required"));
-    }
     let manager = state.oauth.as_ref().ok_or(ApiError(
         StatusCode::SERVICE_UNAVAILABLE,
         "account_storage_disabled",
@@ -304,7 +302,7 @@ pub(super) async fn begin(
         StatusCode::CREATED,
         Json(
             manager
-                .begin(input.label, input.callback_mode)
+                .begin_for(input.provider, input.label, input.callback_mode)
                 .await
                 .map_err(account_error)?,
         ),
@@ -346,6 +344,9 @@ pub(super) async fn callback(
     Path(id): Path<String>,
     ApiJson(input): ApiJson<CallbackInput>,
 ) -> Result<Json<SessionDto>, ApiError> {
+    if input.callback_url.is_some() == input.code.is_some() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
+    }
     let manager = state.oauth.clone().ok_or(ApiError(
         StatusCode::SERVICE_UNAVAILABLE,
         "account_storage_disabled",
@@ -354,7 +355,11 @@ pub(super) async fn callback(
     let (send, receive) = tokio::sync::oneshot::channel();
     let work = state.clone();
     state.spawn(async move {
-        let result = manager.callback(&id, &input.callback_url).await;
+        let result = match (input.callback_url, input.code) {
+            (Some(url), None) => manager.callback(&id, &url).await,
+            (None, Some(code)) => manager.manual_code(&id, &code).await,
+            _ => unreachable!("validated callback input"),
+        };
         work.wake.notify_one();
         let _ = send.send(result);
     })?;

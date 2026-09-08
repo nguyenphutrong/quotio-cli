@@ -80,6 +80,33 @@ pub async fn run(
             if !region_valid || (provider != Provider::Factory && organization.is_some()) {
                 return Err(AccountError::Unsupported);
             }
+            if provider == Provider::Catalog("claude") && !token_stdin {
+                if region.is_some() || organization.is_some() || !settings.is_empty() {
+                    return Err(AccountError::Unsupported);
+                }
+                let manager = super::oauth::OAuthSessionManager::new(
+                    context.clone(),
+                    vault,
+                    std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                );
+                let session = manager
+                    .begin_for(provider, label, super::oauth::OAuthMode::Relay)
+                    .await?;
+                eprintln!("Open this URL to sign in to Claude:\n{}", session.url);
+                // The terminal never launches a browser for manual-code login.
+                let code = tokio::time::timeout(
+                    std::time::Duration::from_secs(180),
+                    super::input::read_oauth_code(),
+                )
+                .await
+                .map_err(|_| AccountError::Cancelled)??;
+                let session = manager.manual_code(&session.id, &code).await?;
+                return Ok(format!(
+                    "Account saved: {}\n",
+                    session.account_id.ok_or(AccountError::OAuth)?
+                ));
+            }
             if let Some(definition) = provider.catalog()
                 && definition.auth == crate::providers::catalog::AuthKind::OAuth
             {

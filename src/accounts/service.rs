@@ -28,6 +28,10 @@ fn scoped(
     if let Credential::FactoryOAuth {
         refresh_pending: true,
         ..
+    }
+    | Credential::ClaudeOAuth {
+        refresh_pending: true,
+        ..
     } = credential
     {
         return Err(AccountError::CommitUncertain);
@@ -45,6 +49,12 @@ fn scoped(
             return Err(AccountError::CommitUncertain);
         }
         keys.insert("GROK_OAUTH_TOKEN".into(), access_token.clone());
+    }
+    if let Credential::ClaudeOAuth { access_token, .. } = credential {
+        if provider != Provider::Catalog("claude") {
+            return Err(AccountError::Unsupported);
+        }
+        keys.insert("CLAUDE_OAUTH_ACCESS_TOKEN".into(), access_token.clone());
     }
     if let Credential::CatalogKey { token, settings } = credential {
         let definition = provider
@@ -202,7 +212,7 @@ async fn validate_credential(
     endpoint_override: Option<&str>,
 ) -> Result<ProviderUsage, AccountError> {
     let ctx = scoped(context, provider, credential)?;
-    let usage = match provider {
+    let mut usage = match provider {
         Provider::Amp => match endpoint_override {
             Some(endpoint) => AmpApiProvider.fetch_api(&ctx, endpoint).await?,
             None => AmpApiProvider.fetch(&ctx).await?,
@@ -259,6 +269,13 @@ async fn validate_credential(
         }
         _ => return Err(AccountError::Unsupported),
     };
+    if let Credential::ClaudeOAuth {
+        account_id, email, ..
+    } = credential
+    {
+        usage.account.id = account_id.clone();
+        usage.account.label = email.clone();
+    }
     if usage.windows.is_empty()
         || usage.account.id.is_empty()
         || usage.windows.iter().any(|w| !w.quota.is_valid())
@@ -512,7 +529,9 @@ pub fn default_label(
         | Credential::CursorNative { .. } => Err(AccountError::Input),
         Credential::GrokOAuth { .. } => Ok("Grok owned account".into()),
         Credential::FactoryOAuth { .. } => Ok("Factory owned account".into()),
-        Credential::CodexOAuth { email, .. } => super::validate_label(email),
+        Credential::CodexOAuth { email, .. } | Credential::ClaudeOAuth { email, .. } => {
+            super::validate_label(email)
+        }
         Credential::ApiKey { token, .. } | Credential::CatalogKey { token, .. } => {
             let suffix =
                 if token.len() > 8 && token.is_ascii() && !token.chars().any(char::is_control) {
@@ -558,6 +577,8 @@ impl Operations for Network {
         Box::pin(async move {
             if matches!(k, Credential::FactoryOAuth { .. }) {
                 crate::providers::factory::refresh(c, k).await
+            } else if matches!(k, Credential::ClaudeOAuth { .. }) {
+                super::oauth::claude::refresh(c, k).await
             } else if matches!(k, Credential::GrokOAuth { .. }) {
                 crate::providers::catalog::oauth_editors::refresh_grok(c, k).await
             } else {
@@ -599,6 +620,9 @@ impl ManagedProvider {
             } | Credential::FactoryOAuth {
                 refresh_pending: true,
                 ..
+            } | Credential::ClaudeOAuth {
+                refresh_pending: true,
+                ..
             }
         ) {
             return Err(AccountError::CommitUncertain);
@@ -606,6 +630,7 @@ impl ManagedProvider {
         if !matches!(
             credential,
             Credential::CodexOAuth { .. }
+                | Credential::ClaudeOAuth { .. }
                 | Credential::GrokOAuth { .. }
                 | Credential::FactoryOAuth { .. }
         ) {
@@ -620,7 +645,7 @@ impl ManagedProvider {
         } else {
             60
         };
-        let needs_refresh = matches!(&credential,Credential::CodexOAuth{expires_at,..} | Credential::GrokOAuth{expires_at,..} | Credential::FactoryOAuth{expires_at,..} if *expires_at<=context.clock.now().unix_timestamp()+refresh_margin);
+        let needs_refresh = matches!(&credential,Credential::CodexOAuth{expires_at,..} | Credential::GrokOAuth{expires_at,..} | Credential::FactoryOAuth{expires_at,..} | Credential::ClaudeOAuth{expires_at,..} if *expires_at<=context.clock.now().unix_timestamp()+refresh_margin);
         if !needs_refresh {
             match self
                 .operations
@@ -660,6 +685,9 @@ impl ManagedProvider {
             refresh_pending, ..
         }
         | Credential::FactoryOAuth {
+            refresh_pending, ..
+        }
+        | Credential::ClaudeOAuth {
             refresh_pending, ..
         } = &mut latest
         {
@@ -747,6 +775,10 @@ impl ProviderAdapter for ManagedProvider {
                 | Credential::FactoryOAuth {
                     refresh_pending: true,
                     ..
+                }
+                | Credential::ClaudeOAuth {
+                    refresh_pending: true,
+                    ..
                 } => return None,
                 Credential::QuotioCustomProvider { .. }
                 | Credential::AmpNative { .. }
@@ -788,7 +820,7 @@ impl ProviderAdapter for ManagedProvider {
     fn idempotent(&self) -> bool {
         self.provider != Provider::Codex
             && !self.factory_oauth
-            && !(self.provider == Provider::Catalog("grok")
+            && !(matches!(self.provider, Provider::Catalog("grok" | "claude"))
                 && self.origin == super::AccountOrigin::Owned)
     }
     fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
@@ -1183,7 +1215,8 @@ mod tests {
                     );
                 }
                 if let Credential::GrokOAuth { access_token, .. }
-                | Credential::FactoryOAuth { access_token, .. } = k
+                | Credential::FactoryOAuth { access_token, .. }
+                | Credential::ClaudeOAuth { access_token, .. } = k
                 {
                     assert_eq!(access_token, "new");
                     let doc: super::super::Document =
@@ -1234,6 +1267,13 @@ mod tests {
                     expires_at,
                     refresh_pending,
                     ..
+                }
+                | Credential::ClaudeOAuth {
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    refresh_pending,
+                    ..
                 } = &mut k
                 {
                     assert!(*refresh_pending);
@@ -1245,6 +1285,9 @@ mod tests {
                             refresh_pending: true,
                             ..
                         } | Credential::FactoryOAuth {
+                            refresh_pending: true,
+                            ..
+                        } | Credential::ClaudeOAuth {
                             refresh_pending: true,
                             ..
                         }
@@ -2446,6 +2489,70 @@ mod tests {
             Err(AccountError::Duplicate)
         ));
         cleanup(path);
+    }
+    #[tokio::test]
+    async fn claude_refresh_fence_survives_failure_restart_and_removal() {
+        for failure in [false, true] {
+            let (vault, fake, id, _, path) = setup(0, false, failure, false);
+            let original = Credential::ClaudeOAuth {
+                access_token: "old".into(),
+                refresh_token: "refresh".into(),
+                account_id: "id".into(),
+                email: "demo@example.com".into(),
+                expires_at: 0,
+                refresh_pending: false,
+            };
+            let mut tx = vault.begin().unwrap();
+            tx.document.accounts[0].provider = Provider::Catalog("claude");
+            tx.document.accounts[0].credential = original.clone();
+            tx.document.reserve_factory_refresh(&id, &original).unwrap();
+            tx.commit().unwrap();
+            let adapter = managed(
+                vault.clone(),
+                fake.clone(),
+                id.clone(),
+                Provider::Catalog("claude"),
+            );
+            assert_eq!(
+                adapter.read(&http::fixture::context()).await.is_ok(),
+                !failure
+            );
+            let restarted = managed(
+                vault.clone(),
+                fake.clone(),
+                id.clone(),
+                Provider::Catalog("claude"),
+            );
+            if failure {
+                assert!(matches!(
+                    restarted.read(&http::fixture::context()).await,
+                    Err(AccountError::CommitUncertain)
+                ));
+                assert!(
+                    restarted
+                        .cache_identity(&http::fixture::context())
+                        .await
+                        .is_none()
+                );
+            } else {
+                assert!(restarted.read(&http::fixture::context()).await.is_ok());
+            }
+            assert_eq!(fake.refreshes.load(Ordering::SeqCst), 1);
+            let mut tx = vault.begin().unwrap();
+            tx.document.remove(&id).unwrap();
+            assert_eq!(tx.document.version, 6);
+            assert!(matches!(
+                tx.document.add(
+                    Provider::Catalog("claude"),
+                    "again",
+                    "again".into(),
+                    original
+                ),
+                Err(AccountError::Duplicate)
+            ));
+            drop(tx);
+            cleanup(path);
+        }
     }
     #[test]
     fn factory_saved_api_keys_keep_idempotent_quota_reads() {

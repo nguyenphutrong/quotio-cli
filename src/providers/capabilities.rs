@@ -127,7 +127,9 @@ pub fn capability(provider: Provider) -> ProviderCapability {
         _ => None,
     };
     let auth = match provider {
-        Provider::Codex => vec![AuthMethod::OAuth, AuthMethod::Native],
+        Provider::Codex | Provider::Catalog("claude") => {
+            vec![AuthMethod::OAuth, AuthMethod::Native]
+        }
         Provider::Amp => vec![AuthMethod::ApiKey, AuthMethod::Native],
         Provider::Factory => vec![
             AuthMethod::ApiKey,

@@ -157,7 +157,12 @@ impl Vault {
                 }
                 let doc: Document =
                     serde_json::from_slice(&bytes).map_err(|_| AccountError::Corrupt)?;
-                if !matches!(doc.version, 1..=5)
+                if !matches!(doc.version, 1..=6)
+                    || (doc.version < 6
+                        && (!doc.claude_refresh_owners.is_empty()
+                            || doc.accounts.iter().any(|a| {
+                                matches!(a.credential, super::Credential::ClaudeOAuth { .. })
+                            })))
                     || (doc.version == 1 && !doc.mutation_receipts.is_empty())
                     || (doc.version < 3
                         && doc.accounts.iter().any(|a| {
@@ -229,6 +234,9 @@ impl Transaction {
         // this mutation touches only an unrelated account or retry receipt.
         if !self.document.factory_refresh_owners.is_empty() {
             self.document.version = self.document.version.max(5);
+        }
+        if !self.document.claude_refresh_owners.is_empty() {
+            self.document.version = self.document.version.max(6);
         }
         let bytes = serde_json::to_vec(&self.document).map_err(|_| AccountError::Corrupt)?;
         if bytes.len() > 1024 * 1024 {
@@ -340,6 +348,53 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn claude_reservations_survive_deletion_and_reject_downgraded_format() {
+        let memory = Arc::new(Memory::default());
+        let dir = std::env::temp_dir().join(random_string().unwrap());
+        let vault = Vault::new(memory.clone(), dir.join("lock"));
+        let credential = Credential::ClaudeOAuth {
+            access_token: "fixture-access".into(),
+            refresh_token: "fixture-refresh".into(),
+            account_id: "id".into(),
+            email: "demo@example.com".into(),
+            expires_at: 0,
+            refresh_pending: true,
+        };
+        let mut tx = vault.begin().unwrap();
+        let id = tx
+            .document
+            .add(
+                Provider::Catalog("claude"),
+                "Claude",
+                "id".into(),
+                credential.clone(),
+            )
+            .unwrap();
+        tx.commit().unwrap();
+        let mut tx = vault.begin().unwrap();
+        tx.document.remove(&id).unwrap();
+        tx.commit().unwrap();
+        let mut tx = vault.begin().unwrap();
+        assert_eq!(tx.document.version, 6);
+        assert!(matches!(
+            tx.document.add(
+                Provider::Catalog("claude"),
+                "Again",
+                "other".into(),
+                credential
+            ),
+            Err(AccountError::Duplicate)
+        ));
+        drop(tx);
+        let bytes = memory.read().unwrap().unwrap();
+        assert_old_reader_rejects(&bytes);
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["version"] = 5.into();
+        memory.write(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(matches!(vault.begin(), Err(AccountError::Corrupt)));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn factory_reservations_require_format_five_through_all_mutations() {
         let memory = Arc::new(Memory::default());
