@@ -29,7 +29,7 @@ const GROK_SETTINGS_URL: &str = "https://cli-chat-proxy.grok.com/v1/settings";
 const GROK_CREDITS_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const KIMI_CODE_USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
 const CURSOR_KEYCHAIN_SERVICE: &str = "cursor-access-token";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 const CURSOR_STATE_QUERY: &str =
     "SELECT value FROM ItemTable WHERE key = 'cursorAuth/accessToken' LIMIT 1;";
 const MAX_NATIVE_FILE_BYTES: u64 = 1024 * 1024;
@@ -689,7 +689,7 @@ async fn cursor_state_token() -> Result<Option<Secret>, ProviderError> {
     cursor_token_from_sqlite_output(&bytes)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 async fn cursor_sqlite_output(database: &CursorDatabase) -> Result<Vec<u8>, ProviderError> {
     cursor_sqlite_query(database, CURSOR_STATE_QUERY).await
 }
@@ -772,7 +772,7 @@ pub(crate) struct CursorLogin {
     pub subscription_status: Option<String>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) async fn cursor_login(path: PathBuf) -> Result<CursorLogin, ProviderError> {
     let query = "SELECT json_group_array(json_object('key',key,'value',value)) FROM ItemTable WHERE key IN ('cursorAuth/accessToken','cursorAuth/cachedEmail','cursorAuth/stripeMembershipType','cursorAuth/stripeSubscriptionStatus');";
     let bytes = native_sqlite_rows(path, query).await?;
@@ -805,7 +805,7 @@ pub(super) async fn native_sqlite_rows(
     Err(ProviderError::Unavailable)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", all(test, unix))))]
 pub(crate) async fn cursor_login(_: PathBuf) -> Result<CursorLogin, ProviderError> {
     Err(ProviderError::Unavailable)
 }
@@ -1239,6 +1239,14 @@ fn regular_file(
 }
 
 pub(super) fn read_regular_file(path: &Path, maximum_bytes: u64) -> Result<Vec<u8>, ProviderError> {
+    read_regular_file_with_hook(path, maximum_bytes, || {})
+}
+
+fn read_regular_file_with_hook(
+    path: &Path,
+    maximum_bytes: u64,
+    after_read: impl FnOnce(),
+) -> Result<Vec<u8>, ProviderError> {
     let before = regular_file(path, maximum_bytes)?.ok_or(ProviderError::Authentication)?;
     let file = open_readonly_file(path)?;
     let opened = file
@@ -1246,8 +1254,7 @@ pub(super) fn read_regular_file(path: &Path, maximum_bytes: u64) -> Result<Vec<u
         .map_err(|_| ProviderError::CredentialStorage)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        if before.dev() != opened.dev() || before.ino() != opened.ino() {
+        if !cursor_same_file(&before, &opened) {
             return Err(ProviderError::CredentialStorage);
         }
     }
@@ -1255,10 +1262,41 @@ pub(super) fn read_regular_file(path: &Path, maximum_bytes: u64) -> Result<Vec<u
         return Err(ProviderError::CredentialStorage);
     }
     let mut bytes = Vec::new();
-    file.take(maximum_bytes + 1)
+    (&file)
+        .take(maximum_bytes + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| ProviderError::CredentialStorage)?;
-    if bytes.len() > maximum_bytes as usize {
+    after_read();
+    let descriptor_after = file
+        .metadata()
+        .map_err(|_| ProviderError::CredentialStorage)?;
+    let path_after = regular_file(path, maximum_bytes)?.ok_or(ProviderError::CredentialStorage)?;
+    if bytes.len() > maximum_bytes as usize
+        || bytes.len() as u64 != before.len()
+        || !descriptor_after.is_file()
+    {
+        return Err(ProviderError::CredentialStorage);
+    }
+    #[cfg(unix)]
+    if !cursor_same_file(&before, &descriptor_after) || !cursor_same_file(&before, &path_after) {
+        return Err(ProviderError::CredentialStorage);
+    }
+    #[cfg(not(unix))]
+    if before.len() != descriptor_after.len()
+        || before.len() != path_after.len()
+        || before
+            .modified()
+            .map_err(|_| ProviderError::CredentialStorage)?
+            != descriptor_after
+                .modified()
+                .map_err(|_| ProviderError::CredentialStorage)?
+        || before
+            .modified()
+            .map_err(|_| ProviderError::CredentialStorage)?
+            != path_after
+                .modified()
+                .map_err(|_| ProviderError::CredentialStorage)?
+    {
         return Err(ProviderError::CredentialStorage);
     }
     Ok(bytes)
@@ -1285,7 +1323,7 @@ pub(super) async fn cache_token(id: &str, context: &ProviderContext) -> Option<S
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, unix))]
 #[path = "cursor_wal_tests.rs"]
 mod cursor_wal_tests;
 

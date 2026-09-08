@@ -75,6 +75,37 @@ impl Drop for Fixture {
     }
 }
 
+#[test]
+fn native_file_rejects_same_inode_same_size_mutation_and_path_replacement() {
+    let fixture = Fixture::new();
+    let path = fixture.directory.join("credentials.toml");
+    let original = b"windsurf_api_key='old-key'\n";
+    let changed = b"windsurf_api_key='new-key'\n";
+    for replace_path in [false, true] {
+        std::fs::write(&path, original).unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        let result = read_regular_file_with_hook(&path, 1024 * 1024, || {
+            if replace_path {
+                std::fs::rename(&path, fixture.directory.join("old.toml")).unwrap();
+            }
+            std::fs::write(&path, changed).unwrap();
+            // Force a distinct timestamp even on filesystems with coarse clock resolution.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH)
+                .unwrap();
+            let after = std::fs::metadata(&path).unwrap();
+            assert_eq!(before.len(), after.len());
+            assert_eq!(before.ino() == after.ino(), !replace_path);
+        });
+        // No credential bytes escape the reader for a subsequent HTTP request.
+        assert_eq!(result.unwrap_err(), ProviderError::CredentialStorage);
+        assert_eq!(std::fs::read(&path).unwrap(), changed);
+    }
+}
+
 #[tokio::test]
 async fn cursor_wal_reads_committed_login_without_source_writes() {
     let fixture = Fixture::new();

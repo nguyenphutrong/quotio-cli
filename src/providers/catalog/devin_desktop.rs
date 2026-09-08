@@ -59,10 +59,9 @@ fn parse_credentials_toml(bytes: &[u8]) -> Result<Secret, ProviderError> {
     let text = std::str::from_utf8(bytes).map_err(|_| ProviderError::InvalidData)?;
     let root: toml::Table = toml::from_str(text).map_err(|_| ProviderError::InvalidData)?;
     // Never silently send credentials intended for another server to Codeium.
-    if let Some(server) = root.get("api_server_url") {
-        match server.as_str().map(str::trim) {
-            Some("https://server.codeium.com" | "https://server.codeium.com/") => (),
-            _ => return Err(ProviderError::InvalidData),
+    for name in ["api_server_url", "apiServerUrl"] {
+        if let Some(server) = root.get(name) {
+            validate_native_server(server.as_str())?;
         }
     }
     native_key(
@@ -70,6 +69,13 @@ fn parse_credentials_toml(bytes: &[u8]) -> Result<Secret, ProviderError> {
             .and_then(toml::Value::as_str)
             .ok_or(ProviderError::Authentication)?,
     )
+}
+
+fn validate_native_server(server: Option<&str>) -> Result<(), ProviderError> {
+    match server.map(str::trim) {
+        Some("https://server.codeium.com" | "https://server.codeium.com/") => Ok(()),
+        _ => Err(ProviderError::InvalidData),
+    }
 }
 
 fn parse_database_rows(bytes: &[u8]) -> Result<Secret, ProviderError> {
@@ -82,6 +88,11 @@ fn parse_database_rows(bytes: &[u8]) -> Result<Secret, ProviderError> {
         .and_then(Value::as_str)
         .ok_or(ProviderError::InvalidData)?;
     let auth: Value = serde_json::from_str(value).map_err(|_| ProviderError::InvalidData)?;
+    for name in ["apiServerUrl", "api_server_url"] {
+        if let Some(server) = auth.get(name) {
+            validate_native_server(server.as_str())?;
+        }
+    }
     native_key(
         auth.get("apiKey")
             .and_then(Value::as_str)
@@ -321,6 +332,101 @@ mod tests {
             json!([{"value":"not-json"}]),
         ] {
             assert!(parse_database_rows(serde_json::to_string(&rows).unwrap().as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn native_credentials_match_swift_fixtures_but_unknown_destinations_fail_closed() {
+        // OpenUsage DevinAuthStoreTests uses these CLI and app credential shapes.
+        assert_eq!(
+            parse_credentials_toml(b"windsurf_api_key = \"devin-session-token$cli\"\n")
+                .unwrap()
+                .0,
+            "devin-session-token$cli"
+        );
+        let rows = json!([{"value": r#"{"apiKey":"devin-session-token$app"}"#}]);
+        assert_eq!(
+            parse_database_rows(&serde_json::to_vec(&rows).unwrap())
+                .unwrap()
+                .0,
+            "devin-session-token$app"
+        );
+        // Swift accepts custom HTTPS destinations and drops HTTP destinations. Neither
+        // is safe here: the CLI sends native credentials only to the fixed Codeium URL.
+        for server in ["https://server.codeium.test/", "http://server.codeium.test"] {
+            assert_eq!(
+                parse_credentials_toml(
+                    format!(
+                        "windsurf_api_key = 'devin-session-token$cli'\napi_server_url = '{server}'"
+                    )
+                    .as_bytes()
+                )
+                .err()
+                .unwrap(),
+                ProviderError::InvalidData
+            );
+        }
+    }
+
+    #[test]
+    fn database_destinations_validate_every_alias_without_exposing_credentials() {
+        let parse = |auth: Value| {
+            parse_database_rows(&serde_json::to_vec(&json!([{"value": auth.to_string()}])).unwrap())
+        };
+        for name in ["apiServerUrl", "api_server_url"] {
+            for server in ["https://server.codeium.com", "https://server.codeium.com/"] {
+                let mut auth = json!({"apiKey": "fixture-key"});
+                auth[name] = json!(server);
+                assert_eq!(parse(auth).unwrap().0, "fixture-key");
+            }
+            for server in [
+                json!(null),
+                json!(42),
+                json!(true),
+                json!({}),
+                json!([]),
+                json!(""),
+                json!("https://evil.example"),
+                json!("http://server.codeium.com"),
+                json!("https://server.codeium.com@evil.example"),
+                json!("https://server.codeium.com/path"),
+                json!("x".repeat(1024 * 1024)),
+            ] {
+                for mixed in [false, true] {
+                    let mut auth = json!({"apiKey": "fixture-secret-never-display"});
+                    if mixed {
+                        auth[if name == "apiServerUrl" {
+                            "api_server_url"
+                        } else {
+                            "apiServerUrl"
+                        }] = json!("https://server.codeium.com");
+                    }
+                    auth[name] = server.clone();
+                    let error = parse(auth).err().unwrap();
+                    assert_eq!(error, ProviderError::InvalidData);
+                    assert!(!format!("{error:?} {error}").contains("fixture-secret"));
+                }
+            }
+        }
+        assert!(
+            parse(json!({"apiKey": "fixture-key",
+            "apiServerUrl": "https://server.codeium.com/",
+            "api_server_url": "https://server.codeium.com"}))
+            .is_ok()
+        );
+        for text in [
+            "apiServerUrl = 'https://evil.example'",
+            "apiServerUrl = 'https://server.codeium.com'\napi_server_url = 'https://evil.example'",
+            "api_server_url = 'https://server.codeium.com'\napiServerUrl = 'https://evil.example'",
+        ] {
+            assert_eq!(
+                parse_credentials_toml(
+                    format!("windsurf_api_key = 'fixture-key'\n{text}").as_bytes()
+                )
+                .err()
+                .unwrap(),
+                ProviderError::InvalidData
+            );
         }
     }
 
