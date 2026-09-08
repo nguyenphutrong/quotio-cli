@@ -348,21 +348,42 @@ pub(super) struct CallbackInput {
 }
 pub(super) async fn begin(
     State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
     ApiJson(input): ApiJson<SessionInput>,
 ) -> Result<(StatusCode, Json<SessionDto>), ApiError> {
     let manager = state.oauth.as_ref().ok_or(ApiError(
         StatusCode::SERVICE_UNAVAILABLE,
         "account_storage_disabled",
     ))?;
-    Ok((
-        StatusCode::CREATED,
-        Json(
+    let mut keys = headers.get_all("idempotency-key").iter();
+    let key = keys
+        .next()
+        .map(|value| {
+            let key = value
+                .to_str()
+                .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_idempotency_key"))?;
+            crate::accounts::service::MutationIntent::new(key, String::new())
+                .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_idempotency_key"))?;
+            Ok::<_, ApiError>(key.to_owned())
+        })
+        .transpose()?;
+    if keys.next().is_some() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_idempotency_key"));
+    }
+    let session = match key {
+        Some(key) => {
+            manager
+                .begin_idempotent(input.provider, input.label, input.callback_mode, key)
+                .await
+        }
+        None => {
             manager
                 .begin_for(input.provider, input.label, input.callback_mode)
                 .await
-                .map_err(account_error)?,
-        ),
-    ))
+        }
+    }
+    .map_err(account_error)?;
+    Ok((StatusCode::CREATED, Json(session)))
 }
 pub(super) async fn session(
     State(state): State<Arc<ApiState>>,

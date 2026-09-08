@@ -229,7 +229,7 @@ pub async fn exchange(
     let code = callback_code(&target, &authorization.state)?;
     exchange_code(context, authorization, &code).await
 }
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OAuthMode {
     Relay,
@@ -282,8 +282,15 @@ struct PendingSession {
     error_code: Option<&'static str>,
     cancel: Arc<tokio::sync::Notify>,
 }
+struct BeginClaim {
+    provider: crate::cli::Provider,
+    label: Option<String>,
+    mode: OAuthMode,
+    session_id: Option<String>,
+}
 struct Sessions {
     sessions: HashMap<String, PendingSession>,
+    begins: HashMap<String, BeginClaim>,
 }
 #[derive(Clone)]
 pub struct OAuthSessionManager {
@@ -305,6 +312,7 @@ impl OAuthSessionManager {
             vault,
             sessions: Arc::new(tokio::sync::Mutex::new(Sessions {
                 sessions: HashMap::new(),
+                begins: HashMap::new(),
             })),
             commit_guard,
             generation,
@@ -356,6 +364,95 @@ impl OAuthSessionManager {
                 sessions.sessions.remove(&id);
             }
         }
+        sessions.begins.retain(|_, claim| {
+            claim
+                .session_id
+                .as_ref()
+                .is_none_or(|id| sessions.sessions.contains_key(id))
+        });
+    }
+    /// A detached claim survives loss of the HTTP request, so a retry can recover
+    /// the session instead of issuing a second provider device-code request.
+    pub async fn begin_idempotent(
+        &self,
+        provider: crate::cli::Provider,
+        label: Option<String>,
+        mode: OAuthMode,
+        key: String,
+    ) -> Result<SessionDto, AccountError> {
+        self.begin_keyed(provider, label, mode, key, copilot::Endpoints::default())
+            .await
+    }
+    async fn begin_keyed(
+        &self,
+        provider: crate::cli::Provider,
+        label: Option<String>,
+        mode: OAuthMode,
+        key: String,
+        endpoints: copilot::Endpoints,
+    ) -> Result<SessionDto, AccountError> {
+        if let Some(label) = &label {
+            super::validate_label(label)?;
+        }
+        let mut sessions = self.sessions.lock().await;
+        Self::prune(&mut sessions);
+        let Sessions {
+            sessions: entries,
+            begins,
+        } = &mut *sessions;
+        if let Some(claim) = begins.get(&key) {
+            if claim.provider != provider || claim.label != label || claim.mode != mode {
+                return Err(AccountError::IdempotencyConflict);
+            }
+            return match &claim.session_id {
+                Some(id) => Ok(Self::dto(
+                    id.clone(),
+                    entries.get(id).expect("retained session"),
+                )),
+                None => Err(AccountError::Busy),
+            };
+        }
+        if begins.len() >= 128 || entries.len() >= 128 {
+            return Err(AccountError::Busy);
+        }
+        begins.insert(
+            key.clone(),
+            BeginClaim {
+                provider,
+                label: label.clone(),
+                mode,
+                session_id: None,
+            },
+        );
+        let manager = self.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        // Spawn while holding the claim lock: cancellation cannot strand a claim
+        // between insertion and task creation. No lock is held over provider I/O.
+        tokio::spawn(async move {
+            let result = if provider == crate::cli::Provider::Catalog("copilot")
+                && mode == OAuthMode::Relay
+            {
+                manager.begin_device(label, endpoints).await
+            } else {
+                manager.begin_for(provider, label, mode).await
+            };
+            let mut sessions = manager.sessions.lock().await;
+            match &result {
+                Ok(session) => {
+                    sessions
+                        .begins
+                        .get_mut(&key)
+                        .expect("begin claim")
+                        .session_id = Some(session.id.clone())
+                }
+                Err(_) => {
+                    sessions.begins.remove(&key);
+                }
+            }
+            let _ = send.send(result);
+        });
+        drop(sessions);
+        receive.await.map_err(|_| AccountError::Cancelled)?
     }
     pub async fn begin(
         &self,
@@ -1082,6 +1179,131 @@ mod session_tests {
             profile: url.into(),
         }
     }
+    #[tokio::test]
+    async fn keyed_begin_recovers_lost_response_without_duplicate_device_request() {
+        let manager = manager();
+        let (url, mut requests, server) = controlled_http().await;
+        let worker = manager.clone();
+        let endpoint = url.clone();
+        let request = tokio::spawn(async move {
+            worker
+                .begin_keyed(
+                    crate::cli::Provider::Catalog("copilot"),
+                    None,
+                    OAuthMode::Relay,
+                    "recover".into(),
+                    device_endpoints(&endpoint),
+                )
+                .await
+        });
+        let (_, respond) = requests.recv().await.unwrap();
+        // Drop the HTTP caller while the provider request is still outstanding.
+        request.abort();
+        assert!(matches!(
+            manager
+                .begin_keyed(
+                    crate::cli::Provider::Catalog("copilot"),
+                    None,
+                    OAuthMode::Relay,
+                    "recover".into(),
+                    device_endpoints(&url)
+                )
+                .await,
+            Err(AccountError::Busy)
+        ));
+        assert!(matches!(
+            manager
+                .begin_idempotent(
+                    crate::cli::Provider::Codex,
+                    None,
+                    OAuthMode::Relay,
+                    "recover".into()
+                )
+                .await,
+            Err(AccountError::IdempotencyConflict)
+        ));
+        respond.send(device_response(900).to_string()).unwrap();
+        let session = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match manager
+                    .begin_keyed(
+                        crate::cli::Provider::Catalog("copilot"),
+                        None,
+                        OAuthMode::Relay,
+                        "recover".into(),
+                        device_endpoints(&url),
+                    )
+                    .await
+                {
+                    Ok(session) => break session,
+                    Err(AccountError::Busy) => tokio::task::yield_now().await,
+                    _ => panic!("unexpected begin result"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        manager.cancel(&session.id).await.unwrap();
+        let replay = manager
+            .begin_keyed(
+                crate::cli::Provider::Catalog("copilot"),
+                None,
+                OAuthMode::Relay,
+                "recover".into(),
+                device_endpoints(&url),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.id, session.id);
+        assert_eq!(replay.status, SessionStatus::Cancelled);
+        assert_eq!(manager.sessions.lock().await.sessions.len(), 1);
+        assert!(requests.try_recv().is_err());
+        assert!(manager.vault.begin().unwrap().document.accounts.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn keyed_begin_checks_intent_and_expires_with_session() {
+        let manager = manager();
+        let provider = crate::cli::Provider::Codex;
+        let first = manager
+            .begin_idempotent(provider, None, OAuthMode::Relay, "key".into())
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager
+                .begin_idempotent(
+                    provider,
+                    Some("other".into()),
+                    OAuthMode::Relay,
+                    "key".into()
+                )
+                .await,
+            Err(AccountError::IdempotencyConflict)
+        ));
+        assert!(matches!(
+            manager
+                .begin_idempotent(provider, None, OAuthMode::Loopback, "key".into())
+                .await,
+            Err(AccountError::IdempotencyConflict)
+        ));
+        manager.cancel(&first.id).await.unwrap();
+        manager
+            .sessions
+            .lock()
+            .await
+            .sessions
+            .get_mut(&first.id)
+            .unwrap()
+            .created = Instant::now() - Duration::from_secs(901);
+        let next = manager
+            .begin_idempotent(provider, None, OAuthMode::Relay, "key".into())
+            .await
+            .unwrap();
+        assert_ne!(next.id, first.id);
+        assert_eq!(manager.sessions.lock().await.begins.len(), 1);
+    }
+
     #[tokio::test]
     async fn copilot_pending_slow_down_persists_only_after_identity() {
         let manager = manager();

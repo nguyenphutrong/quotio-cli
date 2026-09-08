@@ -778,6 +778,21 @@
     "/v1/auth/sessions": {
       "post": {
         "summary": "Begin OAuth session",
+        "description": "With Idempotency-Key, retry the same provider, label and callback mode to recover the same session after a lost response. A begin still in progress returns 409 busy; retry with the same key. A different intent returns 409 idempotency_conflict. Keys are local to this server process and retained while the session is retained (including terminal status, normally through expiry plus 12 minutes; terminal sessions may be evicted at capacity). Without a key, each request starts a new session.",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "description": "One nonempty ASCII graphic key, at most 128 bytes. Keep this key until the session is recovered and cancelled or completed.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[!-~]+$"
+            }
+          }
+        ],
         "responses": {
           "201": {
             "description": "Success",
