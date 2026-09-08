@@ -11,6 +11,18 @@ pub struct Cli {
 pub enum Command {
     /// List supported providers
     Providers,
+    /// Assess one explicit Swift PIV envelope; never import or unlock credentials
+    MigrationInspect {
+        /// Absolute envelope path; symlink components are refused
+        #[arg(long)]
+        piv_envelope: PathBuf,
+        /// Selected key fingerprint from Swift settings; not verified against hardware
+        #[arg(long)]
+        piv_fingerprint: String,
+        /// Save only an immutable assessment receipt in an existing private directory
+        #[arg(long)]
+        stage_dir: Option<PathBuf>,
+    },
     /// Add, select, list or remove accounts managed by Quotio
     Accounts(AccountsArgs),
     /// Collect quota for selected or configured providers

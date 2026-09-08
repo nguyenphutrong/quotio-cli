@@ -6,6 +6,7 @@ mod input;
 pub mod oauth;
 pub mod service;
 pub mod sources;
+pub mod staging;
 pub mod vault;
 use crate::{cli::Provider, error::ProviderError};
 use serde::{Deserialize, Serialize};

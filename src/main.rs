@@ -53,6 +53,33 @@ async fn run() -> ExitCode {
         }
     };
     let (text, code) = match cli.command {
+        Command::MigrationInspect {
+            piv_envelope,
+            piv_fingerprint,
+            stage_dir,
+        } => {
+            let result = (|| {
+                let plan = quotio::accounts::staging::assess(&piv_envelope, &piv_fingerprint)?;
+                let receipt_id = stage_dir
+                    .as_deref()
+                    .map(|dir| quotio::accounts::staging::stage(&plan, dir))
+                    .transpose()?;
+                Ok::<_, quotio::accounts::staging::StagingError>(serde_json::json!({
+                    "plan": plan,
+                    "receipt_id": receipt_id,
+                    "credentials_staged": false,
+                    "accounts_imported": 0
+                }))
+            })();
+            match result {
+                // Assessment completed, but migration is always blocked in this release.
+                Ok(report) => (format!("{report}\n"), 2),
+                Err(error) => {
+                    eprintln!("{error}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
         Command::Serve(args) => {
             tracing_subscriber::registry()
                 .with(
