@@ -71,6 +71,16 @@ fn field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
 fn string(value: Option<&Value>) -> Option<&str> {
     value.and_then(Value::as_str).filter(|s| !s.is_empty())
 }
+fn subscription_plan(value: &Value) -> Option<String> {
+    ["paidTier", "currentTier"].into_iter().find_map(|tier| {
+        let name = value.get(tier)?.get("name")?.as_str()?;
+        if name.len() > 128 || name.chars().any(char::is_control) {
+            return None;
+        }
+        let name = name.trim();
+        (!name.is_empty()).then(|| name.to_owned())
+    })
+}
 pub(super) fn fraction(value: Option<&Value>) -> Result<Option<f64>, ProviderError> {
     let Some(value) = value.filter(|v| !v.is_null()) else {
         return Ok(None);
@@ -338,7 +348,9 @@ impl AntigravityProvider {
             Err(
                 ProviderError::Unavailable
                 | ProviderError::InvalidData
-                | ProviderError::QuotaUnavailable,
+                | ProviderError::QuotaUnavailable
+                | ProviderError::Transient
+                | ProviderError::Timeout,
             ) => json!({}),
             Err(error) => return Err(error),
         };
@@ -405,7 +417,7 @@ impl AntigravityProvider {
             provider: self.id(),
             account: AccountIdentity {
                 subscription_status: None,
-                plan: None,
+                plan: subscription_plan(&subscription),
                 id: before.id,
                 label: before.email,
             },
@@ -549,6 +561,48 @@ mod tests {
             AntigravityProvider.token(&context),
             Err(ProviderError::Authentication)
         ));
+    }
+    #[tokio::test]
+    async fn subscription_plan_is_optional_bounded_and_uses_existing_request() {
+        for (status, metadata, plan) in [
+            (
+                200,
+                json!({"paidTier":{"name":" Pro "},"currentTier":{"name":"Free"}}),
+                Some("Pro"),
+            ),
+            (200, json!({"currentTier":{"name":"Free"}}), Some("Free")),
+            (
+                200,
+                json!({"paidTier":{"name":"bad\nname"},"currentTier":{"name":"Free"}}),
+                Some("Free"),
+            ),
+            (200, json!({"paidTier":{"name":"x".repeat(129)}}), None),
+            (
+                200,
+                json!({"paidTier":{"name":42},"currentTier":{"name":" "}}),
+                None,
+            ),
+            (200, json!({}), None),
+            (403, json!({}), None),
+            (500, json!({}), None),
+        ] {
+            let (base, task) = http::fixture::server_status(vec![
+                (200, json!({"id":"demo-id","email":"demo@example.invalid"})),
+                (status, metadata),
+                (200, json!({"groups":[{"name":"Gemini","buckets":[{"name":"weekly","remainingFraction":0.5}]}]})),
+            ]).await;
+            let usage = AntigravityProvider
+                .fetch_api(
+                    &http::fixture::context(),
+                    &format!("{base}/v1internal:"),
+                    &format!("{base}/userinfo"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(usage.account.plan.as_deref(), plan);
+            assert_eq!(usage.windows[0].quota, Quota::from_used(Some(50.0)));
+            assert_eq!(task.await.unwrap().len(), 3);
+        }
     }
     #[test]
     fn summary_keeps_groups_windows_and_unknown() {
