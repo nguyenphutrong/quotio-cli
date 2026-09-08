@@ -285,18 +285,18 @@ fn zai(root: &Value, now: OffsetDateTime) -> Result<Vec<QuotaWindow>, ProviderEr
         if !matches!(kind, "TOKENS_LIMIT" | "CREDIT_LIMIT" | "TIME_LIMIT") {
             continue;
         }
-        let n = slot.get("number").and_then(Value::as_u64);
-        let unit = slot.get("unit").and_then(Value::as_u64);
+        let n = slot.get("number").and_then(Value::as_f64);
+        let unit = slot.get("unit").and_then(Value::as_f64);
         let period = match (unit, n) {
-            (Some(3), Some(5)) => "Session".into(),
-            (Some(6), Some(1)) => "Weekly".into(),
-            (Some(5), Some(1)) => "Monthly".into(),
-            (Some(u), Some(n)) if matches!(u, 3..=6) => format!(
+            (Some(3.0), Some(5.0)) => "Session".into(),
+            (Some(6.0), Some(1.0)) => "Weekly".into(),
+            (Some(5.0), Some(1.0)) => "Monthly".into(),
+            (Some(u), Some(n)) if matches!(u, 3.0 | 4.0 | 5.0 | 6.0) => format!(
                 "{n} {}",
                 match u {
-                    3 => "hours",
-                    4 => "days",
-                    5 => "months",
+                    3.0 => "hours",
+                    4.0 => "days",
+                    5.0 => "months",
                     _ => "weeks",
                 }
             ),
@@ -307,14 +307,25 @@ fn zai(root: &Value, now: OffsetDateTime) -> Result<Vec<QuotaWindow>, ProviderEr
         } else {
             period
         };
+        // GLM defines nextResetTime in milliseconds, even for small or fractional values.
+        let reset = match slot.get("nextResetTime") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let millis = value.as_f64().ok_or(ProviderError::InvalidData)?;
+                Some(
+                    OffsetDateTime::from_unix_timestamp_nanos((millis * 1_000_000.0) as i128)
+                        .map_err(|_| ProviderError::InvalidData)?,
+                )
+            }
+        };
         let mut w = if kind == "TIME_LIMIT" {
             window(
                 &label,
                 number(slot.get("currentValue"))?,
                 number(slot.get("usage"))?,
                 None,
-                "requests",
-                date(slot.get("nextResetTime"))?,
+                "searches",
+                reset,
                 "zai_quota_api",
                 now,
             )
@@ -325,7 +336,7 @@ fn zai(root: &Value, now: OffsetDateTime) -> Result<Vec<QuotaWindow>, ProviderEr
                 None,
                 None,
                 "tokens",
-                date(slot.get("nextResetTime"))?,
+                reset,
                 "zai_quota_api",
                 now,
             )
@@ -337,22 +348,22 @@ fn zai(root: &Value, now: OffsetDateTime) -> Result<Vec<QuotaWindow>, ProviderEr
             Some("zai-web-searches".into())
         } else {
             match (unit, n) {
-                (Some(3), Some(n)) if n > 0 => {
-                    Some(if n < 24 { "zai-session" } else { "zai-daily" }.into())
+                (Some(3.0), Some(n)) if n > 0.0 => {
+                    Some(if n < 24.0 { "zai-session" } else { "zai-daily" }.into())
                 }
-                (Some(4), Some(n)) if n > 0 => Some(
-                    if n <= 1 {
+                (Some(4.0), Some(n)) if n > 0.0 => Some(
+                    if n <= 1.0 {
                         "zai-daily"
-                    } else if n < 28 {
+                    } else if n < 28.0 {
                         "zai-weekly"
                     } else {
                         "zai-monthly"
                     }
                     .into(),
                 ),
-                (Some(5), Some(n)) if n > 0 => Some("zai-monthly".into()),
-                (Some(6), Some(n)) if n > 0 => {
-                    Some(if n < 4 { "zai-weekly" } else { "zai-monthly" }.into())
+                (Some(5.0), Some(n)) if n > 0.0 => Some("zai-monthly".into()),
+                (Some(6.0), Some(n)) if n > 0.0 => {
+                    Some(if n < 4.0 { "zai-weekly" } else { "zai-monthly" }.into())
                 }
                 _ => None,
             }
@@ -764,6 +775,34 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn zai_accepts_double_periods_and_explicit_millisecond_resets() {
+        let windows = zai(
+            &json!({"data":{"limits":[
+                {"type":"TOKENS_LIMIT","unit":3.0,"number":5.0,"percentage":20,"nextResetTime":1500.5},
+                {"type":"CREDIT_LIMIT","unit":4.0,"number":1.5,"percentage":10,"nextResetTime":1788696000123.5},
+                {"type":"TIME_LIMIT","currentValue":2,"usage":10,"nextResetTime":1000}
+            ]}}),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        assert_eq!(windows[0].metric_id.as_deref(), Some("zai-session"));
+        assert_eq!(windows[0].label, "Session");
+        assert_eq!(windows[1].metric_id.as_deref(), Some("zai-weekly"));
+        assert_eq!(windows[1].label, "1.5 days");
+        assert_eq!(windows[0].resets_at.unwrap().unix_timestamp_nanos(), 1_500_500_000);
+        assert_eq!(windows[1].resets_at.unwrap().unix_timestamp(), 1_788_696_000);
+        assert_eq!(windows[2].resets_at.unwrap().unix_timestamp(), 1);
+        assert_eq!(windows[2].metric_id.as_deref(), Some("zai-web-searches"));
+        assert_eq!(windows[2].consumption.as_ref().unwrap().unit, "searches");
+        assert_eq!(windows[2].amounts.as_ref().unwrap().unit, "searches");
+        for invalid in [json!("1500"), json!(true), json!({}), json!(1e100)] {
+            assert!(zai(
+                &json!({"data":{"limits":[{"type":"TOKENS_LIMIT","percentage":20,"nextResetTime":invalid}]}}),
+                OffsetDateTime::UNIX_EPOCH,
+            ).is_err());
+        }
     }
     #[test]
     fn zai_uses_real_periods_and_separate_mcp_counts() {
