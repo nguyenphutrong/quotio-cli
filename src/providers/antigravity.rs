@@ -5,6 +5,9 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, io::Read, path::Path};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+#[path = "antigravity_subscription.rs"]
+mod subscription_metadata;
+
 const BASE: &str = "https://cloudcode-pa.googleapis.com/v1internal:";
 pub struct AntigravityProvider;
 #[derive(Deserialize)]
@@ -356,12 +359,11 @@ impl AntigravityProvider {
             ) => json!({}),
             Err(error) => return Err(error),
         };
-        let project = subscription.get("cloudaicompanionProject");
-        let project = match project {
-            None | Some(Value::Null) => None,
-            Some(Value::String(s)) => Some(s.as_str()),
-            Some(value) => string(value.get("id")),
-        };
+        let (antigravity_subscription, invalid_metadata) =
+            subscription_metadata::parse(&subscription);
+        let project = antigravity_subscription
+            .as_ref()
+            .and_then(|info| info.cloudaicompanion_project.as_deref());
         let payload = project
             .map(|p| json!({"project":p}))
             .unwrap_or_else(|| json!({}));
@@ -412,9 +414,17 @@ impl AntigravityProvider {
             }
         };
         Ok(ProviderUsage {
+            antigravity_subscription,
             codex_profile: None,
             codex_reset_credits: None,
-            diagnostics: vec![],
+            diagnostics: if invalid_metadata {
+                vec![UsageDiagnostic {
+                    source: "antigravity_subscription".into(),
+                    code: ProviderError::InvalidData,
+                }]
+            } else {
+                vec![]
+            },
             account_ref: None,
             provider: self.id(),
             account: AccountIdentity {
@@ -612,6 +622,83 @@ mod tests {
             assert_eq!(usage.windows[0].quota, Quota::from_used(Some(50.0)));
             assert_eq!(task.await.unwrap().len(), 3);
         }
+    }
+    #[tokio::test]
+    async fn rich_subscription_metadata_reaches_usage_and_quota_request() {
+        let subscription =
+            serde_json::from_str(include_str!("fixtures/antigravity-subscription.json")).unwrap();
+        let (base, task) = http::fixture::server(vec![
+            json!({"id":"demo-id","email":"demo@example.invalid"}),
+            subscription,
+            json!({"groups":[{"name":"Gemini","buckets":[{"name":"weekly","remainingFraction":0.5}]}]}),
+        ])
+        .await;
+        let usage = AntigravityProvider
+            .fetch_api(
+                &http::fixture::context(),
+                &format!("{base}/v1internal:"),
+                &format!("{base}/userinfo"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(usage.account.plan.as_deref(), Some("Pro"));
+        assert_eq!(usage.windows[0].quota, Quota::from_used(Some(50.0)));
+        assert!(usage.diagnostics.is_empty());
+        let expected: Value = serde_json::from_str(include_str!(
+            "fixtures/antigravity-subscription-expected.json"
+        ))
+        .unwrap();
+        let encoded = serde_json::to_value(&usage).unwrap();
+        assert_eq!(encoded["antigravity_subscription"], expected);
+        let requests = task.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].contains("\"project\":\"synthetic-project\""));
+    }
+
+    #[tokio::test]
+    async fn malformed_upgrade_metadata_preserves_quota_and_safe_siblings() {
+        let (base, task) = http::fixture::server(vec![
+            json!({"id":"demo-id","email":"demo@example.invalid"}),
+            json!({"paidTier":{"name":"Pro","upgradeSubscriptionUri":"https://user:secret@example.invalid"},"currentTier":{"name":"Free"},"upgradeSubscriptionUri":"https://example.invalid/upgrade","allowedTiers":[false,{"name":"Ultra"}]}),
+            json!({"groups":[{"name":"Gemini","buckets":[{"name":"weekly","remainingFraction":0.5}]}]}),
+        ]).await;
+        let usage = AntigravityProvider
+            .fetch_api(
+                &http::fixture::context(),
+                &format!("{base}/v1internal:"),
+                &format!("{base}/userinfo"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(usage.account.plan.as_deref(), Some("Pro"));
+        assert_eq!(usage.windows[0].quota, Quota::from_used(Some(50.0)));
+        assert_eq!(usage.diagnostics.len(), 1);
+        assert_eq!(usage.diagnostics[0].code, ProviderError::InvalidData);
+        let metadata = usage.antigravity_subscription.as_ref().unwrap();
+        assert!(
+            metadata
+                .paid_tier
+                .as_ref()
+                .unwrap()
+                .upgrade_subscription_uri
+                .is_none()
+        );
+        assert!(metadata.upgrade_subscription_uri.is_some());
+        let mut legacy = serde_json::to_value(&usage).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("antigravity_subscription");
+        let legacy: ProviderUsage = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.antigravity_subscription.is_none());
+        assert!(
+            !serde_json::to_value(legacy)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("antigravity_subscription")
+        );
+        assert_eq!(task.await.unwrap().len(), 3);
     }
     #[tokio::test]
     async fn slow_subscription_leaves_time_for_quota() {

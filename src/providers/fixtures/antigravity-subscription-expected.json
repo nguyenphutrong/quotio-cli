@@ -1,0 +1,16 @@
+{
+  "current_tier": {"id": "free", "name": "Free", "description": "Basic access", "is_default": true},
+  "paid_tier": {
+    "id": "pro", "name": "Pro", "description": "Paid access",
+    "privacy_notice": {"show_notice": false, "notice_text": "Your privacy matters"},
+    "is_default": false,
+    "upgrade_subscription_uri": "https://example.invalid/tier-upgrade",
+    "upgrade_subscription_text": "View plans",
+    "upgrade_subscription_type": "SUBSCRIPTION",
+    "user_defined_cloudaicompanion_project": true
+  },
+  "allowed_tiers": [{"id": "ultra", "name": "Ultra", "description": "More access", "upgrade_subscription_uri": "https://example.invalid/ultra"}],
+  "cloudaicompanion_project": "synthetic-project",
+  "gcp_managed": false,
+  "upgrade_subscription_uri": "https://example.invalid/upgrade"
+}

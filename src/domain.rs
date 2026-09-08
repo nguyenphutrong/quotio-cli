@@ -152,6 +152,8 @@ pub struct UsageDiagnostic {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antigravity_subscription: Option<AntigravitySubscriptionInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_profile: Option<CodexProfileAnalytics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_reset_credits: Option<CodexResetCreditInventory>,
@@ -239,4 +241,50 @@ impl UsageReport {
             1
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AntigravitySubscriptionInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_tier: Option<AntigravitySubscriptionTier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paid_tier: Option<AntigravitySubscriptionTier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tiers: Option<Vec<AntigravitySubscriptionTier>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloudaicompanion_project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gcp_managed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade_subscription_uri: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AntigravitySubscriptionTier {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy_notice: Option<AntigravityPrivacyNotice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_default: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade_subscription_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade_subscription_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade_subscription_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_defined_cloudaicompanion_project: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AntigravityPrivacyNotice {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_notice: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice_text: Option<String>,
 }

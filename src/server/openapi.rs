@@ -278,6 +278,12 @@ mod tests {
             schema_version: 1,
             generated_at: now,
             providers: vec![crate::domain::ProviderUsage {
+                antigravity_subscription: Some(
+                    serde_json::from_str(include_str!(
+                        "../providers/fixtures/antigravity-subscription-expected.json"
+                    ))
+                    .unwrap(),
+                ),
                 codex_profile: Some(crate::domain::CodexProfileAnalytics {
                     daily_usage: vec![crate::domain::CodexDailyUsage {
                         date: "1970-01-01".into(),
@@ -329,12 +335,26 @@ mod tests {
             }],
             failures: vec![],
         };
-        validate(
-            &schemas["UsageReport"],
-            &serde_json::to_value(report).unwrap(),
-            &document,
-            "usage",
-        );
+        let mut report = serde_json::to_value(report).unwrap();
+        let expected: Value = serde_json::from_str(include_str!(
+            "../providers/fixtures/antigravity-subscription-expected.json"
+        ))
+        .unwrap();
+        assert_eq!(report["providers"][0]["antigravity_subscription"], expected);
+        validate(&schemas["UsageReport"], &report, &document, "usage");
+        report["providers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("antigravity_subscription");
+        validate(&schemas["UsageReport"], &report, &document, "legacy usage");
+        for name in [
+            "AntigravitySubscriptionInfo",
+            "AntigravitySubscriptionTier",
+            "AntigravityPrivacyNotice",
+        ] {
+            assert_eq!(schemas[name]["additionalProperties"], false);
+            validate(&schemas[name], &serde_json::json!({}), &document, name);
+        }
         let settings = crate::settings::SettingsView {
             revision: "runtime".into(),
             values: crate::config::Config::default(),

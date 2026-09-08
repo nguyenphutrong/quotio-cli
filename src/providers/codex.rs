@@ -156,6 +156,7 @@ fn parse(
     }
     let email = account.email.ok_or(ProviderError::InvalidData)?;
     Ok(ProviderUsage {
+        antigravity_subscription: None,
         codex_profile: None,
         codex_reset_credits: None,
         diagnostics: vec![],

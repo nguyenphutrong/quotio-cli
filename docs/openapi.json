@@ -1986,6 +1986,9 @@
           },
           "codex_profile": {
             "$ref": "#/components/schemas/CodexProfileAnalytics"
+          },
+          "antigravity_subscription": {
+            "$ref": "#/components/schemas/AntigravitySubscriptionInfo"
           }
         },
         "additionalProperties": false,
@@ -1994,6 +1997,80 @@
           "account",
           "windows"
         ]
+      },
+      "AntigravitySubscriptionInfo": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "current_tier": {
+            "$ref": "#/components/schemas/AntigravitySubscriptionTier"
+          },
+          "paid_tier": {
+            "$ref": "#/components/schemas/AntigravitySubscriptionTier"
+          },
+          "allowed_tiers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AntigravitySubscriptionTier"
+            }
+          },
+          "cloudaicompanion_project": {
+            "type": "string"
+          },
+          "gcp_managed": {
+            "type": "boolean"
+          },
+          "upgrade_subscription_uri": {
+            "type": "string",
+            "format": "uri"
+          }
+        }
+      },
+      "AntigravitySubscriptionTier": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "privacy_notice": {
+            "$ref": "#/components/schemas/AntigravityPrivacyNotice"
+          },
+          "is_default": {
+            "type": "boolean"
+          },
+          "upgrade_subscription_uri": {
+            "type": "string",
+            "format": "uri"
+          },
+          "upgrade_subscription_text": {
+            "type": "string"
+          },
+          "upgrade_subscription_type": {
+            "type": "string"
+          },
+          "user_defined_cloudaicompanion_project": {
+            "type": "boolean"
+          }
+        }
+      },
+      "AntigravityPrivacyNotice": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "show_notice": {
+            "type": "boolean"
+          },
+          "notice_text": {
+            "type": "string"
+          }
+        }
       },
       "ProviderFailure": {
         "type": "object",
