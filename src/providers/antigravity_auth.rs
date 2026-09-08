@@ -269,34 +269,39 @@ fn parse_state_rows(bytes: &[u8]) -> Result<Credential, ProviderError> {
     let data = STANDARD
         .decode(value)
         .map_err(|_| ProviderError::InvalidData)?;
-    // Match the Swift reader's field-6 scan for nested agent-manager state.
-    for offset in 0..data.len() {
-        if data[offset] != 0x32 {
-            continue;
-        }
-        if let Ok(candidate) = delimited(&data, offset + 1)
-            && candidate.len() > 100
-            && candidate.len() < 2000
-            && let Ok(Some(token)) = find_field(candidate, 1)
-            && token.starts_with(b"ya29.")
-        {
-            return protobuf_credential(candidate);
-        }
-    }
+    // agentManagerInitState stores OAuth credentials in top-level field 6.
+    // Unrelated length-delimited fields are opaque, never credential candidates.
     protobuf_credential(find_field(&data, 6)?.ok_or(ProviderError::Authentication)?)
 }
 fn protobuf_credential(data: &[u8]) -> Result<Credential, ProviderError> {
     let token = find_field(data, 1)?.ok_or(ProviderError::Authentication)?;
+    // Validate token type and refresh shape, although borrowed reads discard them.
+    find_field(data, 2)?;
+    find_field(data, 3)?;
     let token = std::str::from_utf8(token).map_err(|_| ProviderError::InvalidData)?;
     if !valid_secret(token) {
         return Err(ProviderError::Authentication);
     }
     let expiry = match find_field(data, 4)? {
         Some(bytes) => {
-            if bytes.first() != Some(&8) {
+            let mut seconds = None;
+            let mut nanos = None;
+            visit_fields(bytes, |number, wire, value| {
+                let slot = match number {
+                    1 => &mut seconds,
+                    2 => &mut nanos,
+                    _ => return Ok(()),
+                };
+                if wire != 0 || slot.is_some() {
+                    return Err(ProviderError::InvalidData);
+                }
+                *slot = Some(varint(value, 0)?.0);
+                Ok(())
+            })?;
+            if nanos.is_some_and(|value| value > 999_999_999) {
                 return Err(ProviderError::InvalidData);
             }
-            let (seconds, _) = varint(bytes, 1)?;
+            let seconds = seconds.ok_or(ProviderError::InvalidData)?;
             let seconds = i64::try_from(seconds).map_err(|_| ProviderError::InvalidData)?;
             let seconds = if seconds > 10_000_000_000 {
                 seconds / 1000
@@ -346,16 +351,29 @@ fn delimited(data: &[u8], offset: usize) -> Result<&[u8], ProviderError> {
     .ok_or(ProviderError::InvalidData)
 }
 fn find_field(data: &[u8], target: u64) -> Result<Option<&[u8]>, ProviderError> {
+    let mut found = None;
+    visit_fields(data, |number, wire, value| {
+        if number == target {
+            if wire != 2 || found.is_some() {
+                return Err(ProviderError::InvalidData);
+            }
+            found = Some(value);
+        }
+        Ok(())
+    })?;
+    Ok(found)
+}
+fn visit_fields<'a>(
+    data: &'a [u8],
+    mut visit: impl FnMut(u64, u64, &'a [u8]) -> Result<(), ProviderError>,
+) -> Result<(), ProviderError> {
     let mut offset = 0;
     while offset < data.len() {
         let (tag, start) = varint(data, offset)?;
-        if tag >> 3 == 0 {
+        if tag >> 3 == 0 || tag >> 3 > 0x1fff_ffff {
             return Err(ProviderError::InvalidData);
         }
         let wire = tag & 7;
-        if tag >> 3 == target && wire == 2 {
-            return delimited(data, start).map(Some);
-        }
         offset = match wire {
             0 => varint(data, start)?.1,
             1 => start.checked_add(8).ok_or(ProviderError::InvalidData)?,
@@ -371,8 +389,14 @@ fn find_field(data: &[u8], target: u64) -> Result<Option<&[u8]>, ProviderError> 
         if offset > data.len() {
             return Err(ProviderError::InvalidData);
         }
+        let value = if wire == 2 {
+            delimited(data, start)?
+        } else {
+            &data[start..offset]
+        };
+        visit(tag >> 3, wire, value)?;
     }
-    Ok(None)
+    Ok(())
 }
 
 pub fn owned_credential(
@@ -590,6 +614,132 @@ mod tests {
                 .is_err()
             );
         }
+    }
+    fn parse_proto(data: &[u8]) -> Result<Credential, ProviderError> {
+        parse_state_rows(&serde_json::to_vec(&json!([{"value": STANDARD.encode(data)}])).unwrap())
+    }
+    #[test]
+    fn protobuf_ignores_embedded_credentials_and_validates_the_entire_message() {
+        let legitimate = field(1, b"ya29.legitimate");
+        let decoy = field(1, format!("ya29.{}", "decoy".repeat(30)).as_bytes());
+        for number in [1, 2, 5, 7] {
+            let mut message = field(number, &field(6, &decoy));
+            message.extend(field(6, &legitimate));
+            assert_eq!(
+                parse_proto(&message).unwrap().access_token.as_deref(),
+                Some("ya29.legitimate")
+            );
+            assert!(parse_proto(&field(number, &field(6, &decoy))).is_err());
+        }
+        let valid = field(6, &legitimate);
+        for suffix in [
+            field(6, &legitimate),
+            vec![0x30, 0],
+            vec![0x80],
+            vec![0],
+            vec![0x39, 1],
+            vec![0x45, 1],
+            vec![0x48, 0xff],
+        ] {
+            let mut message = valid.clone();
+            message.extend(suffix);
+            assert!(parse_proto(&message).is_err());
+        }
+        for number in [1, 2, 3, 4] {
+            let value = if number == 4 {
+                vec![8, 1]
+            } else {
+                b"synthetic".to_vec()
+            };
+            for wire in [0, 1, 5] {
+                let mut oauth = legitimate.clone();
+                oauth.push(number << 3 | wire);
+                oauth.extend(vec![
+                    0;
+                    match wire {
+                        1 => 8,
+                        5 => 4,
+                        _ => 1,
+                    }
+                ]);
+                assert!(parse_proto(&field(6, &oauth)).is_err());
+            }
+            let mut oauth = if number == 1 {
+                vec![]
+            } else {
+                legitimate.clone()
+            };
+            oauth.extend(field(number, &value));
+            oauth.extend(field(number, &value));
+            assert!(parse_proto(&field(6, &oauth)).is_err());
+        }
+        assert!(parse_proto(&valid).unwrap().expiry.is_none());
+        for timestamp in [
+            vec![],
+            vec![8],
+            vec![8, 1, 8, 2],
+            vec![10, 0],
+            vec![8, 1, 0],
+            vec![8, 1, 16],
+            vec![8, 1, 16, 0, 16, 0],
+            vec![8, 1, 21, 0, 0, 0, 0],
+            vec![8, 1, 0x80],
+            [vec![8], vec![0xff; 10]].concat(),
+            [vec![8, 1, 16], encode_varint(1_000_000_000)].concat(),
+        ] {
+            let mut oauth = legitimate.clone();
+            oauth.extend(field(4, &timestamp));
+            assert!(
+                parse_proto(&field(6, &oauth)).is_err(),
+                "accepted malformed timestamp"
+            );
+        }
+        for value in ["not-base64!", "Mg", "", "===="] {
+            assert!(
+                parse_state_rows(&serde_json::to_vec(&json!([{"value":value}])).unwrap()).is_err()
+            );
+        }
+        for data in [
+            vec![0xff; 11],
+            [vec![0x32], vec![0xff; 10]].concat(),
+            [vec![0x48], vec![0xff; 10]].concat(),
+        ] {
+            assert!(parse_proto(&data).is_err());
+        }
+    }
+    #[tokio::test]
+    async fn native_state_rotation_invalidates_borrowed_session() {
+        struct StateStore(Mutex<Vec<u8>>);
+        impl Store for StateStore {
+            fn credential(&self) -> Result<Credential, ProviderError> {
+                parse_state_rows(&self.0.lock().unwrap())
+            }
+        }
+        let store = Arc::new(StateStore(Mutex::new(
+            include_bytes!("fixtures/antigravity-native-state.json").to_vec(),
+        )));
+        let context = http::fixture::context();
+        let session = Session::load(store.clone(), &context).await.unwrap();
+        session.verify().await.unwrap();
+        let rotated = field(6, &field(1, b"ya29.rotated-native-access"));
+        *store.0.lock().unwrap() =
+            serde_json::to_vec(&json!([{"value":STANDARD.encode(rotated)}])).unwrap();
+        assert_eq!(session.verify().await, Err(ProviderError::Authentication));
+        let next = Session::load(store, &context).await.unwrap();
+        assert_eq!(next.token.0, "ya29.rotated-native-access");
+    }
+    #[test]
+    fn native_reader_wire_fixture() {
+        // Synthetic field layout from NativeAntigravityCredentialReader.swift:
+        // agentManagerInitState.6 -> access=1, refresh=3, Timestamp=4.
+        let credential =
+            parse_state_rows(include_bytes!("fixtures/antigravity-native-state.json")).unwrap();
+        assert_eq!(
+            credential.access_token.as_deref(),
+            Some("ya29.synthetic-native-access")
+        );
+        assert_eq!(credential.expires_at(), Some(1_800_000_000));
+        assert!(credential.refresh_token.is_none());
     }
     #[cfg(unix)]
     #[tokio::test]
