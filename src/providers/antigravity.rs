@@ -334,14 +334,22 @@ impl AntigravityProvider {
                 )
                 .json(&payload)
         };
-        let subscription: Result<Value, _> = quota_json(
-            post(
-                "loadCodeAssist",
-                json!({"metadata":{"ideType":"ANTIGRAVITY"}}),
+        // Subscription metadata is optional; reserve the remaining time for quota.
+        let cap = std::time::Duration::from_secs(2);
+        let budget =
+            super::remaining_fetch_time().map_or(cap, |remaining| remaining.mul_f64(0.25).min(cap));
+        let subscription: Result<Value, _> = tokio::time::timeout(
+            budget,
+            quota_json(
+                post(
+                    "loadCodeAssist",
+                    json!({"metadata":{"ideType":"ANTIGRAVITY"}}),
+                ),
+                context.clock.now(),
             ),
-            context.clock.now(),
         )
-        .await;
+        .await
+        .unwrap_or(Err(ProviderError::Timeout));
         tracing::debug!(result = ?subscription.as_ref().map(|_| ()), "Antigravity subscription response");
         let subscription = match subscription {
             Ok(value) => value,
@@ -603,6 +611,36 @@ mod tests {
             assert_eq!(usage.windows[0].quota, Quota::from_used(Some(50.0)));
             assert_eq!(task.await.unwrap().len(), 3);
         }
+    }
+    #[tokio::test]
+    async fn slow_subscription_leaves_time_for_quota() {
+        let (base, server) = http::fixture::server_status_with_async_action(vec![
+            (200, json!({"id":"demo-id","email":"demo@example.invalid"})),
+            (200, json!({"paidTier":{"name":"Late"}})),
+            (200, json!({"groups":[{"name":"Gemini","buckets":[{"name":"weekly","remainingFraction":0.5}]}]})),
+        ], |index| async move {
+            if index == 1 { tokio::time::sleep(std::time::Duration::from_millis(150)).await; }
+        }).await;
+        let context = http::fixture::context();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(400);
+        let usage = super::super::FETCH_DEADLINE
+            .scope(
+                deadline,
+                tokio::time::timeout_at(
+                    deadline,
+                    AntigravityProvider.fetch_api(
+                        &context,
+                        &format!("{base}/v1internal:"),
+                        &format!("{base}/userinfo"),
+                    ),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(usage.account.plan.is_none());
+        assert_eq!(usage.windows[0].quota, Quota::from_used(Some(50.0)));
+        assert_eq!(server.await.unwrap().len(), 3);
     }
     #[test]
     fn summary_keeps_groups_windows_and_unknown() {
