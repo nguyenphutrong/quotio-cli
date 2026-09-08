@@ -114,7 +114,7 @@ pub(super) async fn exchange(
 ) -> Result<Credential, AccountError> {
     exchange_at(context, authorization, raw, TOKEN_URL).await
 }
-async fn exchange_at(
+pub(super) async fn exchange_at(
     context: &ProviderContext,
     authorization: Authorization,
     raw: &str,

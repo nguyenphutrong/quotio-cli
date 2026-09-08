@@ -121,6 +121,8 @@ each `slow_down`. Pending responses do not create accounts. Cancellation or expi
 stops polling and discards late tokens before persistence. Sessions live in memory;
 a backend restart requires a new session, not reuse of an authorization code.
 
+Claude saves the account identity from the token exchange before any quota request,
+matching the native authorizer. A quota outage does not discard a successful login.
 Claude refresh uses a durable marker written before the token request. A timeout,
 invalid response, or uncertain write leaves that marker in place, preventing replay.
 Current and past refresh-token fingerprints remain reserved after account deletion.

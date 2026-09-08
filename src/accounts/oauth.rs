@@ -687,7 +687,9 @@ impl OAuthSessionManager {
         let provider = self.get(id).await?.provider;
         let result = async {
             let credential = credential?;
-            let identity = if let Credential::CopilotOAuth { account_id, .. } = &credential {
+            let identity = if let Credential::CopilotOAuth { account_id, .. }
+            | Credential::ClaudeOAuth { account_id, .. } = &credential
+            {
                 account_id.clone()
             } else {
                 tokio::time::timeout(
@@ -1177,6 +1179,38 @@ mod session_tests {
             assert!(manager.vault.begin().unwrap().document.accounts.is_empty());
             task.await.unwrap();
         }
+    }
+    #[tokio::test]
+    async fn claude_exchange_persists_identity_without_quota_or_token_responses() {
+        let manager = manager();
+        let session = manager
+            .begin_for(
+                crate::cli::Provider::Catalog("claude"),
+                None,
+                OAuthMode::Relay,
+            )
+            .await
+            .unwrap();
+        let (authorization, label) = manager.claim(&session.id).await.unwrap();
+        let code = format!("private-code#{}", authorization.state);
+        let (url, task) = http::fixture::server(vec![serde_json::json!({"access_token":"private-access", "refresh_token":"private-refresh", "expires_in":3600, "account":{"uuid":"fixture-id", "email_address":"demo@example.com"}})]).await;
+        let credential = claude::exchange_at(&manager.context, authorization, &code, &url).await;
+        let completed = manager
+            .finish(&session.id, credential, label)
+            .await
+            .unwrap();
+        assert_eq!(completed.status, SessionStatus::Completed);
+        assert!(
+            !serde_json::to_string(&completed)
+                .unwrap()
+                .contains("private-")
+        );
+        let tx = manager.vault.begin().unwrap();
+        assert_eq!(tx.document.accounts[0].identity, "fixture-id");
+        assert_eq!(tx.document.claude_refresh_owners.len(), 1);
+        assert_eq!(tx.document.version, 6);
+        drop(tx);
+        assert_eq!(task.await.unwrap().len(), 1);
     }
     #[tokio::test]
     async fn claude_manual_workflow_is_typed_and_single_use() {
