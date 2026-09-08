@@ -255,6 +255,8 @@ async fn codex_stdio_protocol_is_exercised_offline() {
     std::fs::create_dir(&directory).unwrap();
     let script = directory.join("codex-fixture");
     std::fs::write(&script, r#"#!/bin/sh
+# Regress startup slower than the collector unit tests' one-second budget.
+sleep 2
 while IFS= read -r request; do
 case "$request" in
 *'"id":1,'*) printf '%s\n' '{"id":1,"result":{}}';;
@@ -265,12 +267,14 @@ esac
 done
 "#).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let report = collector()
-        .collect(request(vec![Arc::new(CodexProvider {
-            executable: script.clone(),
-        })]))
-        .await;
-    assert_eq!(report.exit_code(), 0);
+    let mut req = request(vec![Arc::new(CodexProvider {
+        executable: script.clone(),
+    })]);
+    // This tests real subprocess I/O, not the collector's deadline. Allow startup
+    // under load; deadline behavior is covered separately with paused time.
+    req.timeout = Duration::from_secs(10);
+    let report = collector().collect(req).await;
+    assert_eq!(report.exit_code(), 0, "{:?}", report.failures);
     assert_eq!(
         report.providers[0].windows[0].quota,
         Quota::from_used(Some(25.0))
