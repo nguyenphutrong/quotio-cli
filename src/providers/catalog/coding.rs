@@ -1020,6 +1020,7 @@ async fn warp_at(
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .header("x-warp-client-id", "warp-app")
+            .header("x-warp-client-version", "v0.2026.01.07.08.13.stable_01")
             .header("User-Agent", "Warp/1.0")
             .json(&json!({
                 "query": r#"query GetRequestLimitInfo($requestContext: RequestContext!) {
@@ -1573,6 +1574,10 @@ mod tests {
         assert_eq!(usage.windows[1].amounts.as_ref().unwrap().remaining, 10.0);
         let request = server.await.unwrap().pop().unwrap();
         assert!(request.contains(&format!("\"category\":\"{}\"", warp_platform())));
+        assert!(request.to_ascii_lowercase().contains("x-warp-client-id: warp-app"));
+        assert!(request.to_ascii_lowercase().contains(
+            "x-warp-client-version: v0.2026.01.07.08.13.stable_01"
+        ));
         assert!(request.starts_with("POST /graphql/v2?op=GetRequestLimitInfo "));
         assert!(request.contains("GetRequestLimitInfo"));
         assert!(
