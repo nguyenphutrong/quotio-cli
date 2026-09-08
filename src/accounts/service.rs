@@ -665,6 +665,7 @@ impl ManagedProvider {
         {
             *refresh_pending = true;
             let mut tx = begin(self.vault.clone()).await?;
+            tx.document.reserve_factory_refresh(&self.id, &latest)?;
             let account = tx
                 .document
                 .accounts
@@ -679,6 +680,7 @@ impl ManagedProvider {
         }
         let updated = self.operations.refresh(context, &latest).await?;
         let mut tx = begin(self.vault.clone()).await?;
+        tx.document.reserve_factory_refresh(&self.id, &updated)?;
         let account = tx
             .document
             .accounts
@@ -2330,6 +2332,120 @@ mod tests {
             std::fs::remove_file(entry.unwrap().path()).unwrap();
         }
         std::fs::remove_dir(path).unwrap();
+    }
+    fn factory_fixture(token: &str, org: &str) -> Credential {
+        Credential::FactoryOAuth {
+            access_token: "fixture".into(),
+            refresh_token: token.into(),
+            organization_id: Some(org.into()),
+            expires_at: 0,
+            refresh_pending: false,
+        }
+    }
+    #[tokio::test]
+    async fn factory_registration_serializes_refresh_ownership_across_organizations() {
+        let (vault, _, _, _, path) = setup(0, false, false, false);
+        let (a, b) = tokio::join!(
+            add(
+                vault.clone(),
+                Provider::Factory,
+                "A".into(),
+                factory_fixture("shared", "A"),
+                "old-org-A-identity".into()
+            ),
+            add(
+                vault.clone(),
+                Provider::Factory,
+                "B".into(),
+                factory_fixture("shared", "B"),
+                "old-org-B-identity".into()
+            ),
+        );
+        assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+        assert!(matches!(
+            if a.is_err() { a } else { b },
+            Err(AccountError::Duplicate)
+        ));
+        cleanup(path);
+    }
+    #[tokio::test]
+    async fn factory_registration_rejects_pending_and_rotated_token_lineage() {
+        let (vault, _, _, _, path) = setup(0, false, false, false);
+        let original = factory_fixture("original", "A");
+        let id = add(
+            vault.clone(),
+            Provider::Factory,
+            "A".into(),
+            original.clone(),
+            "legacy-identity".into(),
+        )
+        .await
+        .unwrap();
+        for pending in [false, true] {
+            let mut tx = vault.begin().unwrap();
+            let account = tx
+                .document
+                .accounts
+                .iter_mut()
+                .find(|a| a.id == id)
+                .unwrap();
+            if let Credential::FactoryOAuth {
+                refresh_pending, ..
+            } = &mut account.credential
+            {
+                *refresh_pending = pending;
+            }
+            tx.commit().unwrap();
+            assert!(matches!(
+                add(
+                    vault.clone(),
+                    Provider::Factory,
+                    "B".into(),
+                    factory_fixture("original", "B"),
+                    "different".into()
+                )
+                .await,
+                Err(AccountError::Duplicate)
+            ));
+        }
+        let rotated = factory_fixture("rotated", "A");
+        let mut tx = vault.begin().unwrap();
+        tx.document.reserve_factory_refresh(&id, &rotated).unwrap();
+        tx.document
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .unwrap()
+            .credential = rotated;
+        tx.commit().unwrap();
+        for token in ["original", "rotated"] {
+            assert!(matches!(
+                add(
+                    vault.clone(),
+                    Provider::Factory,
+                    "B".into(),
+                    factory_fixture(token, "B"),
+                    "different".into()
+                )
+                .await,
+                Err(AccountError::Duplicate)
+            ));
+        }
+        let mut tx = vault.begin().unwrap();
+        tx.document.remove(&id).unwrap();
+        tx.commit().unwrap();
+        assert!(matches!(
+            add(
+                vault.clone(),
+                Provider::Factory,
+                "B".into(),
+                original,
+                "different".into()
+            )
+            .await,
+            Err(AccountError::Duplicate)
+        ));
+        cleanup(path);
     }
     #[test]
     fn factory_saved_api_keys_keep_idempotent_quota_reads() {

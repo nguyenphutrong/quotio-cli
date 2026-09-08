@@ -176,11 +176,7 @@ pub fn prepare_factory_owned(input: FactoryOwnedInput) -> Result<PreparedAccount
     Ok(PreparedAccount {
         provider: Provider::Factory,
         label: super::validate_label(&input.label)?,
-        identity: crate::cache::fingerprint(&[
-            "factory_owned",
-            &input.refresh_token,
-            input.organization_id.as_deref().unwrap_or(""),
-        ]),
+        identity: crate::cache::fingerprint(&["factory_owned", &input.refresh_token]),
         credential: Credential::FactoryOAuth {
             expires_at: token_expiry(&input.access_token),
             access_token: input.access_token,

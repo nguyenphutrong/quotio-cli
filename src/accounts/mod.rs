@@ -191,6 +191,8 @@ pub struct Document {
     pub accounts: Vec<Account>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub mutation_receipts: std::collections::BTreeMap<String, MutationReceipt>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub factory_refresh_owners: std::collections::BTreeMap<String, String>,
 }
 impl Document {
     pub fn empty() -> Self {
@@ -198,7 +200,30 @@ impl Document {
             version: 1,
             accounts: vec![],
             mutation_receipts: Default::default(),
+            factory_refresh_owners: Default::default(),
         }
+    }
+    // Retain token lineage after rotation/removal so registration cannot bypass a fence.
+    pub fn reserve_factory_refresh(
+        &mut self,
+        id: &str,
+        credential: &Credential,
+    ) -> Result<(), AccountError> {
+        let Credential::FactoryOAuth { refresh_token, .. } = credential else {
+            return Ok(());
+        };
+        let fingerprint = crate::cache::fingerprint(&["factory_owned", refresh_token]);
+        if self.factory_refresh_owners.get(&fingerprint).is_some_and(|owner| owner != id)
+            || self.accounts.iter().any(|account| {
+                account.id != id && matches!(&account.credential,
+                    Credential::FactoryOAuth { refresh_token: existing, .. } if existing == refresh_token)
+            })
+        {
+            return Err(AccountError::Duplicate);
+        }
+        self.factory_refresh_owners
+            .insert(fingerprint, id.to_owned());
+        Ok(())
     }
     pub fn add(
         &mut self,
@@ -216,6 +241,7 @@ impl Document {
             return Err(AccountError::Duplicate);
         }
         let id = random_string()?;
+        self.reserve_factory_refresh(&id, &credential)?;
         let active = !self
             .accounts
             .iter()
@@ -265,6 +291,8 @@ impl Document {
             .iter()
             .position(|a| a.id == id)
             .ok_or(AccountError::NotFound)?;
+        let account = self.accounts[index].clone();
+        self.reserve_factory_refresh(&account.id, &account.credential)?;
         let removed = self.accounts.remove(index);
         if removed.active
             && let Some(next) = self
