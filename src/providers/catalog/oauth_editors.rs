@@ -657,52 +657,61 @@ async fn cursor_token(context: &ProviderContext) -> Result<Secret, ProviderError
 
 #[cfg(target_os = "macos")]
 struct CursorDatabase {
-    query_file: std::fs::File,
-    inspection_file: std::fs::File,
+    directory: PathBuf,
+    sources: Vec<(PathBuf, Option<std::fs::Metadata>)>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for CursorDatabase {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
 }
 
 #[cfg(target_os = "macos")]
 async fn cursor_state_token() -> Result<Option<Secret>, ProviderError> {
     let path = cursor_state_database_path().ok_or(ProviderError::Authentication)?;
-    let path_for_open = path.clone();
-    let Some(CursorDatabase {
-        query_file,
-        inspection_file,
-    }) = blocking(move || open_cursor_database(&path_for_open)).await?
-    else {
+    let Some(database) = blocking(move || open_cursor_database(&path)).await? else {
         return Ok(None);
     };
     let bytes =
-        match tokio::time::timeout(CURSOR_SQLITE_TIMEOUT, cursor_sqlite_output(query_file)).await {
+        match tokio::time::timeout(CURSOR_SQLITE_TIMEOUT, cursor_sqlite_output(&database)).await {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(_)) | Err(_) => return Ok(None),
         };
-    let path_for_verify = path;
-    if !blocking(move || cursor_database_remains_safe(&inspection_file, &path_for_verify)).await? {
+    if !blocking(move || cursor_database_remains_safe(&database)).await? {
         return Ok(None);
     }
     cursor_token_from_sqlite_output(&bytes)
 }
 
 #[cfg(target_os = "macos")]
-async fn cursor_sqlite_output(database: std::fs::File) -> Result<Vec<u8>, ProviderError> {
+async fn cursor_sqlite_output(database: &CursorDatabase) -> Result<Vec<u8>, ProviderError> {
     cursor_sqlite_query(database, CURSOR_STATE_QUERY).await
 }
 
 #[cfg(target_os = "macos")]
 async fn cursor_sqlite_query(
-    database: std::fs::File,
+    database: &CursorDatabase,
     query: &'static str,
 ) -> Result<Vec<u8>, ProviderError> {
     let mut child = Command::new("/usr/bin/sqlite3")
         .args([
+            "-init",
+            "/dev/null",
+            "-safe",
             "-batch",
             "-noheader",
             "-readonly",
-            "file:/dev/fd/0?mode=ro&immutable=1",
-            query,
         ])
-        .stdin(Stdio::from(database))
+        .args(["-cmd", ".limit length 1048576"])
+        .arg(database.directory.join("state.vscdb"))
+        // Do not evaluate a hostile view or virtual table in place of ItemTable.
+        .arg(format!(
+            "PRAGMA trusted_schema=OFF; SELECT CASE WHEN EXISTS(SELECT 1 FROM pragma_table_list('ItemTable') WHERE schema='main' AND type='table') THEN 1 ELSE json('invalid') END; {query}"
+        ))
+        .env("SQLITE_TMPDIR", &database.directory)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
@@ -726,7 +735,16 @@ async fn cursor_sqlite_query(
     {
         return Err(ProviderError::Unavailable);
     }
-    Ok(bytes)
+    // .limit reports the effective value; the schema check then emits 1. Remove
+    // those fixed records before parsing credentials, failing closed on older tools.
+    let mut lines = bytes.splitn(3, |byte| *byte == b'\n');
+    let limit = lines.next().ok_or(ProviderError::Unavailable)?;
+    if std::str::from_utf8(limit).ok().map(str::trim) != Some("length 1048576")
+        || lines.next() != Some(b"1".as_slice())
+    {
+        return Err(ProviderError::Unavailable);
+    }
+    Ok(lines.next().ok_or(ProviderError::Unavailable)?.to_vec())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -752,22 +770,14 @@ pub(crate) struct CursorLogin {
 
 #[cfg(target_os = "macos")]
 pub(crate) async fn cursor_login(path: PathBuf) -> Result<CursorLogin, ProviderError> {
-    let open_path = path.clone();
-    let Some(CursorDatabase {
-        query_file,
-        inspection_file,
-    }) = blocking(move || open_cursor_database(&open_path)).await?
-    else {
+    let Some(database) = blocking(move || open_cursor_database(&path)).await? else {
         return Err(ProviderError::CredentialStorage);
     };
     let query = "SELECT json_group_array(json_object('key',key,'value',value)) FROM ItemTable WHERE key IN ('cursorAuth/accessToken','cursorAuth/cachedEmail','cursorAuth/stripeMembershipType','cursorAuth/stripeSubscriptionStatus');";
-    let bytes = tokio::time::timeout(
-        CURSOR_SQLITE_TIMEOUT,
-        cursor_sqlite_query(query_file, query),
-    )
-    .await
-    .map_err(|_| ProviderError::Timeout)??;
-    if !blocking(move || cursor_database_remains_safe(&inspection_file, &path)).await? {
+    let bytes = tokio::time::timeout(CURSOR_SQLITE_TIMEOUT, cursor_sqlite_query(&database, query))
+        .await
+        .map_err(|_| ProviderError::Timeout)??;
+    if !blocking(move || cursor_database_remains_safe(&database)).await? {
         return Err(ProviderError::CredentialStorage);
     }
     cursor_login_from_output(&bytes)
@@ -817,71 +827,205 @@ fn cursor_login_from_output(bytes: &[u8]) -> Result<CursorLogin, ProviderError> 
 
 #[cfg(target_os = "macos")]
 fn open_cursor_database(path: &Path) -> Result<Option<CursorDatabase>, ProviderError> {
-    let before = match regular_file(path, MAX_CURSOR_DATABASE_BYTES)? {
-        Some(metadata) => metadata,
-        None => return Ok(None),
+    open_cursor_database_with_hooks(path, || {}, || {})
+}
+
+#[cfg(target_os = "macos")]
+fn open_cursor_database_with_hooks(
+    path: &Path,
+    after_capture: impl FnOnce(),
+    after_database_read: impl FnOnce(),
+) -> Result<Option<CursorDatabase>, ProviderError> {
+    use std::{
+        io::Write,
+        os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     };
-    if cursor_has_wal_sidecars(path)? {
-        return Ok(None);
-    }
-    let query_file = open_readonly_file(path)?;
-    let opened = query_file
-        .metadata()
-        .map_err(|_| ProviderError::CredentialStorage)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if before.dev() != opened.dev() || before.ino() != opened.ino() {
+
+    // Capture all identities before reading any bytes. Never give SQLite a source path:
+    // even a read-only WAL connection may create or update the owner's shared memory.
+    let mut sources = Vec::new();
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        let path = PathBuf::from(name);
+        let metadata = regular_file(&path, MAX_CURSOR_DATABASE_BYTES)?;
+        if suffix.is_empty() && metadata.is_none() {
+            return Ok(None);
+        }
+        if suffix == "-journal" && metadata.as_ref().is_some_and(|m| m.len() != 0) {
             return Err(ProviderError::CredentialStorage);
         }
+        sources.push((path, metadata));
     }
-    if !opened.is_file() || opened.len() > MAX_CURSOR_DATABASE_BYTES {
+    after_capture();
+    let mut after_database_read = Some(after_database_read);
+    let directory = std::env::temp_dir().join(format!(
+        "quotio-cursor-{}",
+        crate::accounts::random_string().map_err(|_| ProviderError::CredentialStorage)?
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .map_err(|_| ProviderError::CredentialStorage)?;
+    let snapshot = CursorDatabase { directory, sources };
+    let mut page_size = 0;
+    let mut wal_mode = false;
+    for (index, (source, metadata)) in snapshot.sources.iter().take(2).enumerate() {
+        let Some(before) = metadata else { continue };
+        let file = open_readonly_file(source)?;
+        let opened = file
+            .metadata()
+            .map_err(|_| ProviderError::CredentialStorage)?;
+        if !cursor_same_file(before, &opened) || !opened.is_file() {
+            return Err(ProviderError::CredentialStorage);
+        }
+        let mut bytes = Vec::new();
+        (&file)
+            .take(MAX_CURSOR_DATABASE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ProviderError::CredentialStorage)?;
+        if let Some(hook) = after_database_read.take() {
+            hook();
+        }
+        if bytes.len() > MAX_CURSOR_DATABASE_BYTES as usize
+            || !cursor_same_file(
+                before,
+                &file
+                    .metadata()
+                    .map_err(|_| ProviderError::CredentialStorage)?,
+            )
+        {
+            return Err(ProviderError::CredentialStorage);
+        }
+        if index == 0 {
+            if bytes.len() < 100
+                || &bytes[..16] != b"SQLite format 3\0"
+                || !matches!((bytes[18], bytes[19]), (1, 1) | (2, 2))
+            {
+                return Err(ProviderError::InvalidData);
+            }
+            page_size = u16::from_be_bytes([bytes[16], bytes[17]]) as usize;
+            if page_size == 1 {
+                page_size = 65536;
+            }
+            if !(512..=65536).contains(&page_size) || !page_size.is_power_of_two() {
+                return Err(ProviderError::InvalidData);
+            }
+            wal_mode = bytes[18] == 2;
+        } else if !bytes.is_empty() {
+            if !wal_mode {
+                return Err(ProviderError::InvalidData);
+            }
+            let committed_end = cursor_validate_wal(&bytes, page_size)?;
+            bytes.truncate(committed_end);
+        }
+        let name = if index == 0 {
+            "state.vscdb"
+        } else {
+            "state.vscdb-wal"
+        };
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(snapshot.directory.join(name))
+            .and_then(|mut file| file.write_all(&bytes))
+            .map_err(|_| ProviderError::CredentialStorage)?;
+    }
+    // A read-only WAL connection needs a WAL file even after a clean checkpoint.
+    if wal_mode && snapshot.sources[1].1.is_none() {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(snapshot.directory.join("state.vscdb-wal"))
+            .map_err(|_| ProviderError::CredentialStorage)?;
+    }
+    // SHM is deliberately not copied. SQLite rebuilds it only in the private directory.
+    if !cursor_database_remains_safe(&snapshot)? {
         return Err(ProviderError::CredentialStorage);
     }
-    if !cursor_database_is_rollback(&query_file)? || cursor_has_wal_sidecars(path)? {
-        return Ok(None);
-    }
-    let inspection_file = query_file
-        .try_clone()
-        .map_err(|_| ProviderError::CredentialStorage)?;
-    Ok(Some(CursorDatabase {
-        query_file,
-        inspection_file,
-    }))
+    Ok(Some(snapshot))
 }
 
 #[cfg(target_os = "macos")]
-fn cursor_database_remains_safe(
-    inspection_file: &std::fs::File,
-    path: &Path,
-) -> Result<bool, ProviderError> {
-    Ok(!cursor_has_wal_sidecars(path)? && cursor_database_is_rollback(inspection_file)?)
+fn cursor_same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev()
+        && a.ino() == b.ino()
+        && a.len() == b.len()
+        && a.mtime() == b.mtime()
+        && a.mtime_nsec() == b.mtime_nsec()
+        && a.ctime() == b.ctime()
+        && a.ctime_nsec() == b.ctime_nsec()
 }
 
 #[cfg(target_os = "macos")]
-fn cursor_has_wal_sidecars(path: &Path) -> Result<bool, ProviderError> {
-    for suffix in ["-wal", "-shm"] {
-        let mut sidecar = path.as_os_str().to_os_string();
-        sidecar.push(suffix);
-        if regular_file(Path::new(&sidecar), MAX_CURSOR_DATABASE_BYTES)?.is_some() {
-            return Ok(true);
+fn cursor_database_remains_safe(database: &CursorDatabase) -> Result<bool, ProviderError> {
+    for (path, before) in &database.sources {
+        let after = regular_file(path, MAX_CURSOR_DATABASE_BYTES)?;
+        match (before, after) {
+            (None, None) => (),
+            (Some(before), Some(after)) if cursor_same_file(before, &after) => (),
+            _ => return Ok(false),
         }
     }
-    Ok(false)
+    Ok(true)
 }
 
 #[cfg(target_os = "macos")]
-fn cursor_database_is_rollback(file: &std::fs::File) -> Result<bool, ProviderError> {
-    use std::os::unix::fs::FileExt;
-
-    let mut header = [0u8; 100];
-    let read = file
-        .read_at(&mut header, 0)
-        .map_err(|_| ProviderError::CredentialStorage)?;
-    if read != header.len() || &header[..16] != b"SQLite format 3\0" {
-        return Ok(false);
+fn cursor_validate_wal(bytes: &[u8], page_size: usize) -> Result<usize, ProviderError> {
+    // SQLite silently ignores invalid WAL headers. Reject them rather than returning
+    // stale credentials from the main database. Frame recovery still belongs to SQLite.
+    let be = |bytes: &[u8]| u32::from_be_bytes(bytes[..4].try_into().unwrap());
+    if bytes.len() < 32
+        || !matches!(be(bytes), 0x377f0682 | 0x377f0683)
+        || be(&bytes[4..]) != 3007000
+        || be(&bytes[8..]) as usize != page_size
+    {
+        return Err(ProviderError::InvalidData);
     }
-    Ok(header[18] == 1 && header[19] == 1)
+    let little = be(bytes) == 0x377f0682;
+    let checksum = |bytes: &[u8], mut sum: [u32; 2]| {
+        for pair in bytes.chunks_exact(8) {
+            let word = |v: &[u8]| {
+                if little {
+                    u32::from_le_bytes(v[..4].try_into().unwrap())
+                } else {
+                    be(v)
+                }
+            };
+            sum[0] = sum[0].wrapping_add(word(pair)).wrapping_add(sum[1]);
+            sum[1] = sum[1].wrapping_add(word(&pair[4..])).wrapping_add(sum[0]);
+        }
+        sum
+    };
+    let mut sum = checksum(&bytes[..24], [0, 0]);
+    if sum != [be(&bytes[24..]), be(&bytes[28..])] {
+        return Err(ProviderError::InvalidData);
+    }
+    let mut committed_end = None;
+    for (index, frame) in bytes[32..].chunks_exact(24 + page_size).enumerate() {
+        // Old frames can remain after a WAL reset. They are not part of this log.
+        if frame[8..16] != bytes[16..24] {
+            break;
+        }
+        sum = checksum(&frame[..8], sum);
+        sum = checksum(&frame[24..], sum);
+        if sum != [be(&frame[16..]), be(&frame[20..])]
+            || be(frame) == 0
+            || u64::from(be(frame)).max(u64::from(be(&frame[4..]))) * page_size as u64
+                > MAX_CURSOR_DATABASE_BYTES
+        {
+            // Rollback followed by a shorter write can leave checksum-invalid
+            // frames with the same salts. Like SQLite, retain the last valid commit.
+            return committed_end.ok_or(ProviderError::InvalidData);
+        }
+        if be(&frame[4..]) != 0 {
+            committed_end = Some(32 + (index + 1) * (24 + page_size));
+        }
+    }
+    Ok(committed_end.unwrap_or(32))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1048,6 +1192,10 @@ pub(super) async fn cache_token(id: &str, context: &ProviderContext) -> Option<S
         _ => None,
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "cursor_wal_tests.rs"]
+mod cursor_wal_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1365,21 +1513,18 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn cursor_sqlite_uses_opened_descriptor_after_path_replacement() {
+    async fn cursor_snapshot_rejects_path_replacement() {
         let directory = TemporaryDirectory::new();
         let database = directory.path().join("state.vscdb");
         create_cursor_database(&database, "opened-token");
-        let CursorDatabase {
-            query_file,
-            inspection_file,
-        } = open_cursor_database(&database).unwrap().unwrap();
+        let snapshot = open_cursor_database(&database).unwrap().unwrap();
 
         let replacement = directory.path().join("replacement.vscdb");
         create_cursor_database(&replacement, "replacement-token");
         std::fs::rename(&replacement, &database).unwrap();
 
-        let output = cursor_sqlite_output(query_file).await.unwrap();
-        assert!(cursor_database_remains_safe(&inspection_file, &database).unwrap());
+        let output = cursor_sqlite_output(&snapshot).await.unwrap();
+        assert!(!cursor_database_remains_safe(&snapshot).unwrap());
         assert_eq!(
             cursor_token_from_sqlite_output(&output).unwrap().unwrap().0,
             "opened-token"
@@ -1402,12 +1547,15 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn cursor_skips_wal_sidecars_for_descriptor_reads() {
+    fn cursor_rejects_malformed_wal() {
         let directory = TemporaryDirectory::new();
         let database = directory.path().join("state.vscdb");
         create_cursor_database(&database, "fixture-token");
         std::fs::write(format!("{}-wal", database.display()), b"synthetic-wal").unwrap();
-        assert!(open_cursor_database(&database).unwrap().is_none());
+        assert_eq!(
+            open_cursor_database(&database).err(),
+            Some(ProviderError::InvalidData)
+        );
     }
 
     #[tokio::test]
