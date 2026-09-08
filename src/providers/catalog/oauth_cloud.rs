@@ -11,7 +11,7 @@ use ring::{
     rand::{SecureRandom, SystemRandom},
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -71,14 +71,14 @@ struct KiroSession {
     token: Secret,
     region: String,
     profile_arn: Option<String>,
+    borrowed: bool,
+    machine: String,
 }
 
 struct KiroNativeCredential {
     access_token: String,
     refresh_token: Option<String>,
     client_id: Option<String>,
-    client_secret: Option<String>,
-    auth_method: String,
     profile_arn: Option<String>,
     region: Option<String>,
     expires_at: Option<OffsetDateTime>,
@@ -107,6 +107,8 @@ fn fetch_kiro<'a>(context: &'a ProviderContext) -> FetchFuture<'a> {
             &session.token,
             &session.region,
             session.profile_arn.as_deref(),
+            session.borrowed,
+            &session.machine,
         )
         .await
     })
@@ -375,9 +377,6 @@ fn parse_kiro_native(value: &Value) -> Result<KiroNativeCredential, ProviderErro
             .ok_or(ProviderError::Authentication)?,
         refresh_token: first_secret(object, &["refreshToken", "refresh_token"])?,
         client_id: first_secret(object, &["clientId", "client_id"])?,
-        client_secret: first_secret(object, &["clientSecret", "client_secret"])?,
-        auth_method: first_text(object, &["authMethod", "auth_method"], 64)?
-            .unwrap_or_else(|| "IdC".into()),
         profile_arn: first_text(object, &["profileArn", "profile_arn"], 2048)?,
         region: first_text(object, &["region"], 64)?,
         expires_at: first_date(object, &["expiresAt", "expires_at", "expiry", "expired"])?,
@@ -412,61 +411,6 @@ fn refreshed_expiry(now: OffsetDateTime, seconds: f64) -> Result<OffsetDateTime,
         .ok_or(ProviderError::InvalidData)
 }
 
-async fn refresh_kiro_at(
-    context: &ProviderContext,
-    mut credential: KiroNativeCredential,
-    endpoint: &str,
-) -> Result<KiroNativeCredential, ProviderError> {
-    let refresh_token = credential
-        .refresh_token
-        .as_deref()
-        .ok_or(ProviderError::Authentication)?;
-    let body = if credential.auth_method.eq_ignore_ascii_case("social") {
-        json!({"refreshToken": refresh_token})
-    } else {
-        json!({
-            "refreshToken": refresh_token,
-            "clientId": credential.client_id.as_deref().ok_or(ProviderError::Authentication)?,
-            "clientSecret": credential.client_secret.as_deref().ok_or(ProviderError::Authentication)?,
-            "grantType": "refresh_token",
-        })
-    };
-    let now = context.clock.now();
-    let root = oauth_response(
-        context
-            .http
-            .post(endpoint)
-            .header("Accept", "application/json")
-            .header("Content-Type", "application/json")
-            .json(&body),
-        now,
-    )
-    .await?;
-    let object = root.as_object().ok_or(ProviderError::InvalidData)?;
-    credential.access_token = first_secret(object, &["accessToken", "access_token"])?
-        .ok_or(ProviderError::InvalidData)?;
-    credential.refresh_token =
-        first_secret(object, &["refreshToken", "refresh_token"])?.or(credential.refresh_token);
-    credential.expires_at = Some(refreshed_expiry(
-        now,
-        first_number(object, &["expiresIn", "expires_in"])?.ok_or(ProviderError::InvalidData)?,
-    )?);
-    Ok(credential)
-}
-
-async fn refresh_kiro(
-    context: &ProviderContext,
-    credential: KiroNativeCredential,
-    region: &str,
-) -> Result<KiroNativeCredential, ProviderError> {
-    let endpoint = if credential.auth_method.eq_ignore_ascii_case("social") {
-        format!("https://prod.{region}.auth.desktop.kiro.dev/refreshToken")
-    } else {
-        format!("https://oidc.{region}.amazonaws.com/token")
-    };
-    refresh_kiro_at(context, credential, &endpoint).await
-}
-
 async fn kiro_session(context: &ProviderContext) -> Result<KiroSession, ProviderError> {
     if context.credentials.get("KIRO_ACCESS_TOKEN").is_some() {
         let (region, profile_arn) = kiro_metadata(context, None, None)?;
@@ -474,13 +418,23 @@ async fn kiro_session(context: &ProviderContext) -> Result<KiroSession, Provider
             token: common::key(context, "KIRO_ACCESS_TOKEN")?,
             region,
             profile_arn,
+            borrowed: false,
+            machine: kiro_machine_identifier(None, None, platform_machine_seed)?,
         });
     }
 
     let source = read_native_json(kiro_auth_path()?)
         .await?
         .ok_or(ProviderError::Authentication)?;
-    let mut credential = parse_kiro_native(&source)?;
+    kiro_borrowed_session(context, &source, platform_machine_seed)
+}
+
+fn kiro_borrowed_session(
+    context: &ProviderContext,
+    source: &Value,
+    hardware: impl FnOnce() -> Result<String, ProviderError>,
+) -> Result<KiroSession, ProviderError> {
+    let credential = parse_kiro_native(source)?;
     let (region, profile_arn) = kiro_metadata(
         context,
         credential.region.as_deref(),
@@ -488,23 +442,70 @@ async fn kiro_session(context: &ProviderContext) -> Result<KiroSession, Provider
     )?;
     if credential
         .expires_at
-        .is_none_or(|expires_at| expires_at <= context.clock.now() + Duration::minutes(5))
+        .is_some_and(|expires_at| expires_at <= context.clock.now() + Duration::minutes(5))
     {
-        credential = refresh_kiro(context, credential, &region).await?;
+        return Err(ProviderError::OwnerRefreshRequired);
     }
     Ok(KiroSession {
         token: Secret(credential.access_token),
         region,
         profile_arn,
+        borrowed: true,
+        machine: kiro_machine_identifier(
+            credential.client_id.as_deref(),
+            credential.refresh_token.as_deref(),
+            hardware,
+        )?,
     })
 }
 
-fn kiro_machine_identifier(token: &Secret) -> String {
-    digest(&SHA256, format!("quotio:kiro:{}", token.0).as_bytes())
+fn kiro_machine_identifier(
+    client_id: Option<&str>,
+    refresh_token: Option<&str>,
+    hardware: impl FnOnce() -> Result<String, ProviderError>,
+) -> Result<String, ProviderError> {
+    let seed = match client_id.or(refresh_token) {
+        Some(seed) => seed.to_owned(),
+        None => hardware()?,
+    };
+    let seed = checked_secret(&seed)?;
+    Ok(digest(&SHA256, seed.as_bytes())
         .as_ref()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect()
+        .collect())
+}
+
+fn platform_machine_seed() -> Result<String, ProviderError> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut uuid = [0u8; 16];
+        let timeout = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        // gethostuuid writes exactly 16 bytes and respects the supplied timeout.
+        if unsafe { libc::gethostuuid(uuid.as_mut_ptr(), &timeout) } != 0 {
+            return Err(ProviderError::CredentialStorage);
+        }
+        let hex: String = uuid.iter().map(|byte| format!("{byte:02X}")).collect();
+        Ok(format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..]
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let seed =
+            fs::read_to_string("/etc/machine-id").map_err(|_| ProviderError::CredentialStorage)?;
+        checked_text(&seed, 128)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    Err(ProviderError::CredentialStorage)
 }
 
 fn invocation_id() -> Result<String, ProviderError> {
@@ -658,8 +659,9 @@ async fn fetch_kiro_at(
     token: &Secret,
     region: &str,
     profile_arn: Option<&str>,
+    borrowed: bool,
+    machine: &str,
 ) -> Result<ProviderUsage, ProviderError> {
-    let machine = kiro_machine_identifier(token);
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/other lang/rust api/codewhispererruntime#1.0.0 KiroIDE-quotio-{machine}"
     );
@@ -694,7 +696,11 @@ async fn fetch_kiro_at(
             .header("Accept", "application/json"),
         context.clock.now(),
     )
-    .await?;
+    .await
+    .map_err(|error| match error {
+        ProviderError::Authentication if borrowed => ProviderError::OwnerRefreshRequired,
+        other => other,
+    })?;
     let (windows, plan) = kiro_windows(&root, context.clock.now())?;
     let scope = format!("{region}\0{}", profile_arn.unwrap_or_default());
     let mut usage = common::usage("kiro", token, &scope, windows)?;
@@ -1212,6 +1218,7 @@ pub(super) async fn cache_identity(id: &str, context: &ProviderContext) -> Optio
 mod tests {
     use super::*;
     use crate::providers::http::fixture;
+    use serde_json::json;
     use std::{
         fs,
         sync::atomic::{AtomicU64, Ordering},
@@ -1382,26 +1389,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kiro_refresh_and_usage_keep_requests_cookie_free() {
-        let native = parse_kiro_native(&json!({
-            "accessToken": "old-access",
-            "refreshToken": "refresh",
-            "authMethod": "Social"
-        }))
-        .unwrap();
-        let (refresh_url, refresh_task) = fixture::server(vec![json!({
-            "accessToken": "new-access",
-            "expiresIn": 3600
-        })])
-        .await;
-        let refreshed = refresh_kiro_at(&fixture::context(), native, &refresh_url)
-            .await
-            .unwrap();
-        assert_eq!(refreshed.access_token, "new-access");
-        let refresh_requests = refresh_task.await.unwrap();
-        assert!(refresh_requests[0].starts_with("POST / HTTP/1.1"));
-        assert!(refresh_requests[0].contains("refreshToken"));
-
+    async fn kiro_usage_keeps_requests_cookie_free() {
         let (base, task) = fixture::server(vec![json!({
             "nextDateReset": 1_900_000_000i64,
             "subscriptionInfo": {"subscriptionTitle": "Kiro Pro"},
@@ -1424,6 +1412,8 @@ mod tests {
             &token(),
             "ap-northeast-2",
             Some("arn:aws:codewhisperer:ap-northeast-2:123:profile/test"),
+            true,
+            "fixture-machine",
         )
         .await
         .unwrap();
@@ -1442,6 +1432,89 @@ mod tests {
         assert!(requests[0].contains("amz-sdk-request: attempt=1; max=1"));
         assert!(requests[0].contains("KiroIDE-quotio-"));
         assert!(!requests[0].to_ascii_lowercase().contains("cookie:"));
+    }
+
+    #[test]
+    fn kiro_borrowed_expiry_requires_owner_and_identity_survives_rotation() {
+        let context = fixture::context();
+        for expiry in [
+            context.clock.now() - Duration::seconds(1),
+            context.clock.now() + Duration::minutes(4),
+        ] {
+            let source = json!({"accessToken": "synthetic", "refreshToken": "refresh", "expiresAt": expiry.unix_timestamp()});
+            assert!(matches!(
+                kiro_borrowed_session(&context, &source, || panic!("no hardware read")),
+                Err(ProviderError::OwnerRefreshRequired)
+            ));
+        }
+        let session = |access: &str, client: Option<&str>, refresh: Option<&str>| {
+            kiro_borrowed_session(
+                &context,
+                &json!({"accessToken": access, "clientId": client, "refreshToken": refresh}),
+                || Ok("fixture-hardware".into()),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            session("old", Some("client"), Some("old-refresh")).machine,
+            session("new", Some("client"), Some("new-refresh")).machine
+        );
+        assert_eq!(
+            session("old", None, Some("refresh")).machine,
+            session("new", None, Some("refresh")).machine
+        );
+        assert_eq!(
+            session("old", None, None).machine,
+            session("new", None, None).machine
+        );
+        assert_eq!(
+            kiro_machine_identifier(Some("abc"), Some("ignored"), || panic!("no hardware read"))
+                .unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[tokio::test]
+    async fn kiro_borrowed_auth_failures_never_refresh_or_change_native_bytes() {
+        for (status, borrowed) in [(401, true), (403, true), (401, false), (403, false)] {
+            let path = temp_file("kiro-borrowed");
+            let original = br#"{ "accessToken": "synthetic", "refreshToken": "refresh" }"#;
+            fs::write(&path, original).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let context = fixture::context();
+            let source = read_native_json(path.clone()).await.unwrap().unwrap();
+            let session =
+                kiro_borrowed_session(&context, &source, || panic!("no hardware read")).unwrap();
+            let (url, task) =
+                fixture::server_status(vec![(status, json!({"error": "secret-response"}))]).await;
+            let result = fetch_kiro_at(
+                &context,
+                &url,
+                &session.token,
+                &session.region,
+                None,
+                borrowed,
+                &session.machine,
+            )
+            .await;
+            if borrowed {
+                assert!(matches!(result, Err(ProviderError::OwnerRefreshRequired)));
+            } else {
+                assert!(matches!(result, Err(ProviderError::Authentication)));
+            }
+            let error = result.unwrap_err().to_string();
+            assert!(!error.contains("secret-response"));
+            assert!(error.len() < 160);
+            let requests = task.await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("GET "));
+            assert_eq!(fs::read(&path).unwrap(), original);
+            fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
