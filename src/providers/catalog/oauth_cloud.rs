@@ -414,7 +414,7 @@ pub(crate) async fn refresh_kiro(
 ) -> Result<crate::accounts::Credential, crate::accounts::AccountError> {
     refresh_kiro_at(context, credential, None).await
 }
-async fn refresh_kiro_at(
+pub(crate) async fn refresh_kiro_at(
     context: &ProviderContext,
     credential: &crate::accounts::Credential,
     endpoint_override: Option<&str>,

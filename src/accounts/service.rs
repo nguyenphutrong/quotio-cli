@@ -782,23 +782,28 @@ impl ManagedProvider {
         let updated = self.operations.refresh(context, &latest).await?;
         let mut tx = begin(self.vault.clone()).await?;
         tx.document.reserve_factory_refresh(&self.id, &updated)?;
-        let account = tx
+        let result = match tx
             .document
             .accounts
             .iter_mut()
             .find(|a| a.id == self.id && a.provider == self.provider)
-            .ok_or(AccountError::NotFound)?;
-        if account.credential != latest {
-            return Err(AccountError::Busy);
-        }
-        account.credential = updated.clone();
-        let enabled = account.enabled();
-        // Persist rotation without holding the global vault lock during network IO.
+        {
+            None => Err(AccountError::NotFound),
+            Some(account) if account.credential != latest => Err(AccountError::Busy),
+            Some(account) => {
+                account.credential = updated.clone();
+                if account.enabled() {
+                    Ok(())
+                } else {
+                    Err(AccountError::SourceDisabled)
+                }
+            }
+        };
+        // Persist returned token lineage even when removal or replacement prevents
+        // installing the credential. Keep existing mutation receipts in this write.
         commit(tx).await?;
         drop(guard);
-        if !enabled {
-            return Err(AccountError::SourceDisabled);
-        }
+        result?;
         let usage = self
             .operations
             .quota(context, self.provider, &updated)
@@ -1339,6 +1344,8 @@ mod tests {
         ) -> OperationFuture<'a, Credential> {
             Box::pin(async move {
                 self.refreshes.fetch_add(1, Ordering::SeqCst);
+                let doc: super::super::Document =
+                    serde_json::from_slice(&self.memory.read().unwrap().unwrap()).unwrap();
                 if self.wait_for_refresh.load(Ordering::SeqCst) {
                     self.started.notify_one();
                     self.release_refresh.notified().await;
@@ -1392,8 +1399,6 @@ mod tests {
                 } = &mut k
                 {
                     assert!(*refresh_pending);
-                    let doc: super::super::Document =
-                        serde_json::from_slice(&self.memory.read().unwrap().unwrap()).unwrap();
                     assert!(doc.accounts.iter().any(|a| matches!(
                         a.credential,
                         Credential::GrokOAuth {
@@ -2809,6 +2814,211 @@ mod tests {
             refresh_pending: false,
         }
     }
+    #[tokio::test]
+    async fn removed_or_replaced_accounts_keep_late_refresh_reservations() {
+        for provider in [
+            Provider::Factory,
+            Provider::Catalog("claude"),
+            Provider::Catalog("kiro"),
+            Provider::Antigravity,
+            Provider::Catalog("grok"),
+        ] {
+            for replace in [false, true] {
+                let (vault, fake, id, _, path) = setup(0, false, false, false);
+                let original = match provider {
+                    Provider::Factory => factory_fixture("refresh", "org"),
+                    Provider::Antigravity => antigravity_fixture("refresh"),
+                    Provider::Catalog("kiro") => kiro_fixture("refresh"),
+                    Provider::Catalog("claude") => Credential::ClaudeOAuth {
+                        access_token: "old".into(),
+                        refresh_token: "refresh".into(),
+                        account_id: "id".into(),
+                        email: "demo@example.com".into(),
+                        expires_at: 0,
+                        refresh_pending: false,
+                    },
+                    _ => Credential::GrokOAuth {
+                        access_token: "old".into(),
+                        refresh_token: "refresh".into(),
+                        expires_at: 0,
+                        refresh_pending: false,
+                    },
+                };
+                let mut tx = vault.begin().unwrap();
+                tx.document.accounts[0].provider = provider;
+                tx.document.accounts[0].credential = original.clone();
+                tx.document.reserve_factory_refresh(&id, &original).unwrap();
+                tx.commit().unwrap();
+                fake.wait_for_refresh.store(true, Ordering::SeqCst);
+                let adapter = managed(vault.clone(), fake.clone(), id.clone(), provider);
+                let running =
+                    tokio::spawn(async move { adapter.read(&http::fixture::context()).await });
+                fake.started.notified().await;
+                let intent = MutationIntent::new("remove-or-replace", "fixture".into()).unwrap();
+                let changed_id = id.clone();
+                let replacement = original.clone();
+                commit_once(vault.clone(), intent.clone(), move |doc| {
+                    if replace {
+                        doc.accounts
+                            .iter_mut()
+                            .find(|a| a.id == changed_id)
+                            .unwrap()
+                            .credential = replacement;
+                    } else {
+                        doc.remove(&changed_id)?;
+                    }
+                    Ok(changed_id)
+                })
+                .await
+                .unwrap();
+                fake.release_refresh.notify_one();
+                let result = running.await.unwrap();
+                assert!(if replace {
+                    matches!(result, Err(AccountError::Busy))
+                } else {
+                    matches!(result, Err(AccountError::NotFound))
+                });
+                assert_eq!(fake.quota_calls.load(Ordering::SeqCst), 0);
+                let reopened = Vault::new(fake.memory.clone(), path.join("lock"));
+                assert_eq!(
+                    mutation_receipt(reopened.clone(), &intent).await.unwrap(),
+                    Some(id.clone())
+                );
+                let mut tx = reopened.begin().unwrap();
+                if replace {
+                    assert!(
+                        tx.document
+                            .accounts
+                            .iter()
+                            .find(|a| a.id == id)
+                            .unwrap()
+                            .credential
+                            == original
+                    );
+                } else {
+                    assert!(!tx.document.accounts.iter().any(|a| a.id == id));
+                }
+                let mut rotated = original.clone();
+                match &mut rotated {
+                    Credential::FactoryOAuth { refresh_token, .. }
+                    | Credential::ClaudeOAuth { refresh_token, .. }
+                    | Credential::KiroOAuth { refresh_token, .. }
+                    | Credential::AntigravityOAuth { refresh_token, .. }
+                    | Credential::GrokOAuth { refresh_token, .. } => {
+                        *refresh_token = "rotated".into()
+                    }
+                    _ => unreachable!(),
+                }
+                // Grok has a replay fence but no persistent lineage reservation.
+                if provider != Provider::Catalog("grok") {
+                    assert!(matches!(
+                        tx.document
+                            .add(provider, "again", "different".into(), rotated),
+                        Err(AccountError::Duplicate)
+                    ));
+                }
+                drop(tx);
+                cleanup(path);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn kiro_http_refresh_after_deletion_keeps_returned_token_reserved() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct KiroHttp(String);
+        impl Operations for KiroHttp {
+            fn quota<'a>(
+                &'a self,
+                _: &'a ProviderContext,
+                _: Provider,
+                _: &'a Credential,
+            ) -> OperationFuture<'a, ProviderUsage> {
+                panic!("deleted account must not start quota")
+            }
+            fn refresh<'a>(
+                &'a self,
+                c: &'a ProviderContext,
+                k: &'a Credential,
+            ) -> OperationFuture<'a, Credential> {
+                Box::pin(crate::providers::catalog::oauth_cloud::refresh_kiro_at(
+                    c,
+                    k,
+                    Some(&self.0),
+                ))
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/refreshToken", listener.local_addr().unwrap());
+        let (started, pending) = tokio::sync::oneshot::channel();
+        let (resume, released) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0; 1024];
+                let n = stream.read(&mut buffer).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buffer[..n]);
+                if request.ends_with(b"{\"refreshToken\":\"refresh\"}") {
+                    break;
+                }
+            }
+            started.send(()).unwrap();
+            released.await.unwrap();
+            let body = r#"{"accessToken":"new","refreshToken":"rotated","expiresIn":3600}"#;
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let (vault, fake, id, _, path) = setup(0, false, false, false);
+        let original = kiro_fixture("refresh");
+        let mut tx = vault.begin().unwrap();
+        tx.document.accounts[0].provider = Provider::Catalog("kiro");
+        tx.document.accounts[0].credential = original.clone();
+        tx.document.reserve_factory_refresh(&id, &original).unwrap();
+        tx.commit().unwrap();
+        let mut adapter = managed(
+            vault.clone(),
+            fake.clone(),
+            id.clone(),
+            Provider::Catalog("kiro"),
+        );
+        adapter.operations = Arc::new(KiroHttp(endpoint));
+        let running = tokio::spawn(async move { adapter.read(&http::fixture::context()).await });
+        pending.await.unwrap();
+        let intent = MutationIntent::new("delete-http", "fixture".into()).unwrap();
+        let removed = id.clone();
+        commit_once(vault.clone(), intent.clone(), move |doc| {
+            doc.remove(&removed)?;
+            Ok(removed)
+        })
+        .await
+        .unwrap();
+        resume.send(()).unwrap();
+        assert!(matches!(
+            running.await.unwrap(),
+            Err(AccountError::NotFound)
+        ));
+        server.await.unwrap();
+        let reopened = Vault::new(fake.memory.clone(), path.join("lock"));
+        assert_eq!(
+            mutation_receipt(reopened.clone(), &intent).await.unwrap(),
+            Some(id.clone())
+        );
+        let mut tx = reopened.begin().unwrap();
+        assert!(!tx.document.accounts.iter().any(|a| a.id == id));
+        assert!(matches!(
+            tx.document.add(
+                Provider::Catalog("kiro"),
+                "again",
+                "different".into(),
+                kiro_fixture("rotated")
+            ),
+            Err(AccountError::Duplicate)
+        ));
+        drop(tx);
+        cleanup(path);
+    }
+
     #[tokio::test]
     async fn kiro_lineage_survives_rotation_restart_and_removal() {
         let (vault, fake, id, _, path) = setup(0, false, false, false);
