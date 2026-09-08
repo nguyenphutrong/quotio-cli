@@ -181,6 +181,7 @@ impl Vault {
                                     | super::Credential::GrokNative { .. }
                                     | super::Credential::DevinDesktopNative { .. }
                                     | super::Credential::FactoryNative { .. }
+                                    | super::Credential::KiroNative { .. }
                             )
                         }))
                     || (doc.version < 4 && doc.accounts.iter().any(|a| !a.enabled))

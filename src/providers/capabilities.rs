@@ -188,6 +188,13 @@ pub fn capability(provider: Provider) -> ProviderCapability {
                 origin: "borrowed_native",
                 credential_refresh: false,
             }]
+        } else if provider == Provider::Catalog("kiro") {
+            vec![SourceCapability {
+                kind: "kiro_native",
+                platforms: vec!["macos", "linux"],
+                origin: "borrowed_native",
+                credential_refresh: false,
+            }]
         } else if provider == Provider::Factory {
             vec![SourceCapability {
                 kind: "factory_native",

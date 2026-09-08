@@ -28,6 +28,7 @@ impl From<&super::Account> for AccountDto {
                 Credential::GrokNative { .. } => Some("grok_native"),
                 Credential::DevinDesktopNative { .. } => Some("devin_desktop_native"),
                 Credential::FactoryNative { .. } => Some("factory_native"),
+                Credential::KiroNative { .. } => Some("kiro_native"),
                 Credential::CursorNative { .. } => Some("cursor_native"),
                 Credential::AmpNative { .. } => Some("amp_native"),
                 Credential::CodexNative { .. } => Some("codex_native"),
@@ -196,6 +197,7 @@ pub struct PreparedAccount {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceInput {
+    KiroNative {},
     DevinDesktopNative {
         location: super::sources::DevinDesktopLocation,
     },
@@ -224,6 +226,15 @@ pub enum SourceInput {
 }
 pub async fn prepare_source(input: SourceInput) -> Result<PreparedAccount, AccountError> {
     let (identity, credential, resolved) = match input {
+        SourceInput::KiroNative {} => {
+            let source = super::sources::KiroNativeReference::system()?;
+            let resolved = source.resolve().await?;
+            (
+                source.identity()?,
+                Credential::KiroNative { source },
+                resolved,
+            )
+        }
         SourceInput::DevinDesktopNative { location } => {
             let source = super::sources::DevinDesktopNativeReference::system(location)?;
             let resolved = source.resolve().await?;

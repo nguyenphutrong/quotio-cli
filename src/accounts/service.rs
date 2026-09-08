@@ -256,6 +256,14 @@ async fn validate_credential(
             )
             .await?
         }
+        Provider::Catalog("kiro") => {
+            crate::providers::catalog::oauth_cloud::fetch_kiro_credential(
+                &ctx,
+                credential,
+                endpoint_override,
+            )
+            .await?
+        }
         Provider::Factory if matches!(credential, Credential::FactoryOAuth { .. }) => {
             crate::providers::factory::fetch_oauth_at(
                 context,
@@ -536,10 +544,12 @@ pub fn default_label(
         | Credential::CopilotNative { .. }
         | Credential::GrokNative { .. }
         | Credential::DevinDesktopNative { .. }
+        | Credential::KiroNative { .. }
         | Credential::FactoryNative { .. }
         | Credential::CursorNative { .. } => Err(AccountError::Input),
         Credential::CopilotOAuth { login, .. } => super::validate_label(login),
         Credential::GrokOAuth { .. } => Ok("Grok owned account".into()),
+        Credential::KiroToken { .. } => Ok("Kiro account".into()),
         Credential::FactoryOAuth { .. } => Ok("Factory owned account".into()),
         Credential::CodexOAuth { email, .. } | Credential::ClaudeOAuth { email, .. } => {
             super::validate_label(email)
@@ -799,6 +809,7 @@ impl ProviderAdapter for ManagedProvider {
                 | Credential::CopilotNative { .. }
                 | Credential::GrokNative { .. }
                 | Credential::DevinDesktopNative { .. }
+                | Credential::KiroNative { .. }
                 | Credential::FactoryNative { .. }
                 | Credential::CursorNative { .. } => serde_json::to_string(
                     &account
@@ -915,6 +926,7 @@ async fn local_sources(requested: &[Provider], timeout: std::time::Duration) -> 
         })
         .collect();
     for (provider, token) in [
+        (Provider::Catalog("kiro"), "KIRO_ACCESS_TOKEN"),
         (Provider::Factory, "FACTORY_API_KEY"),
         (Provider::Catalog("cursor"), "CURSOR_ACCESS_TOKEN"),
         (Provider::Catalog("claude"), "CLAUDE_OAUTH_ACCESS_TOKEN"),
@@ -997,6 +1009,9 @@ pub(crate) fn native_reference_replaces_local(provider: Provider, credential: &C
         Credential::DevinDesktopNative { .. } => {
             provider == Provider::Catalog("devin-desktop")
                 && std::env::var_os("DEVIN_DESKTOP_API_KEY").is_none()
+        }
+        Credential::KiroNative { .. } => {
+            provider == Provider::Catalog("kiro") && std::env::var_os("KIRO_ACCESS_TOKEN").is_none()
         }
         Credential::FactoryNative { .. } => {
             provider == Provider::Factory && std::env::var_os("FACTORY_API_KEY").is_none()
@@ -1108,7 +1123,7 @@ async fn adapters_with_vault(
                         | Provider::Factory
                         | Provider::Amp
                         | Provider::Catalog(
-                            "cursor" | "grok" | "claude" | "copilot" | "devin-desktop"
+                            "cursor" | "grok" | "claude" | "copilot" | "devin-desktop" | "kiro"
                         )
                 )
             })
@@ -1341,12 +1356,14 @@ mod tests {
                 .env("QUOTIO_SELECTION_FIXTURE", &dir)
                 .env_remove("CLAUDE_OAUTH_ACCESS_TOKEN")
                 .env_remove("COPILOT_API_TOKEN")
+                .env_remove("KIRO_ACCESS_TOKEN")
                 .env_remove("FACTORY_API_KEY")
                 .env_remove("DEVIN_DESKTOP_API_KEY");
             if independent {
                 command
                     .env("CLAUDE_OAUTH_ACCESS_TOKEN", "independent-claude-fixture")
                     .env("COPILOT_API_TOKEN", "independent-copilot-fixture")
+                    .env("KIRO_ACCESS_TOKEN", "independent-kiro-fixture")
                     .env("FACTORY_API_KEY", "independent-factory-fixture")
                     .env("DEVIN_DESKTOP_API_KEY", "independent-desktop-fixture");
             }
@@ -1370,6 +1387,15 @@ mod tests {
         let missing = dir.join("missing-native-credentials");
         assert!(!missing.exists());
         for (provider, token, credential) in [
+            (
+                Provider::Catalog("kiro"),
+                "KIRO_ACCESS_TOKEN",
+                Credential::KiroNative {
+                    source: super::super::sources::KiroNativeReference {
+                        path: missing.join(".aws/sso/cache/kiro-auth-token.json"),
+                    },
+                },
+            ),
             (
                 Provider::Catalog("devin-desktop"),
                 "DEVIN_DESKTOP_API_KEY",
@@ -1755,6 +1781,60 @@ mod tests {
             std::fs::remove_dir_all(dir).unwrap();
         }
     }
+    #[tokio::test]
+    async fn kiro_native_fences_rotation_and_disable() {
+        let dir = std::env::temp_dir().join(random_string().unwrap());
+        let path = dir.join(".aws/sso/cache/kiro-auth-token.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = br#"{"accessToken":"kiro-first","refreshToken":"owner-only","clientId":"stable-client"}"#;
+        std::fs::write(&path, original).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let credential = Credential::KiroNative {
+            source: super::super::sources::KiroNativeReference { path: path.clone() },
+        };
+        let provider = Provider::Catalog("kiro");
+        let vault = Vault::new(Arc::new(Memory::default()), dir.join("lock"));
+        let mut tx = vault.begin().unwrap();
+        let id = tx
+            .document
+            .add(provider, "Fixture", "source".into(), credential.clone())
+            .unwrap();
+        let account = tx.document.accounts[0].clone();
+        assert!(
+            !serde_json::to_string(&tx.document)
+                .unwrap()
+                .contains("owner-only")
+        );
+        tx.commit().unwrap();
+        let adapter = super::managed(&vault, &account);
+        let context = http::fixture::context();
+        let before = adapter.cache_identity(&context).await.unwrap();
+        let changed = path.clone();
+        let (endpoint, server) = http::fixture::server_status_with_action(
+            vec![(200, serde_json::json!({"usageBreakdownList":[{"resourceType":"CREDIT","usageLimit":100,"currentUsage":25}]}))],
+            move |_| { std::fs::write(&changed, br#"{"accessToken":"kiro-second","refreshToken":"owner-only","clientId":"stable-client"}"#).unwrap(); },
+        ).await;
+        assert!(matches!(
+            validate_with_endpoint(&context, provider, &credential, Some(&endpoint)).await,
+            Err(AccountError::Busy)
+        ));
+        assert_ne!(adapter.cache_identity(&context).await.unwrap(), before);
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET "));
+        assert!(requests[0].contains("Bearer kiro-first"));
+        assert!(!requests[0].contains("owner-only"));
+        let mut tx = vault.begin().unwrap();
+        tx.document.patch(&id, None, None, Some(false)).unwrap();
+        tx.commit().unwrap();
+        assert!(adapter.cache_identity(&context).await.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn claude_native_http_fences_rotation_and_disable() {
         for rotate in [false, true] {

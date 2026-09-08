@@ -79,6 +79,16 @@ pub enum Credential {
     DevinDesktopNative {
         source: sources::DevinDesktopNativeReference,
     },
+    KiroNative {
+        source: sources::KiroNativeReference,
+    },
+    KiroToken {
+        access_token: String,
+        region: String,
+        profile_arn: Option<String>,
+        machine: String,
+        expires_at: Option<i64>,
+    },
     FactoryNative {
         source: sources::FactoryNativeReference,
     },
@@ -174,6 +184,7 @@ impl Account {
             Credential::AmpNative { .. }
             | Credential::DevinDesktopNative { .. }
             | Credential::FactoryNative { .. }
+            | Credential::KiroNative { .. }
             | Credential::CopilotNative { .. }
             | Credential::ClaudeNative { .. }
             | Credential::CodexNative { .. }
@@ -285,6 +296,7 @@ impl Document {
                 | Credential::AmpNative { .. }
                 | Credential::DevinDesktopNative { .. }
                 | Credential::FactoryNative { .. }
+                | Credential::KiroNative { .. }
                 | Credential::ClaudeNative { .. }
                 | Credential::CopilotNative { .. }
                 | Credential::CodexNative { .. }

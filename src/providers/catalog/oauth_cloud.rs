@@ -291,6 +291,58 @@ fn home_dir() -> Result<PathBuf, ProviderError> {
         .ok_or(ProviderError::CredentialStorage)
 }
 
+pub(crate) async fn kiro_reference_token(
+    path: &std::path::Path,
+) -> Result<crate::accounts::Credential, ProviderError> {
+    let source = read_native_json(path.to_owned())
+        .await?
+        .ok_or(ProviderError::Authentication)?;
+    let credential = parse_kiro_native(&source)?;
+    Ok(crate::accounts::Credential::KiroToken {
+        access_token: credential.access_token,
+        region: credential.region.unwrap_or_else(|| "us-east-1".into()),
+        profile_arn: credential.profile_arn,
+        machine: kiro_machine_identifier(
+            credential.client_id.as_deref(),
+            credential.refresh_token.as_deref(),
+            platform_machine_seed,
+        )?,
+        expires_at: credential.expires_at.map(|date| date.unix_timestamp()),
+    })
+}
+
+pub(crate) async fn fetch_kiro_credential(
+    context: &ProviderContext,
+    credential: &crate::accounts::Credential,
+    endpoint: Option<&str>,
+) -> Result<crate::domain::ProviderUsage, ProviderError> {
+    let crate::accounts::Credential::KiroToken {
+        access_token,
+        region,
+        profile_arn,
+        machine,
+        expires_at,
+    } = credential
+    else {
+        return Err(ProviderError::Authentication);
+    };
+    if expires_at.is_some_and(|expiry| expiry <= context.clock.now().unix_timestamp() + 300) {
+        return Err(ProviderError::OwnerRefreshRequired);
+    }
+    let (region, profile) = kiro_metadata(context, Some(region), profile_arn.as_deref())?;
+    let url = format!("https://q.{region}.amazonaws.com/getUsageLimits");
+    fetch_kiro_at(
+        context,
+        endpoint.unwrap_or(&url),
+        &Secret(access_token.clone()),
+        &region,
+        profile.as_deref(),
+        true,
+        machine,
+    )
+    .await
+}
+
 fn kiro_auth_path() -> Result<PathBuf, ProviderError> {
     Ok(home_dir()?
         .join(".aws")

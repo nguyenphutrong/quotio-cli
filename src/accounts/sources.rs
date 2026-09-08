@@ -165,6 +165,49 @@ impl ClaudeNativeReference {
     }
 }
 
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KiroNativeReference {
+    pub path: std::path::PathBuf,
+}
+impl KiroNativeReference {
+    pub fn system() -> Result<Self, AccountError> {
+        Ok(Self {
+            path: std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .ok_or(AccountError::NotFound)?
+                .join(".aws/sso/cache/kiro-auth-token.json"),
+        })
+    }
+    pub fn identity(&self) -> Result<String, AccountError> {
+        if !self.path.is_absolute()
+            || !self.path.ends_with(".aws/sso/cache/kiro-auth-token.json")
+            || self
+                .path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(AccountError::Input);
+        }
+        Ok(crate::cache::fingerprint(&[
+            "kiro_native",
+            self.path.to_str().ok_or(AccountError::Input)?,
+        ]))
+    }
+    pub async fn resolve(&self) -> Result<Resolved, AccountError> {
+        self.identity()?;
+        let credential =
+            crate::providers::catalog::oauth_cloud::kiro_reference_token(&self.path).await?;
+        Ok(Resolved {
+            label: "Kiro native account".into(),
+            provider: crate::cli::Provider::Catalog("kiro"),
+            plan: None,
+            subscription_status: None,
+            credentials: vec![credential],
+        })
+    }
+}
+
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FactoryLocation {
@@ -554,6 +597,9 @@ impl Credential {
             {
                 source.resolve().await.map(Some)
             }
+            Self::KiroNative { source } if provider == crate::cli::Provider::Catalog("kiro") => {
+                source.resolve().await.map(Some)
+            }
             Self::FactoryNative { source } if provider == crate::cli::Provider::Factory => {
                 source.resolve().await.map(Some)
             }
@@ -596,6 +642,7 @@ impl Credential {
             Self::QuotioCustomProvider { .. }
             | Self::DevinDesktopNative { .. }
             | Self::FactoryNative { .. }
+            | Self::KiroNative { .. }
             | Self::CodexNative { .. }
             | Self::ClaudeNative { .. }
             | Self::CopilotNative { .. }
