@@ -35,6 +35,17 @@ impl VaultNamespace {
     }
 }
 
+fn account_data_directory(
+    explicit: Option<PathBuf>,
+    platform: Option<PathBuf>,
+) -> Result<PathBuf, AccountError> {
+    match explicit {
+        Some(path) if path.is_absolute() => Ok(path),
+        Some(_) => Err(AccountError::Storage),
+        None => platform.ok_or(AccountError::Storage),
+    }
+}
+
 impl FromStr for VaultNamespace {
     type Err = &'static str;
 
@@ -199,10 +210,14 @@ impl Vault {
         _interactive: bool,
         namespace: Option<&VaultNamespace>,
     ) -> Result<Self, AccountError> {
-        let dirs = directories::ProjectDirs::from("", "", "quotio").ok_or(AccountError::Storage)?;
+        let directory = account_data_directory(
+            std::env::var_os("QUOTIO_ACCOUNT_DATA_DIR").map(PathBuf::from),
+            directories::ProjectDirs::from("", "", "quotio")
+                .map(|dirs| dirs.data_local_dir().to_owned()),
+        )?;
         #[cfg(target_os = "linux")]
         let backend: Arc<dyn Backend> = match super::encrypted_file::EncryptedFile::from_environment(
-            &dirs.data_local_dir().join(
+            &directory.join(
                 namespace
                     .map(VaultNamespace::vault_name)
                     .unwrap_or_else(|| "vault".into()),
@@ -219,7 +234,7 @@ impl Vault {
         let lock_name = namespace
             .map(VaultNamespace::lock_name)
             .unwrap_or_else(|| "accounts.lock".into());
-        Ok(Self::new(backend, dirs.data_local_dir().join(lock_name)))
+        Ok(Self::new(backend, directory.join(lock_name)))
     }
     pub fn new(backend: Arc<dyn Backend>, lock_path: PathBuf) -> Self {
         Self { backend, lock_path }
@@ -799,6 +814,21 @@ pub(crate) mod tests {
         for invalid in ["", "Manual", "-manual", "manual-", "manual_test", "a/../b"] {
             assert!(invalid.parse::<VaultNamespace>().is_err());
         }
+    }
+    #[test]
+    fn account_data_directory_requires_an_absolute_override() {
+        let platform = PathBuf::from("/platform/accounts");
+        let isolated = PathBuf::from("/isolated/accounts");
+        assert_eq!(
+            account_data_directory(Some(isolated.clone()), Some(platform.clone())).unwrap(),
+            isolated
+        );
+        assert_eq!(
+            account_data_directory(None, Some(platform.clone())).unwrap(),
+            platform
+        );
+        assert!(account_data_directory(Some(PathBuf::from("relative")), None).is_err());
+        assert!(account_data_directory(None, None).is_err());
     }
     #[cfg(target_os = "macos")]
     #[test]
