@@ -14,8 +14,19 @@ use std::{
 };
 use tracing_subscriber::{filter::Targets, layer::SubscriberExt, util::SubscriberInitExt};
 
-fn account_timeout(command: &quotio::cli::AccountCommand) -> Duration {
+fn account_timeout(command: &quotio::cli::AccountCommand) -> Option<Duration> {
     if matches!(
+        command,
+        quotio::cli::AccountCommand::Add {
+            provider: Provider::Catalog("claude"),
+            token_stdin: false,
+            ..
+        }
+    ) {
+        // Manual OAuth bounds input and exchange separately. Once claimed, a
+        // durable credential commit must not be dropped at the input deadline.
+        None
+    } else if matches!(
         command,
         quotio::cli::AccountCommand::Add {
             provider: Provider::Catalog("copilot"),
@@ -23,9 +34,21 @@ fn account_timeout(command: &quotio::cli::AccountCommand) -> Duration {
         }
     ) {
         // Device expiry is at most one hour, plus startup and persistence time.
-        Duration::from_secs(3720)
+        Some(Duration::from_secs(3720))
     } else {
-        Duration::from_secs(180)
+        Some(Duration::from_secs(180))
+    }
+}
+
+async fn within_account_deadline<T>(
+    timeout: Option<Duration>,
+    operation: impl std::future::Future<Output = Result<T, quotio::accounts::AccountError>>,
+) -> Result<T, quotio::accounts::AccountError> {
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, operation)
+            .await
+            .unwrap_or(Err(quotio::accounts::AccountError::Cancelled)),
+        None => operation.await,
     }
 }
 
@@ -158,7 +181,7 @@ async fn run() -> ExitCode {
                 // Register Ctrl-C before an account command can disable terminal echo.
                 biased;
                 _=tokio::signal::ctrl_c()=>Err(quotio::accounts::AccountError::Cancelled),
-                result=tokio::time::timeout(timeout,quotio::accounts::command::run(args.command,&context))=>result.unwrap_or(Err(quotio::accounts::AccountError::Cancelled)),
+                result=within_account_deadline(timeout,quotio::accounts::command::run(args.command,&context))=>result,
             };
             match result {
                 Ok(text) => (text, 0),
@@ -288,7 +311,7 @@ mod tests {
     use super::*;
     #[test]
     fn copilot_terminal_deadline_does_not_truncate_device_expiry() {
-        for (provider, expected) in [("copilot", 3720), ("codex", 180), ("claude", 180)] {
+        for (provider, expected) in [("copilot", Some(3720)), ("codex", Some(180)), ("claude", None)] {
             let cli =
                 Cli::try_parse_from(["quotio", "accounts", "add", "--provider", provider]).unwrap();
             let Command::Accounts(args) = cli.command else {
@@ -296,8 +319,29 @@ mod tests {
             };
             assert_eq!(
                 account_timeout(&args.command),
-                Duration::from_secs(expected)
+                expected.map(Duration::from_secs)
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_claude_input_keeps_exchange_and_commit_alive() {
+        let cli = Cli::try_parse_from([
+            "quotio", "accounts", "add", "--provider", "claude",
+        ]).unwrap();
+        let Command::Accounts(args) = cli.command else { panic!("account command") };
+        let start = tokio::time::Instant::now();
+        let result = within_account_deadline(account_timeout(&args.command), async {
+            tokio::time::timeout(Duration::from_secs(180), async {
+                tokio::time::sleep(Duration::from_secs(179)).await;
+            }).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                tokio::time::sleep(Duration::from_secs(20)).await;
+            }).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok("persisted")
+        }).await;
+        assert_eq!(result.unwrap(), "persisted");
+        assert_eq!(start.elapsed(), Duration::from_secs(204));
     }
 }
