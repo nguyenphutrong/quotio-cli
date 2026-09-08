@@ -29,25 +29,6 @@ fn account_timeout(command: &quotio::cli::AccountCommand) -> Duration {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn copilot_terminal_deadline_does_not_truncate_device_expiry() {
-        for (provider, expected) in [("copilot", 3720), ("codex", 180), ("claude", 180)] {
-            let cli =
-                Cli::try_parse_from(["quotio", "accounts", "add", "--provider", provider]).unwrap();
-            let Command::Accounts(args) = cli.command else {
-                panic!("account command");
-            };
-            assert_eq!(
-                account_timeout(&args.command),
-                Duration::from_secs(expected)
-            );
-        }
-    }
-}
-
 fn main() -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -300,4 +281,23 @@ async fn run() -> ExitCode {
         return ExitCode::from(3);
     }
     ExitCode::from(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn copilot_terminal_deadline_does_not_truncate_device_expiry() {
+        for (provider, expected) in [("copilot", 3720), ("codex", 180), ("claude", 180)] {
+            let cli =
+                Cli::try_parse_from(["quotio", "accounts", "add", "--provider", provider]).unwrap();
+            let Command::Accounts(args) = cli.command else {
+                panic!("account command");
+            };
+            assert_eq!(
+                account_timeout(&args.command),
+                Duration::from_secs(expected)
+            );
+        }
+    }
 }
