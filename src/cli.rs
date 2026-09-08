@@ -168,7 +168,9 @@ impl Provider {
     pub fn supports_accounts(self) -> bool {
         matches!(
             self,
-            Self::Codex | Self::Catalog("cursor" | "grok" | "claude" | "copilot" | "kiro")
+            Self::Codex
+                | Self::Antigravity
+                | Self::Catalog("cursor" | "grok" | "claude" | "copilot" | "kiro")
         ) || self.api_key_name().is_some()
     }
 

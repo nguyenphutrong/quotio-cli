@@ -781,7 +781,7 @@ pub(crate) async fn cursor_login(path: PathBuf) -> Result<CursorLogin, ProviderE
 
 // Only fixed provider queries may call this reader. SQLite sees private copies only.
 #[cfg(unix)]
-pub(super) async fn native_sqlite_rows(
+pub(crate) async fn native_sqlite_rows(
     path: PathBuf,
     query: &'static str,
 ) -> Result<Vec<u8>, ProviderError> {
@@ -798,7 +798,7 @@ pub(super) async fn native_sqlite_rows(
 }
 
 #[cfg(not(unix))]
-pub(super) async fn native_sqlite_rows(
+pub(crate) async fn native_sqlite_rows(
     _: PathBuf,
     _: &'static str,
 ) -> Result<Vec<u8>, ProviderError> {

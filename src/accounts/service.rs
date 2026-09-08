@@ -36,9 +36,29 @@ fn scoped(
     | Credential::KiroOAuth {
         refresh_pending: true,
         ..
+    }
+    | Credential::AntigravityOAuth {
+        refresh_pending: true,
+        ..
     } = credential
     {
         return Err(AccountError::CommitUncertain);
+    }
+    if let Credential::AntigravityToken { access_token, .. }
+    | Credential::AntigravityOAuth { access_token, .. } = credential
+    {
+        if provider != Provider::Antigravity {
+            return Err(AccountError::Unsupported);
+        }
+        let expires_at = match credential {
+            Credential::AntigravityToken { expires_at, .. } => *expires_at,
+            Credential::AntigravityOAuth { expires_at, .. } => Some(*expires_at),
+            _ => unreachable!(),
+        };
+        if expires_at.is_some_and(|expiry| expiry <= context.clock.now().unix_timestamp()) {
+            return Err(ProviderError::Authentication.into());
+        }
+        keys.insert("ANTIGRAVITY_ACCESS_TOKEN".into(), access_token.clone());
     }
     if let Credential::GrokOAuth {
         access_token,
@@ -277,6 +297,11 @@ async fn validate_credential(
             .await?
         }
         Provider::Factory => FactoryProvider.fetch(&ctx).await?,
+        Provider::Antigravity => {
+            crate::providers::antigravity::AntigravityProvider
+                .fetch(&ctx)
+                .await?
+        }
         Provider::Codex if endpoint_override.is_some() => {
             let endpoint = endpoint_override.unwrap();
             codex_api::fetch_at(&ctx, credential, endpoint, endpoint, endpoint).await?
@@ -549,11 +574,15 @@ pub fn default_label(
         | Credential::GrokNative { .. }
         | Credential::DevinDesktopNative { .. }
         | Credential::KiroNative { .. }
+        | Credential::AntigravityNative { .. }
         | Credential::FactoryNative { .. }
         | Credential::CursorNative { .. } => Err(AccountError::Input),
         Credential::CopilotOAuth { login, .. } => super::validate_label(login),
         Credential::GrokOAuth { .. } => Ok("Grok owned account".into()),
         Credential::KiroToken { .. } | Credential::KiroOAuth { .. } => Ok("Kiro account".into()),
+        Credential::AntigravityToken { .. } | Credential::AntigravityOAuth { .. } => {
+            Ok("Antigravity account".into())
+        }
         Credential::FactoryOAuth { .. } => Ok("Factory owned account".into()),
         Credential::CodexOAuth { email, .. } | Credential::ClaudeOAuth { email, .. } => {
             super::validate_label(email)
@@ -601,7 +630,9 @@ impl Operations for Network {
         k: &'a Credential,
     ) -> OperationFuture<'a, Credential> {
         Box::pin(async move {
-            if matches!(k, Credential::KiroOAuth { .. }) {
+            if matches!(k, Credential::AntigravityOAuth { .. }) {
+                crate::providers::antigravity_auth::refresh_owned(c, k).await
+            } else if matches!(k, Credential::KiroOAuth { .. }) {
                 crate::providers::catalog::oauth_cloud::refresh_kiro(c, k).await
             } else if matches!(k, Credential::FactoryOAuth { .. }) {
                 crate::providers::factory::refresh(c, k).await
@@ -654,6 +685,9 @@ impl ManagedProvider {
             } | Credential::KiroOAuth {
                 refresh_pending: true,
                 ..
+            } | Credential::AntigravityOAuth {
+                refresh_pending: true,
+                ..
             }
         ) {
             return Err(AccountError::CommitUncertain);
@@ -665,6 +699,7 @@ impl ManagedProvider {
                 | Credential::GrokOAuth { .. }
                 | Credential::FactoryOAuth { .. }
                 | Credential::KiroOAuth { .. }
+                | Credential::AntigravityOAuth { .. }
         ) {
             let usage = self
                 .operations
@@ -677,7 +712,7 @@ impl ManagedProvider {
         } else {
             60
         };
-        let needs_refresh = matches!(&credential,Credential::CodexOAuth{expires_at,..} | Credential::GrokOAuth{expires_at,..} | Credential::FactoryOAuth{expires_at,..} | Credential::ClaudeOAuth{expires_at,..} | Credential::KiroOAuth{expires_at,..} if *expires_at<=context.clock.now().unix_timestamp()+refresh_margin);
+        let needs_refresh = matches!(&credential,Credential::CodexOAuth{expires_at,..} | Credential::GrokOAuth{expires_at,..} | Credential::FactoryOAuth{expires_at,..} | Credential::ClaudeOAuth{expires_at,..} | Credential::KiroOAuth{expires_at,..} | Credential::AntigravityOAuth{expires_at,..} if *expires_at<=context.clock.now().unix_timestamp()+refresh_margin);
         if !needs_refresh {
             match self
                 .operations
@@ -723,6 +758,9 @@ impl ManagedProvider {
             refresh_pending, ..
         }
         | Credential::KiroOAuth {
+            refresh_pending, ..
+        }
+        | Credential::AntigravityOAuth {
             refresh_pending, ..
         } = &mut latest
         {
@@ -818,6 +856,10 @@ impl ProviderAdapter for ManagedProvider {
                 | Credential::KiroOAuth {
                     refresh_pending: true,
                     ..
+                }
+                | Credential::AntigravityOAuth {
+                    refresh_pending: true,
+                    ..
                 } => return None,
                 Credential::QuotioCustomProvider { .. }
                 | Credential::AmpNative { .. }
@@ -827,6 +869,7 @@ impl ProviderAdapter for ManagedProvider {
                 | Credential::GrokNative { .. }
                 | Credential::DevinDesktopNative { .. }
                 | Credential::KiroNative { .. }
+                | Credential::AntigravityNative { .. }
                 | Credential::FactoryNative { .. }
                 | Credential::CursorNative { .. } => serde_json::to_string(
                     &account
@@ -860,8 +903,10 @@ impl ProviderAdapter for ManagedProvider {
     fn idempotent(&self) -> bool {
         self.provider != Provider::Codex
             && !self.factory_oauth
-            && !(matches!(self.provider, Provider::Catalog("grok" | "claude" | "kiro"))
-                && self.origin == super::AccountOrigin::Owned)
+            && !(matches!(
+                self.provider,
+                Provider::Antigravity | Provider::Catalog("grok" | "claude" | "kiro")
+            ) && self.origin == super::AccountOrigin::Owned)
     }
     fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
         Box::pin(async move {
@@ -944,6 +989,8 @@ async fn local_sources(requested: &[Provider], timeout: std::time::Duration) -> 
         .collect();
     for (provider, token) in [
         (Provider::Catalog("kiro"), "KIRO_ACCESS_TOKEN"),
+        (Provider::Antigravity, "ANTIGRAVITY_ACCESS_TOKEN"),
+        (Provider::Antigravity, "ANTIGRAVITY_AUTH_FILE"),
         (Provider::Factory, "FACTORY_API_KEY"),
         (Provider::Catalog("cursor"), "CURSOR_ACCESS_TOKEN"),
         (Provider::Catalog("claude"), "CLAUDE_OAUTH_ACCESS_TOKEN"),
@@ -1026,6 +1073,13 @@ pub(crate) fn native_reference_replaces_local(provider: Provider, credential: &C
         Credential::DevinDesktopNative { .. } => {
             provider == Provider::Catalog("devin-desktop")
                 && std::env::var_os("DEVIN_DESKTOP_API_KEY").is_none()
+        }
+        Credential::AntigravityNative { source } => {
+            provider == Provider::Antigravity
+                && std::env::var_os("ANTIGRAVITY_ACCESS_TOKEN").is_none()
+                && std::env::var_os("ANTIGRAVITY_AUTH_FILE").is_none()
+                && source.location == super::sources::AntigravityLocation::GeminiKeychain
+                && source.path.is_none()
         }
         Credential::KiroNative { .. } => {
             provider == Provider::Catalog("kiro") && std::env::var_os("KIRO_ACCESS_TOKEN").is_none()
@@ -1137,6 +1191,7 @@ async fn adapters_with_vault(
                 matches!(
                     p,
                     Provider::Codex
+                        | Provider::Antigravity
                         | Provider::Factory
                         | Provider::Amp
                         | Provider::Catalog(
@@ -1261,7 +1316,8 @@ mod tests {
                 if let Credential::GrokOAuth { access_token, .. }
                 | Credential::FactoryOAuth { access_token, .. }
                 | Credential::ClaudeOAuth { access_token, .. }
-                | Credential::KiroOAuth { access_token, .. } = k
+                | Credential::KiroOAuth { access_token, .. }
+                | Credential::AntigravityOAuth { access_token, .. } = k
                 {
                     assert_eq!(access_token, "new");
                     let doc: super::super::Document =
@@ -1326,6 +1382,13 @@ mod tests {
                     expires_at,
                     refresh_pending,
                     ..
+                }
+                | Credential::AntigravityOAuth {
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    refresh_pending,
+                    ..
                 } = &mut k
                 {
                     assert!(*refresh_pending);
@@ -1343,6 +1406,9 @@ mod tests {
                             refresh_pending: true,
                             ..
                         } | Credential::KiroOAuth {
+                            refresh_pending: true,
+                            ..
+                        } | Credential::AntigravityOAuth {
                             refresh_pending: true,
                             ..
                         }
@@ -1385,6 +1451,8 @@ mod tests {
                 .env_remove("CLAUDE_OAUTH_ACCESS_TOKEN")
                 .env_remove("COPILOT_API_TOKEN")
                 .env_remove("KIRO_ACCESS_TOKEN")
+                .env_remove("ANTIGRAVITY_ACCESS_TOKEN")
+                .env_remove("ANTIGRAVITY_AUTH_FILE")
                 .env_remove("FACTORY_API_KEY")
                 .env_remove("DEVIN_DESKTOP_API_KEY");
             if independent {
@@ -1392,6 +1460,10 @@ mod tests {
                     .env("CLAUDE_OAUTH_ACCESS_TOKEN", "independent-claude-fixture")
                     .env("COPILOT_API_TOKEN", "independent-copilot-fixture")
                     .env("KIRO_ACCESS_TOKEN", "independent-kiro-fixture")
+                    .env(
+                        "ANTIGRAVITY_ACCESS_TOKEN",
+                        "independent-antigravity-fixture",
+                    )
                     .env("FACTORY_API_KEY", "independent-factory-fixture")
                     .env("DEVIN_DESKTOP_API_KEY", "independent-desktop-fixture");
             }
@@ -1415,6 +1487,16 @@ mod tests {
         let missing = dir.join("missing-native-credentials");
         assert!(!missing.exists());
         for (provider, token, credential) in [
+            (
+                Provider::Antigravity,
+                "ANTIGRAVITY_ACCESS_TOKEN",
+                Credential::AntigravityNative {
+                    source: super::super::sources::AntigravityNativeReference {
+                        location: super::super::sources::AntigravityLocation::GeminiKeychain,
+                        path: None,
+                    },
+                },
+            ),
             (
                 Provider::Catalog("kiro"),
                 "KIRO_ACCESS_TOKEN",
@@ -2634,6 +2716,85 @@ mod tests {
         assert!(vault.begin().unwrap().document.accounts[0].credential == credential);
         cleanup(path);
     }
+    fn antigravity_fixture(refresh: &str) -> Credential {
+        Credential::AntigravityOAuth {
+            access_token: "old".into(),
+            refresh_token: refresh.into(),
+            expires_at: 0,
+            client_id: "fixture-client".into(),
+            client_secret: "fixture-secret".into(),
+            refresh_pending: false,
+        }
+    }
+    #[tokio::test]
+    async fn antigravity_lineage_survives_rotation_and_removal() {
+        let (vault, fake, id, _, path) = setup(0, false, false, false);
+        let original = antigravity_fixture("refresh");
+        let mut tx = vault.begin().unwrap();
+        tx.document.accounts[0].provider = Provider::Antigravity;
+        tx.document.accounts[0].credential = original.clone();
+        tx.document.reserve_factory_refresh(&id, &original).unwrap();
+        tx.commit().unwrap();
+        let adapter = managed(
+            vault.clone(),
+            fake.clone(),
+            id.clone(),
+            Provider::Antigravity,
+        );
+        assert!(adapter.read(&http::fixture::context()).await.is_ok());
+        assert_eq!(fake.refreshes.load(Ordering::SeqCst), 1);
+        let mut tx = vault.begin().unwrap();
+        tx.document.remove(&id).unwrap();
+        tx.commit().unwrap();
+        let mut tx = vault.begin().unwrap();
+        for token in ["refresh", "rotated"] {
+            assert!(matches!(
+                tx.document.add(
+                    Provider::Antigravity,
+                    "again",
+                    "different".into(),
+                    antigravity_fixture(token)
+                ),
+                Err(AccountError::Duplicate)
+            ));
+        }
+        drop(tx);
+        cleanup(path);
+    }
+    #[test]
+    fn antigravity_scoping_rejects_expiry_and_isolates_credentials() {
+        let context = http::fixture::context();
+        let credential = Credential::AntigravityToken {
+            access_token: "fixture".into(),
+            expires_at: None,
+        };
+        let ctx = scoped(&context, Provider::Antigravity, &credential).unwrap();
+        assert_eq!(
+            ctx.credentials.get("ANTIGRAVITY_ACCESS_TOKEN").unwrap().0,
+            "fixture"
+        );
+        assert!(ctx.credentials.get("ANTIGRAVITY_AUTH_FILE").is_none());
+        assert!(scoped(&context, Provider::Codex, &credential).is_err());
+        assert!(matches!(
+            scoped(
+                &context,
+                Provider::Antigravity,
+                &antigravity_fixture("refresh")
+            ),
+            Err(AccountError::Provider(ProviderError::Authentication))
+        ));
+        let mut pending = antigravity_fixture("refresh");
+        if let Credential::AntigravityOAuth {
+            refresh_pending, ..
+        } = &mut pending
+        {
+            *refresh_pending = true;
+        }
+        assert!(matches!(
+            scoped(&context, Provider::Antigravity, &pending),
+            Err(AccountError::CommitUncertain)
+        ));
+    }
     fn kiro_fixture(refresh: &str) -> Credential {
         Credential::KiroOAuth {
             access_token: "old".into(),
@@ -2769,9 +2930,13 @@ mod tests {
     }
     #[tokio::test]
     async fn factory_and_kiro_inflight_refresh_cancellation_and_disable_are_fenced() {
-        for (provider, cancel) in [Provider::Factory, Provider::Catalog("kiro")]
-            .into_iter()
-            .flat_map(|p| [false, true].map(|cancel| (p, cancel)))
+        for (provider, cancel) in [
+            Provider::Factory,
+            Provider::Catalog("kiro"),
+            Provider::Antigravity,
+        ]
+        .into_iter()
+        .flat_map(|p| [false, true].map(|cancel| (p, cancel)))
         {
             let (vault, fake, id, _, path) = setup(0, false, false, false);
             let mut tx = vault.begin().unwrap();
@@ -2784,6 +2949,8 @@ mod tests {
                     expires_at: 0,
                     refresh_pending: false,
                 }
+            } else if provider == Provider::Antigravity {
+                antigravity_fixture("refresh")
             } else {
                 kiro_fixture("refresh")
             };
@@ -2819,7 +2986,7 @@ mod tests {
             assert_eq!(fake.quota_calls.load(Ordering::SeqCst), 0);
             let tx = vault.begin().unwrap();
             assert!(
-                matches!(&tx.document.accounts[0].credential, Credential::FactoryOAuth { refresh_pending, refresh_token, .. } | Credential::KiroOAuth { refresh_pending, refresh_token, .. } if *refresh_pending == cancel && refresh_token == if cancel {"refresh"} else {"rotated"})
+                matches!(&tx.document.accounts[0].credential, Credential::FactoryOAuth { refresh_pending, refresh_token, .. } | Credential::KiroOAuth { refresh_pending, refresh_token, .. } | Credential::AntigravityOAuth { refresh_pending, refresh_token, .. } if *refresh_pending == cancel && refresh_token == if cancel {"refresh"} else {"rotated"})
             );
             drop(tx);
             assert!(
@@ -2856,6 +3023,7 @@ mod tests {
             Provider::Factory,
             Provider::Catalog("claude"),
             Provider::Catalog("kiro"),
+            Provider::Antigravity,
         ]
         .into_iter()
         .flat_map(|p| (0..=4).map(move |mode| (p, mode)))
@@ -2871,6 +3039,8 @@ mod tests {
                     expires_at: 0,
                     refresh_pending: false,
                 }
+            } else if provider == Provider::Antigravity {
+                antigravity_fixture("refresh")
             } else if provider == Provider::Catalog("kiro") {
                 kiro_fixture("refresh")
             } else {

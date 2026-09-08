@@ -157,7 +157,12 @@ impl Vault {
                 }
                 let doc: Document =
                     serde_json::from_slice(&bytes).map_err(|_| AccountError::Corrupt)?;
-                if !matches!(doc.version, 1..=7)
+                if !matches!(doc.version, 1..=8)
+                    || (doc.version < 8
+                        && (!doc.antigravity_refresh_owners.is_empty()
+                            || doc.accounts.iter().any(|a| {
+                                matches!(a.credential, super::Credential::AntigravityOAuth { .. })
+                            })))
                     || (doc.version < 7
                         && (!doc.kiro_refresh_owners.is_empty()
                             || doc.accounts.iter().any(|a| {
@@ -187,6 +192,7 @@ impl Vault {
                                     | super::Credential::DevinDesktopNative { .. }
                                     | super::Credential::FactoryNative { .. }
                                     | super::Credential::KiroNative { .. }
+                                    | super::Credential::AntigravityNative { .. }
                             )
                         }))
                     || (doc.version < 4 && doc.accounts.iter().any(|a| !a.enabled))
@@ -244,6 +250,9 @@ impl Transaction {
         // this mutation touches only an unrelated account or retry receipt.
         if !self.document.factory_refresh_owners.is_empty() {
             self.document.version = self.document.version.max(5);
+        }
+        if !self.document.antigravity_refresh_owners.is_empty() {
+            self.document.version = self.document.version.max(8);
         }
         if !self.document.kiro_refresh_owners.is_empty() {
             self.document.version = self.document.version.max(7);
@@ -368,6 +377,55 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn antigravity_reservations_reject_downgrade_after_deletion() {
+        let dir = std::env::temp_dir().join(random_string().unwrap());
+        let memory = Arc::new(Memory::default());
+        let vault = Vault::new(memory.clone(), dir.join("lock"));
+        let credential = Credential::AntigravityOAuth {
+            access_token: "fixture-access".into(),
+            refresh_token: "fixture-refresh".into(),
+            expires_at: 0,
+            client_id: "fixture-client".into(),
+            client_secret: "fixture-secret".into(),
+            refresh_pending: false,
+        };
+        let mut tx = vault.begin().unwrap();
+        let id = tx
+            .document
+            .add(
+                Provider::Antigravity,
+                "Fixture",
+                "fixture".into(),
+                credential.clone(),
+            )
+            .unwrap();
+        tx.commit().unwrap();
+        let mut tx = vault.begin().unwrap();
+        tx.document.accounts.clear();
+        tx.commit().unwrap();
+        let mut tx = vault.begin().unwrap();
+        assert_eq!(tx.document.version, 8);
+        assert!(matches!(
+            tx.document.reserve_factory_refresh("another", &credential),
+            Err(AccountError::Duplicate)
+        ));
+        assert!(
+            tx.document
+                .reserve_factory_refresh(&id, &credential)
+                .is_ok()
+        );
+        drop(tx);
+        let bytes = memory.read().unwrap().unwrap();
+        assert!(pre_kiro_reservations::read(&bytes).is_err());
+        let mut downgraded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        downgraded["version"] = 7.into();
+        memory
+            .write(&serde_json::to_vec(&downgraded).unwrap())
+            .unwrap();
+        assert!(matches!(vault.begin(), Err(AccountError::Corrupt)));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn kiro_reservations_reject_old_readers_after_deletion() {
         let memory = Arc::new(Memory::default());

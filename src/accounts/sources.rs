@@ -4,6 +4,65 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum AntigravityLocation {
+    GeminiKeychain,
+    StateDb,
+}
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AntigravityNativeReference {
+    pub location: AntigravityLocation,
+    pub path: Option<std::path::PathBuf>,
+}
+impl AntigravityNativeReference {
+    pub fn system(location: AntigravityLocation) -> Result<Self, AccountError> {
+        let path = match location {
+            AntigravityLocation::StateDb => Some(
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .ok_or(AccountError::NotFound)?
+                    .join("Library/Application Support/Antigravity/User/globalStorage/state.vscdb"),
+            ),
+            _ if !cfg!(target_os = "macos") => return Err(AccountError::Unsupported),
+            _ => None,
+        };
+        let source = Self { location, path };
+        source.identity()?;
+        Ok(source)
+    }
+    pub fn identity(&self) -> Result<String, AccountError> {
+        let location = match (self.location, &self.path) {
+            (AntigravityLocation::GeminiKeychain, None) => "gemini/antigravity",
+            (AntigravityLocation::StateDb, Some(path))
+                if path.is_absolute()
+                    && path.ends_with(
+                        "Library/Application Support/Antigravity/User/globalStorage/state.vscdb",
+                    )
+                    && !path
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir)) =>
+            {
+                path.to_str().ok_or(AccountError::Input)?
+            }
+            _ => return Err(AccountError::Input),
+        };
+        Ok(crate::cache::fingerprint(&["antigravity_native", location]))
+    }
+    pub async fn resolve(&self) -> Result<Resolved, AccountError> {
+        self.identity()?;
+        let credential = crate::providers::antigravity_auth::reference_token(self).await?;
+        Ok(Resolved {
+            label: "Antigravity native account".into(),
+            provider: crate::cli::Provider::Antigravity,
+            plan: None,
+            subscription_status: None,
+            credentials: vec![credential],
+        })
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum CopilotLocation {
     Apps,
     Hosts,
@@ -597,6 +656,9 @@ impl Credential {
             {
                 source.resolve().await.map(Some)
             }
+            Self::AntigravityNative { source } if provider == crate::cli::Provider::Antigravity => {
+                source.resolve().await.map(Some)
+            }
             Self::KiroNative { source } if provider == crate::cli::Provider::Catalog("kiro") => {
                 source.resolve().await.map(Some)
             }
@@ -643,6 +705,7 @@ impl Credential {
             | Self::DevinDesktopNative { .. }
             | Self::FactoryNative { .. }
             | Self::KiroNative { .. }
+            | Self::AntigravityNative { .. }
             | Self::CodexNative { .. }
             | Self::ClaudeNative { .. }
             | Self::CopilotNative { .. }

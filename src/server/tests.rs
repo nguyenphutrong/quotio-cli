@@ -404,6 +404,52 @@ pub(super) async fn done(state: &ApiState, id: &str) -> Operation {
     panic!("operation timeout")
 }
 #[tokio::test]
+async fn antigravity_owned_intake_is_explicit_and_idempotent() {
+    let (state, dir, _) = fixture().await;
+    let body = json!({"kind":"antigravity_owned","label":"Owned Antigravity","access_token":"synthetic-antigravity-access","refresh_token":"synthetic-antigravity-refresh","expires_at":0,"client_id":"1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com","client_secret":"synthetic-client-secret"});
+    let (_, Json(op)) = management::create(
+        State(state.clone()),
+        key("antigravity-intake"),
+        ApiJson(body.clone()),
+    )
+    .await
+    .unwrap_or_else(|_| panic!());
+    assert_eq!(done(&state, &op.id).await.status, "completed");
+    let (_, Json(retry)) = management::create(
+        State(state.clone()),
+        key("antigravity-intake"),
+        ApiJson(body.clone()),
+    )
+    .await
+    .unwrap_or_else(|_| panic!());
+    assert_eq!(retry.id, op.id);
+    let Json(accounts) = management::list(State(state.clone()))
+        .await
+        .unwrap_or_else(|_| panic!());
+    assert!(!accounts.to_string().contains("synthetic-"));
+    let account = accounts["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["provider"] == "antigravity")
+        .unwrap();
+    assert_eq!(account["origin"], "owned");
+    for field in ["path", "endpoint", "provider", "owned"] {
+        let mut invalid = body.clone();
+        invalid[field] = "fixture".into();
+        assert!(matches!(
+            management::create(
+                State(state.clone()),
+                key("invalid-antigravity"),
+                ApiJson(invalid)
+            )
+            .await,
+            Err(ApiError(StatusCode::BAD_REQUEST, _))
+        ));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[tokio::test]
 async fn kiro_owned_intake_is_explicit_and_idempotent() {
     let (state, dir, _) = fixture().await;
     let body = json!({"kind":"kiro_owned","label":"Owned Kiro","access_token":"synthetic-kiro-access","refresh_token":"synthetic-kiro-refresh","expires_at":0,"authMethod":"Social","region":"us-east-1"});

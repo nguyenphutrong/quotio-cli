@@ -104,7 +104,7 @@ pub fn capability(provider: Provider) -> ProviderCapability {
             "Register an explicit Factory credential file as read-only, or supply separately owned tokens for the default WorkOS client. Native refresh stays with Factory.",
         ),
         Provider::Antigravity => Some(
-            "Sign in with the Antigravity app, then authorize Quotio to read its existing local login.",
+            "Register the fixed Antigravity Keychain entry or state database as read-only, or supply separately owned tokens and client credentials. Refresh borrowed tokens in Antigravity.",
         ),
         Provider::Catalog(id)
             if provider.catalog().is_some_and(|definition| {
@@ -142,7 +142,7 @@ pub fn capability(provider: Provider) -> ProviderCapability {
             AuthMethod::Native,
         ],
         Provider::Catalog("grok" | "kiro") => vec![AuthMethod::Native, AuthMethod::OwnedToken],
-        Provider::Antigravity => vec![AuthMethod::Native],
+        Provider::Antigravity => vec![AuthMethod::Native, AuthMethod::OwnedToken],
         Provider::Catalog(_) if native.is_some() => vec![AuthMethod::Native],
         _ if provider.api_key_name().is_some() => vec![AuthMethod::ApiKey],
         _ => Vec::new(),
@@ -188,6 +188,13 @@ pub fn capability(provider: Provider) -> ProviderCapability {
             vec![SourceCapability {
                 kind: "devin_desktop_native",
                 platforms: vec!["macos", "linux"],
+                origin: "borrowed_native",
+                credential_refresh: false,
+            }]
+        } else if provider == Provider::Antigravity {
+            vec![SourceCapability {
+                kind: "antigravity_native",
+                platforms: vec!["macos"],
                 origin: "borrowed_native",
                 credential_refresh: false,
             }]

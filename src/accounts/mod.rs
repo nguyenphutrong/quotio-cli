@@ -85,6 +85,21 @@ pub enum Credential {
     DevinDesktopNative {
         source: sources::DevinDesktopNativeReference,
     },
+    AntigravityNative {
+        source: sources::AntigravityNativeReference,
+    },
+    AntigravityToken {
+        access_token: String,
+        expires_at: Option<i64>,
+    },
+    AntigravityOAuth {
+        access_token: String,
+        refresh_token: String,
+        expires_at: i64,
+        client_id: String,
+        client_secret: String,
+        refresh_pending: bool,
+    },
     KiroOAuth {
         access_token: String,
         refresh_token: String,
@@ -202,6 +217,7 @@ impl Account {
             Credential::AmpNative { .. }
             | Credential::DevinDesktopNative { .. }
             | Credential::FactoryNative { .. }
+            | Credential::AntigravityNative { .. }
             | Credential::KiroNative { .. }
             | Credential::CopilotNative { .. }
             | Credential::ClaudeNative { .. }
@@ -240,6 +256,8 @@ pub struct Document {
     pub claude_refresh_owners: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub kiro_refresh_owners: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub antigravity_refresh_owners: std::collections::BTreeMap<String, String>,
 }
 impl Document {
     pub fn empty() -> Self {
@@ -250,6 +268,7 @@ impl Document {
             factory_refresh_owners: Default::default(),
             claude_refresh_owners: Default::default(),
             kiro_refresh_owners: Default::default(),
+            antigravity_refresh_owners: Default::default(),
         }
     }
     // Retain token lineage after rotation/removal so registration cannot bypass a fence.
@@ -258,6 +277,21 @@ impl Document {
         id: &str,
         credential: &Credential,
     ) -> Result<(), AccountError> {
+        if let Credential::AntigravityOAuth { refresh_token, .. } = credential {
+            let fingerprint = crate::cache::fingerprint(&["antigravity_owned", refresh_token]);
+            if self.antigravity_refresh_owners.get(&fingerprint).is_some_and(|owner| owner != id)
+                || self.accounts.iter().any(|account| {
+                    account.id != id && matches!(&account.credential,
+                        Credential::AntigravityOAuth { refresh_token: existing, .. } if existing == refresh_token)
+                })
+            {
+                return Err(AccountError::Duplicate);
+            }
+            self.antigravity_refresh_owners
+                .insert(fingerprint, id.to_owned());
+            self.version = self.version.max(8);
+            return Ok(());
+        }
         if let Credential::KiroOAuth { refresh_token, .. } = credential {
             let fingerprint = crate::cache::fingerprint(&["kiro_owned", refresh_token]);
             if self.kiro_refresh_owners.get(&fingerprint).is_some_and(|owner| owner != id)
@@ -331,6 +365,7 @@ impl Document {
                 | Credential::AmpNative { .. }
                 | Credential::DevinDesktopNative { .. }
                 | Credential::FactoryNative { .. }
+                | Credential::AntigravityNative { .. }
                 | Credential::KiroNative { .. }
                 | Credential::ClaudeNative { .. }
                 | Credential::CopilotNative { .. }

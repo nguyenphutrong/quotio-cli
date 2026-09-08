@@ -271,20 +271,14 @@ impl AntigravityProvider {
                 .fetch_with_token(context, base, user_info, &self.token(context)?, expected)
                 .await;
         }
-        let mut session = super::antigravity_auth::Session::load(
+        let session = super::antigravity_auth::Session::load(
             std::sync::Arc::new(super::antigravity_auth::NativeStore),
             context,
         )
         .await?;
-        let mut result = self
+        let result = self
             .fetch_with_token(context, base, user_info, &session.token, expected)
             .await;
-        if matches!(result, Err(ProviderError::Authentication)) {
-            session.retry_auth(context).await?;
-            result = self
-                .fetch_with_token(context, base, user_info, &session.token, expected)
-                .await;
-        }
         if result.is_ok() {
             session.verify().await?;
         }
@@ -461,13 +455,18 @@ impl ProviderAdapter for AntigravityProvider {
         })
     }
 
+    fn account_ref(&self) -> Option<crate::domain::AccountRef> {
+        Some(crate::domain::AccountRef {
+            origin: None,
+            id: "local".into(),
+            label: "Local or environment Antigravity account".into(),
+        })
+    }
     fn id(&self) -> ProviderId {
         ProviderId("antigravity".into())
     }
     fn idempotent(&self) -> bool {
-        // Fetch may exchange a native refresh token. Do not replay the whole
-        // operation after an uncertain OAuth response.
-        false
+        true
     }
     fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
         Box::pin(async move {
@@ -505,7 +504,9 @@ impl ProviderAdapter for AntigravityProvider {
                 || context.credentials.get("ANTIGRAVITY_AUTH_FILE").is_some()
                 || matches!(
                     last,
-                    ProviderError::RateLimited
+                    ProviderError::Authentication
+                        | ProviderError::LocalCredentialStorage
+                        | ProviderError::RateLimited
                         | ProviderError::Cancelled
                         | ProviderError::InvalidData
                 )

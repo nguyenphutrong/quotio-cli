@@ -204,6 +204,9 @@ async fn mutate(
                             api::AccountCreateInput::ApiKey(input) => {
                                 api::prepare(&work.context, input).await
                             }
+                            api::AccountCreateInput::AntigravityOwned(input) => {
+                                api::prepare_antigravity_owned(input)
+                            }
                             api::AccountCreateInput::KiroOwned(input) => {
                                 api::prepare_kiro_owned(input)
                             }

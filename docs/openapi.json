@@ -488,7 +488,8 @@
                   {
                     "$ref": "#/components/schemas/FactoryOwnedInput"
                   },
-                  {"$ref": "#/components/schemas/KiroOwnedInput"}
+                  {"$ref": "#/components/schemas/KiroOwnedInput"},
+                  {"$ref": "#/components/schemas/AntigravityOwnedInput"}
                 ]
               }
             }
@@ -2057,6 +2058,7 @@
               "devin_desktop_native",
               "factory_native",
               "kiro_native",
+              "antigravity_native",
               "cursor_native",
               "amp_native",
               "codex_native",
@@ -2182,6 +2184,7 @@
                     "grok_native",
                     "factory_native",
                     "kiro_native",
+                    "antigravity_native",
                     "devin_desktop_native"
                   ]
                 },
@@ -2745,6 +2748,7 @@
           {"$ref": "#/components/schemas/DevinDesktopNativeInput"},
           {"$ref": "#/components/schemas/FactoryNativeInput"},
           {"$ref": "#/components/schemas/KiroNativeInput"},
+          {"$ref": "#/components/schemas/AntigravityNativeInput"},
           {
             "type": "object",
             "additionalProperties": false,
@@ -2882,6 +2886,31 @@
           "location": {"enum": ["credentials_toml", "state_database"]}
         },
         "description": "Read-only reference to exactly one fixed Devin Desktop source. credentials_toml reads ~/.local/share/devin/credentials.toml. state_database reads ~/Library/Application Support/Devin/User/globalStorage/state.vscdb on macOS or ~/.config/Devin/User/globalStorage/state.vscdb on Linux. No fallback, custom path, credential copy or refresh. Explicit api_server_url values other than https://server.codeium.com (with optional trailing slash) are rejected. The separate devin organization account is unchanged."
+      },
+      "AntigravityNativeInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "location"],
+        "properties": {
+          "kind": {"const": "antigravity_native"},
+          "location": {"enum": ["gemini_keychain", "state_db"]}
+        },
+        "description": "Explicit read-only source. gemini_keychain selects only service gemini, account antigravity. state_db selects ~/Library/Application Support/Antigravity/User/globalStorage/state.vscdb, including WAL records. The selected path is stored at registration. No caller path, proxy discovery, token cache, refresh, or owner writes. Expired tokens must be refreshed in Antigravity. Explicit account reads never fall back to the local service. A Keychain reference replaces the matching local alias, including when disabled; environment token/file inputs remain independent."
+      },
+      "AntigravityOwnedInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "label", "access_token", "refresh_token", "expires_at", "client_id", "client_secret"],
+        "properties": {
+          "kind": {"const": "antigravity_owned"},
+          "label": {"type": "string", "minLength": 1, "maxLength": 100},
+          "access_token": {"type": "string", "writeOnly": true},
+          "refresh_token": {"type": "string", "writeOnly": true},
+          "expires_at": {"type": "integer"},
+          "client_id": {"const": "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"},
+          "client_secret": {"type": "string", "writeOnly": true}
+        },
+        "description": "Separately owned Google OAuth tokens for the supported Antigravity client. The caller must supply the client secret explicitly; Quotio does not ship a secret or extract one from an installed app. Inputs stay inside the protected vault. Refresh uses only https://oauth2.googleapis.com/token. No caller endpoint, browser login, native import, or proxy discovery. Refresh is durably marked pending before sending; rotation is saved before quota. An interrupted or uncertain refresh cannot be replayed. Refresh-token reservations survive rotation and deletion. Vault format 8 rejects older readers and downgraded documents containing these credentials or reservations."
       },
       "KiroNativeInput": {
         "type": "object",

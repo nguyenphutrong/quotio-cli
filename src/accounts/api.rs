@@ -29,6 +29,7 @@ impl From<&super::Account> for AccountDto {
                 Credential::DevinDesktopNative { .. } => Some("devin_desktop_native"),
                 Credential::FactoryNative { .. } => Some("factory_native"),
                 Credential::KiroNative { .. } => Some("kiro_native"),
+                Credential::AntigravityNative { .. } => Some("antigravity_native"),
                 Credential::CursorNative { .. } => Some("cursor_native"),
                 Credential::AmpNative { .. } => Some("amp_native"),
                 Credential::CodexNative { .. } => Some("codex_native"),
@@ -110,6 +111,7 @@ pub enum AccountCreateInput {
     GrokOwned(GrokOwnedInput),
     FactoryOwned(FactoryOwnedInput),
     KiroOwned(KiroOwnedInput),
+    AntigravityOwned(AntigravityOwnedInput),
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -224,6 +226,36 @@ pub fn prepare_kiro_owned(input: KiroOwnedInput) -> Result<PreparedAccount, Acco
     })
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AntigravityOwnedKind {
+    AntigravityOwned,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AntigravityOwnedInput {
+    pub kind: AntigravityOwnedKind,
+    pub label: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: i64,
+    pub client_id: String,
+    pub client_secret: String,
+}
+pub fn prepare_antigravity_owned(
+    input: AntigravityOwnedInput,
+) -> Result<PreparedAccount, AccountError> {
+    let identity = crate::cache::fingerprint(&["antigravity_owned", &input.refresh_token]);
+    let label = super::validate_label(&input.label)?;
+    let credential = crate::providers::antigravity_auth::owned_credential(input)?;
+    Ok(PreparedAccount {
+        provider: Provider::Antigravity,
+        label,
+        credential,
+        identity,
+    })
+}
+
 pub struct PreparedAccount {
     provider: Provider,
     label: String,
@@ -234,6 +266,9 @@ pub struct PreparedAccount {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceInput {
     KiroNative {},
+    AntigravityNative {
+        location: super::sources::AntigravityLocation,
+    },
     DevinDesktopNative {
         location: super::sources::DevinDesktopLocation,
     },
@@ -262,6 +297,15 @@ pub enum SourceInput {
 }
 pub async fn prepare_source(input: SourceInput) -> Result<PreparedAccount, AccountError> {
     let (identity, credential, resolved) = match input {
+        SourceInput::AntigravityNative { location } => {
+            let source = super::sources::AntigravityNativeReference::system(location)?;
+            let resolved = source.resolve().await?;
+            (
+                source.identity()?,
+                Credential::AntigravityNative { source },
+                resolved,
+            )
+        }
         SourceInput::KiroNative {} => {
             let source = super::sources::KiroNativeReference::system()?;
             let resolved = source.resolve().await?;
@@ -534,6 +578,24 @@ mod tests {
         assert!(account.active);
     }
 
+    #[test]
+    fn antigravity_source_contract_is_fixed_and_read_only() {
+        for location in ["gemini_keychain", "state_db"] {
+            let body = serde_json::json!({"kind":"antigravity_native", "location":location});
+            assert!(serde_json::from_value::<SourceInput>(body.clone()).is_ok());
+            for field in ["path", "service", "account", "endpoint", "refresh", "owned"] {
+                let mut invalid = body.clone();
+                invalid[field] = "fixture".into();
+                assert!(serde_json::from_value::<SourceInput>(invalid).is_err());
+            }
+        }
+        assert!(
+            serde_json::from_value::<SourceInput>(
+                serde_json::json!({"kind":"antigravity_native", "location":"antigravity_keychain"})
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn kiro_source_registration_isolated() {
         let dir = std::env::temp_dir().join(crate::accounts::random_string().unwrap());
