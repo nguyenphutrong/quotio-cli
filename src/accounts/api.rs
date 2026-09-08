@@ -28,6 +28,7 @@ impl From<&super::Account> for AccountDto {
                 Credential::GrokNative { .. } => Some("grok_native"),
                 Credential::CursorNative { .. } => Some("cursor_native"),
                 Credential::AmpNative { .. } => Some("amp_native"),
+                Credential::CodexNative { .. } => Some("codex_native"),
                 Credential::QuotioCustomProvider { .. } => Some("quotio_custom_provider"),
                 _ => None,
             },
@@ -151,6 +152,10 @@ pub struct PreparedAccount {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceInput {
+    CodexNative {
+        #[serde(default)]
+        location: super::sources::CodexLocation,
+    },
     GrokNative {
         entry_key: String,
     },
@@ -162,6 +167,15 @@ pub enum SourceInput {
 }
 pub async fn prepare_source(input: SourceInput) -> Result<PreparedAccount, AccountError> {
     let (identity, credential, resolved) = match input {
+        SourceInput::CodexNative { location } => {
+            let source = super::sources::CodexNativeReference::system(location)?;
+            let resolved = source.resolve().await?;
+            (
+                source.identity()?,
+                Credential::CodexNative { source },
+                resolved,
+            )
+        }
         SourceInput::QuotioCustomProvider { source } => {
             let resolved = source.resolve().await?;
             (

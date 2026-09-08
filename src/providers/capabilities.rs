@@ -176,6 +176,13 @@ pub fn capability(provider: Provider) -> ProviderCapability {
                 origin: "borrowed_native",
                 credential_refresh: false,
             }]
+        } else if provider == Provider::Codex {
+            vec![SourceCapability {
+                kind: "codex_native",
+                platforms: vec!["macos", "linux"],
+                origin: "borrowed_native",
+                credential_refresh: false,
+            }]
         } else if provider == Provider::Amp {
             vec![SourceCapability {
                 kind: "amp_native",

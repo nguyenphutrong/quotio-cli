@@ -2052,6 +2052,7 @@
               "grok_native",
               "cursor_native",
               "amp_native",
+              "codex_native",
               "quotio_custom_provider"
             ]
           }
@@ -2164,6 +2165,7 @@
                   "enum": [
                     "quotio_custom_provider",
                     "amp_native",
+                    "codex_native",
                     "cursor_native",
                     "grok_native"
                   ]
@@ -2725,6 +2727,23 @@
       },
       "AccountSourceInput": {
         "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind"],
+            "properties": {
+              "kind": {
+                "const": "codex_native",
+                "description": "Read-only reference to a selected standard Codex auth.json. No proxy directory discovery, credential refresh or native writes."
+              },
+              "location": {
+                "type": "string",
+                "enum": ["default", "config", "codex_home"],
+                "default": "default",
+                "description": "default selects ~/.codex/auth.json; config selects ~/.config/codex/auth.json; codex_home selects $CODEX_HOME/auth.json. The server pins the selected absolute path."
+              }
+            }
+          },
           {
             "type": "object",
             "additionalProperties": false,

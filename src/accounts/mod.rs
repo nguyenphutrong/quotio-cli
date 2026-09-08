@@ -70,6 +70,9 @@ pub enum Credential {
     GrokNative {
         source: sources::GrokNativeReference,
     },
+    CodexNative {
+        source: sources::CodexNativeReference,
+    },
     CursorNative {
         source: sources::CursorNativeReference,
     },
@@ -133,6 +136,7 @@ impl Account {
         match self.credential {
             Credential::QuotioCustomProvider { .. } => AccountOrigin::BorrowedProxy,
             Credential::AmpNative { .. }
+            | Credential::CodexNative { .. }
             | Credential::CursorNative { .. }
             | Credential::GrokNative { .. } => AccountOrigin::BorrowedNative,
             _ => AccountOrigin::Owned,
@@ -194,6 +198,7 @@ impl Document {
             credential,
             Credential::QuotioCustomProvider { .. }
                 | Credential::AmpNative { .. }
+                | Credential::CodexNative { .. }
                 | Credential::CursorNative { .. }
                 | Credential::GrokNative { .. }
         ) {

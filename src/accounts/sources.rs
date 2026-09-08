@@ -167,12 +167,84 @@ impl GrokNativeReference {
     }
 }
 
+#[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexLocation {
+    #[default]
+    Default,
+    Config,
+    CodexHome,
+}
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CodexNativeReference {
+    pub path: std::path::PathBuf,
+}
+impl CodexNativeReference {
+    pub fn system(location: CodexLocation) -> Result<Self, AccountError> {
+        let path = match location {
+            CodexLocation::CodexHome => std::env::var_os("CODEX_HOME")
+                .map(std::path::PathBuf::from)
+                .ok_or(AccountError::NotFound)?
+                .join("auth.json"),
+            location => std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .ok_or(AccountError::NotFound)?
+                .join(match location {
+                    CodexLocation::Config => ".config/codex/auth.json",
+                    _ => ".codex/auth.json",
+                }),
+        };
+        let source = Self { path };
+        source.identity()?;
+        Ok(source)
+    }
+    pub fn identity(&self) -> Result<String, AccountError> {
+        if !self.path.is_absolute()
+            || self
+                .path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(AccountError::Input);
+        }
+        Ok(crate::cache::fingerprint(&[
+            "codex_native",
+            self.path.to_str().ok_or(AccountError::Input)?,
+        ]))
+    }
+    pub async fn resolve(&self) -> Result<Resolved, AccountError> {
+        self.identity()?;
+        let path = self.path.clone();
+        let credential = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || crate::providers::codex_native::load(&path)),
+        )
+        .await
+        .map_err(|_| AccountError::Busy)?
+        .map_err(|_| AccountError::Storage)??;
+        let Credential::CodexOAuth { ref email, .. } = credential else {
+            return Err(AccountError::Corrupt);
+        };
+        Ok(Resolved {
+            label: email.clone(),
+            provider: crate::cli::Provider::Codex,
+            plan: None,
+            subscription_status: None,
+            credentials: vec![credential],
+        })
+    }
+}
+
 impl Credential {
     pub async fn resolve_reference(
         &self,
         provider: crate::cli::Provider,
     ) -> Result<Option<Resolved>, AccountError> {
         match self {
+            Self::CodexNative { source } if provider == crate::cli::Provider::Codex => {
+                source.resolve().await.map(Some)
+            }
             Self::QuotioCustomProvider { source }
                 if matches!(
                     provider,
@@ -197,6 +269,7 @@ impl Credential {
                 source.resolve().await.map(Some)
             }
             Self::QuotioCustomProvider { .. }
+            | Self::CodexNative { .. }
             | Self::AmpNative { .. }
             | Self::GrokNative { .. }
             | Self::CursorNative { .. } => Err(AccountError::Unsupported),
@@ -396,6 +469,79 @@ fn read_preferences(_: QuotioDomain) -> Result<Vec<u8>, AccountError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn codex_registration_only_accepts_standard_location_selectors() {
+        use crate::accounts::api::SourceInput;
+        for location in ["default", "config", "codex_home"] {
+            assert!(
+                serde_json::from_value::<SourceInput>(
+                    serde_json::json!({"kind":"codex_native","location":location})
+                )
+                .is_ok()
+            );
+        }
+        let base = serde_json::json!({"kind":"codex_native"});
+        assert!(serde_json::from_value::<SourceInput>(base.clone()).is_ok());
+        for field in [
+            "path",
+            "token",
+            "owned",
+            "source",
+            "refresh_token",
+            "enabled",
+        ] {
+            let mut value = base.clone();
+            value[field] = "fixture".into();
+            assert!(serde_json::from_value::<SourceInput>(value).is_err());
+        }
+        assert!(
+            serde_json::from_value::<SourceInput>(
+                serde_json::json!({"kind":"codex_native","location":"../../secret"})
+            )
+            .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn codex_source_rejects_hostile_files_and_observes_owner_removal() {
+        let dir = std::env::temp_dir().join(super::super::random_string().unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("auth.json");
+        let source = CodexNativeReference { path: path.clone() };
+        std::fs::write(
+            &path,
+            br#"{"tokens":{"access_token":"fixture","account_id":"id"}}"#,
+        )
+        .unwrap();
+        assert!(source.resolve().await.is_ok());
+        assert!(matches!(
+            Credential::CodexNative {
+                source: source.clone()
+            }
+            .resolve_reference(crate::cli::Provider::Amp)
+            .await,
+            Err(AccountError::Unsupported)
+        ));
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            source.resolve().await,
+            Err(AccountError::NotFound)
+        ));
+        #[cfg(unix)]
+        {
+            let other = dir.join("other.json");
+            std::fs::write(&other, b"{}").unwrap();
+            std::os::unix::fs::symlink(&other, &path).unwrap();
+            assert!(source.resolve().await.is_err());
+            assert_eq!(std::fs::read(&other).unwrap(), b"{}");
+            std::fs::remove_file(&path).unwrap();
+        }
+        std::fs::write(&path, vec![b' '; 1024 * 1024 + 1]).unwrap();
+        assert!(matches!(source.resolve().await, Err(AccountError::Corrupt)));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(source.resolve().await.is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn grok_registration_only_accepts_an_explicit_safe_entry() {
         let base =

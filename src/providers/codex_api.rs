@@ -82,7 +82,7 @@ pub async fn fetch(
     )
     .await
 }
-async fn fetch_at(
+pub(crate) async fn fetch_at(
     context: &ProviderContext,
     credential: &Credential,
     endpoint: &str,

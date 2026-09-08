@@ -165,6 +165,7 @@ impl Vault {
                                 a.credential,
                                 super::Credential::QuotioCustomProvider { .. }
                                     | super::Credential::AmpNative { .. }
+                                    | super::Credential::CodexNative { .. }
                                     | super::Credential::CursorNative { .. }
                                     | super::Credential::GrokNative { .. }
                             )

@@ -213,6 +213,10 @@ async fn validate_credential(
             .await?
         }
         Provider::Factory => FactoryProvider.fetch(&ctx).await?,
+        Provider::Codex if endpoint_override.is_some() => {
+            let endpoint = endpoint_override.unwrap();
+            codex_api::fetch_at(&ctx, credential, endpoint, endpoint, endpoint).await?
+        }
         Provider::Codex => codex_api::fetch(&ctx, credential).await?,
         provider if provider.key_api().is_some() || provider.catalog().is_some() => {
             provider.adapter().fetch(&ctx).await?
@@ -463,6 +467,7 @@ pub fn default_label(
     match credential {
         Credential::QuotioCustomProvider { .. }
         | Credential::AmpNative { .. }
+        | Credential::CodexNative { .. }
         | Credential::GrokNative { .. }
         | Credential::CursorNative { .. } => Err(AccountError::Input),
         Credential::GrokOAuth { .. } => Ok("Grok owned account".into()),
@@ -687,6 +692,7 @@ impl ProviderAdapter for ManagedProvider {
                 } => return None,
                 Credential::QuotioCustomProvider { .. }
                 | Credential::AmpNative { .. }
+                | Credential::CodexNative { .. }
                 | Credential::GrokNative { .. }
                 | Credential::CursorNative { .. } => serde_json::to_string(
                     &account
@@ -872,8 +878,19 @@ pub(crate) fn uses_native_amp_source() -> bool {
         std::env::var("AMP_URL").ok().as_deref(),
     )
 }
-fn native_reference_replaces_local(provider: Provider, credential: &Credential) -> bool {
+pub(crate) fn native_reference_replaces_local(provider: Provider, credential: &Credential) -> bool {
     match credential {
+        Credential::CodexNative { source } => {
+            provider == Provider::Codex
+                && super::sources::CodexNativeReference::system(
+                    if std::env::var_os("CODEX_HOME").is_some() {
+                        super::sources::CodexLocation::CodexHome
+                    } else {
+                        super::sources::CodexLocation::Default
+                    },
+                )
+                .is_ok_and(|local| local == *source)
+        }
         Credential::AmpNative { .. } => provider == Provider::Amp && uses_native_amp_source(),
         Credential::GrokNative { .. } => {
             provider == Provider::Catalog("grok") && std::env::var_os("GROK_OAUTH_TOKEN").is_none()
@@ -957,9 +974,12 @@ pub async fn adapters(
     }
     if filter == Some("local") {
         if saved
-            && providers
-                .iter()
-                .any(|p| matches!(p, Provider::Amp | Provider::Catalog("cursor")))
+            && providers.iter().any(|p| {
+                matches!(
+                    p,
+                    Provider::Codex | Provider::Amp | Provider::Catalog("cursor" | "grok")
+                )
+            })
         {
             let accounts = discover(Vault::for_usage()?, timeout).await?;
             if accounts.iter().any(|a| {
@@ -1165,6 +1185,95 @@ mod tests {
         assert!(native_amp_selection(false, Some("invalid-url")));
         assert!(!native_amp_selection(true, None));
         assert!(!native_amp_selection(false, Some("https://custom.example")));
+    }
+    #[tokio::test]
+    async fn codex_native_http_is_read_only_and_fences_source_and_account_changes() {
+        for rotate in [false, true] {
+            let dir = std::env::temp_dir().join(random_string().unwrap());
+            std::fs::create_dir(&dir).unwrap();
+            let path = dir.join("auth.json");
+            let original = br#"{"tokens":{"access_token":"native-first-fixture","account_id":"fixture-account","refresh_token":"owner-only"}}"#;
+            std::fs::write(&path, original).unwrap();
+            let credential = Credential::CodexNative {
+                source: super::super::sources::CodexNativeReference { path: path.clone() },
+            };
+            let vault = Vault::new(Arc::new(Memory::default()), dir.join("lock"));
+            let mut tx = vault.begin().unwrap();
+            let id = tx
+                .document
+                .add(
+                    Provider::Codex,
+                    "Fixture",
+                    "source".into(),
+                    credential.clone(),
+                )
+                .unwrap();
+            let account = tx.document.accounts[0].clone();
+            assert!(
+                !serde_json::to_string(&tx.document)
+                    .unwrap()
+                    .contains("native-first-fixture")
+            );
+            tx.commit().unwrap();
+            let adapter = super::managed(&vault, &account);
+            let context = http::fixture::context();
+            let before = adapter.cache_identity(&context).await.unwrap();
+            let change_path = path.clone();
+            let (endpoint, server) = http::fixture::server_status_with_action(vec![
+                (200, serde_json::json!({"rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":18000}}})),
+                (200, serde_json::json!({})), (200, serde_json::json!({})),
+            ], move |_| {
+                if rotate {
+                    std::fs::write(&change_path, br#"{"tokens":{"access_token":"native-second-fixture","account_id":"fixture-account"}}"#).unwrap();
+                }
+            }).await;
+            let result =
+                validate_with_endpoint(&context, Provider::Codex, &credential, Some(&endpoint))
+                    .await;
+            if rotate {
+                assert!(matches!(result, Err(AccountError::Busy)));
+                assert_ne!(adapter.cache_identity(&context).await.unwrap(), before);
+            } else {
+                let usage = result.unwrap();
+                assert_eq!(usage.account.id, "fixture-account");
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                let managed = ManagedProvider {
+                    origin: account.origin(),
+                    label: account.label.clone(),
+                    operations: Arc::new(Network),
+                    vault: vault.clone(),
+                    id: id.clone(),
+                    provider: Provider::Codex,
+                    provider_id: Provider::Codex.adapter().id(),
+                };
+                let mut tx = vault.begin().unwrap();
+                tx.document.remove(&id).unwrap();
+                tx.commit().unwrap();
+                assert!(matches!(
+                    managed.verify_current(&credential, usage).await,
+                    Err(AccountError::NotFound)
+                ));
+            }
+            let requests = server.await.unwrap();
+            assert_eq!(requests.len(), 3);
+            for request in requests {
+                assert!(request.starts_with("GET "));
+                assert!(request.contains("Bearer native-first-fixture"));
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("chatgpt-account-id: fixture-account")
+                );
+                assert!(!request.contains("owner-only"));
+            }
+            if rotate {
+                let mut tx = vault.begin().unwrap();
+                tx.document.patch(&id, None, None, Some(false)).unwrap();
+                tx.commit().unwrap();
+            }
+            assert!(adapter.cache_identity(&context).await.is_none());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
     #[tokio::test]
     async fn amp_native_resolution_reaches_http_and_rejects_rotation_during_response() {

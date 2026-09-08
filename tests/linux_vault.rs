@@ -232,6 +232,15 @@ async fn native_amp_reference_registers_disables_and_removes_through_rest() {
 async fn native_grok_reference_registers_disables_and_removes_through_rest() {
     native_reference_lifecycle("grok", ".grok/auth.json", r#"{"https://auth.x.ai::fixture":{"key":"native-fixture-key","expires_at":"2099-01-01T00:00:00Z"},"https://auth.x.ai::other":{"key":"other-fixture-key","expires_at":"2099-01-01T00:00:00Z"}}"#, serde_json::json!({"kind":"grok_native","entry_key":"https://auth.x.ai::fixture"})).await;
 }
+#[tokio::test]
+async fn native_codex_reference_registers_disables_and_removes_through_rest() {
+    native_reference_lifecycle(
+        "codex",
+        ".codex/auth.json",
+        r#"{"tokens":{"access_token":"native-fixture-key","account_id":"fixture-account","refresh_token":"owner-only-refresh"}}"#,
+        serde_json::json!({"kind":"codex_native"}),
+    ).await;
+}
 async fn native_reference_lifecycle(
     provider: &str,
     native_path: &str,

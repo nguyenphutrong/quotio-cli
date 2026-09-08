@@ -369,14 +369,16 @@ pub(super) async fn validate_refresh_account(
     id: &str,
 ) -> Result<(), ApiError> {
     if id == "local" {
-        if provider == Provider::Amp
-            && !state.no_saved_accounts
-            && crate::accounts::service::uses_native_amp_source()
-        {
-            let accounts = api::list(vault(state)?).await.map_err(account_error)?;
+        if !state.no_saved_accounts && provider.supports_accounts() {
+            let accounts = crate::accounts::service::list(vault(state)?)
+                .await
+                .map_err(account_error)?;
             if accounts.iter().any(|a| {
-                a.origin == crate::accounts::AccountOrigin::BorrowedNative
-                    && a.provider == Provider::Amp
+                a.provider == provider
+                    && crate::accounts::service::native_reference_replaces_local(
+                        provider,
+                        &a.credential,
+                    )
             }) {
                 return Err(ApiError(
                     StatusCode::CONFLICT,

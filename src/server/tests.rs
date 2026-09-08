@@ -75,6 +75,164 @@ pub(super) async fn fixture() -> (Arc<ApiState>, std::path::PathBuf, String) {
         id,
     )
 }
+#[test]
+fn codex_source_rest_runs_with_an_isolated_home() {
+    let dir = std::env::temp_dir().join(accounts::random_string().unwrap());
+    std::fs::create_dir_all(dir.join(".codex")).unwrap();
+    let original = br#"{"tokens":{"access_token":"synthetic-native-secret","account_id":"fixture-id","refresh_token":"synthetic-owner-refresh"}}"#;
+    let path = dir.join(".codex/auth.json");
+    std::fs::write(&path, original).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "server::tests::codex_source_rest_child",
+            "--nocapture",
+        ])
+        .env("HOME", &dir)
+        .env("QUOTIO_CODEX_SOURCE_REST_FIXTURE", &dir)
+        .env_remove("CODEX_HOME")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[tokio::test]
+async fn codex_source_rest_child() {
+    let Ok(home) = std::env::var("QUOTIO_CODEX_SOURCE_REST_FIXTURE") else {
+        return;
+    };
+    assert_eq!(std::env::var("HOME").unwrap(), home);
+    assert!(std::path::Path::new(&home).starts_with(std::env::temp_dir()));
+    let (mut state, dir, _) = fixture().await;
+    Arc::get_mut(&mut state).unwrap().no_saved_accounts = false;
+    state.settings.write().await.values.enabled_providers = vec!["codex".into()];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let token = "synthetic-management-token-1234567890";
+    let app = router(
+        state.clone(),
+        Arc::new(security::Policy::new(address, true, None, &[], Some(token.into())).unwrap()),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let base = format!("http://{address}");
+    let input = json!({"kind":"codex_native"});
+    let unauth = client
+        .post(format!("{base}/v1/account-sources"))
+        .json(&input)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), 401);
+    let invalid = client
+        .post(format!("{base}/v1/account-sources"))
+        .bearer_auth(token)
+        .header("Idempotency-Key", "bad-source")
+        .json(&json!({"kind":"codex_native","path":"/tmp/untrusted"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), 400);
+    let request = || {
+        client
+            .post(format!("{base}/v1/account-sources"))
+            .bearer_auth(token)
+            .header("Idempotency-Key", "codex-source")
+            .json(&input)
+    };
+    let response = request().send().await.unwrap();
+    assert_eq!(response.status(), 202);
+    let operation: Value = response.json().await.unwrap();
+    let completed = done(&state, operation["id"].as_str().unwrap()).await;
+    let completed = serde_json::to_value(completed).unwrap();
+    assert_eq!(completed["status"], "completed", "{completed}");
+    let id = completed["result"]["account_id"].as_str().unwrap();
+    let replay: Value = request().send().await.unwrap().json().await.unwrap();
+    assert_eq!(replay["id"], operation["id"]);
+    for enabled in [false, true] {
+        let response = client
+            .patch(format!("{base}/v1/accounts/{id}"))
+            .bearer_auth(token)
+            .header("Idempotency-Key", format!("codex-enabled-{enabled}"))
+            .json(&json!({"enabled":enabled,"label":"Native Codex fixture"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 202);
+        let op: Value = response.json().await.unwrap();
+        assert_eq!(
+            done(&state, op["id"].as_str().unwrap()).await.status,
+            "completed"
+        );
+        let account: Value = client
+            .get(format!("{base}/v1/accounts/{id}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let alias = client
+            .post(format!("{base}/v1/refresh"))
+            .bearer_auth(token)
+            .json(&json!({"providers":["codex"],"account_id":"local","force":true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(alias.status(), 409);
+        assert_eq!(account["enabled"], enabled);
+        assert_eq!(account["origin"], "borrowed_native");
+        assert_eq!(account["source_kind"], "codex_native");
+        assert_eq!(account["label"], "Native Codex fixture");
+        assert!(!account.to_string().contains("synthetic-native-secret"));
+    }
+    let document = state.vault.as_ref().unwrap().begin().unwrap();
+    let bytes = serde_json::to_string(&document.document).unwrap();
+    assert!(!bytes.contains("synthetic-native-secret"));
+    assert!(!bytes.contains("synthetic-owner-refresh"));
+    assert_eq!(document.document.version, 4);
+    drop(document);
+    let response: Value = client
+        .delete(format!("{base}/v1/accounts/{id}"))
+        .bearer_auth(token)
+        .header("Idempotency-Key", "codex-remove")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        done(&state, response["id"].as_str().unwrap()).await.status,
+        "completed"
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/v1/accounts/{id}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    server.abort();
+    for job in state.jobs.lock().unwrap().drain(..) {
+        job.abort();
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
 fn key(value: &str) -> axum::http::HeaderMap {
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("idempotency-key", value.parse().unwrap());
