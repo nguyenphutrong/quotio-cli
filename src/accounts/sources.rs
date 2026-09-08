@@ -165,6 +165,78 @@ impl ClaudeNativeReference {
     }
 }
 
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FactoryLocation {
+    V2File,
+    V2LoginKeychain,
+    V2Keyring,
+    Legacy,
+}
+impl FactoryLocation {
+    pub(crate) fn filename(self) -> &'static str {
+        match self {
+            Self::V2File => "auth.v2.file",
+            Self::V2LoginKeychain => "auth.v2.loginkeychain",
+            Self::V2Keyring => "auth.v2.keyring",
+            Self::Legacy => "auth.encrypted",
+        }
+    }
+}
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FactoryNativeReference {
+    pub directory: std::path::PathBuf,
+    pub location: FactoryLocation,
+}
+impl FactoryNativeReference {
+    pub fn system(location: FactoryLocation) -> Result<Self, AccountError> {
+        if !cfg!(target_os = "macos")
+            && matches!(
+                location,
+                FactoryLocation::V2LoginKeychain | FactoryLocation::V2Keyring
+            )
+        {
+            return Err(AccountError::Unsupported);
+        }
+        let source = Self {
+            directory: std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .ok_or(AccountError::NotFound)?
+                .join(".factory"),
+            location,
+        };
+        source.identity()?;
+        Ok(source)
+    }
+    pub fn identity(&self) -> Result<String, AccountError> {
+        if !self.directory.is_absolute()
+            || self
+                .directory
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(AccountError::Input);
+        }
+        Ok(crate::cache::fingerprint(&[
+            "factory_native",
+            self.directory.to_str().ok_or(AccountError::Input)?,
+            self.location.filename(),
+        ]))
+    }
+    pub async fn resolve(&self) -> Result<Resolved, AccountError> {
+        self.identity()?;
+        let credential = crate::providers::factory::load_native(self).await?;
+        Ok(Resolved {
+            label: format!("Factory {}", self.location.filename()),
+            provider: crate::cli::Provider::Factory,
+            plan: None,
+            subscription_status: None,
+            credentials: vec![credential],
+        })
+    }
+}
+
 fn enabled_default() -> bool {
     true
 }
@@ -405,6 +477,9 @@ impl Credential {
         provider: crate::cli::Provider,
     ) -> Result<Option<Resolved>, AccountError> {
         match self {
+            Self::FactoryNative { source } if provider == crate::cli::Provider::Factory => {
+                source.resolve().await.map(Some)
+            }
             Self::CopilotNative { source }
                 if provider == crate::cli::Provider::Catalog("copilot") =>
             {
@@ -442,6 +517,7 @@ impl Credential {
                 source.resolve().await.map(Some)
             }
             Self::QuotioCustomProvider { .. }
+            | Self::FactoryNative { .. }
             | Self::CodexNative { .. }
             | Self::ClaudeNative { .. }
             | Self::CopilotNative { .. }
@@ -644,6 +720,107 @@ fn read_preferences(_: QuotioDomain) -> Result<Vec<u8>, AccountError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn factory_native_reads_one_fixed_file_without_copying_refresh_secrets() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use ring::aead;
+        let dir = std::env::temp_dir().join(super::super::random_string().unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let source = FactoryNativeReference {
+            directory: dir.clone(),
+            location: FactoryLocation::V2File,
+        };
+        let clear = br#"{"access_token":"fixture-access","refresh_token":"owner-only-refresh","active_organization_id":"org"}"#;
+        let key = [42u8; 32];
+        let nonce = [7u8; 12];
+        let cipher =
+            aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_256_GCM, &key).unwrap());
+        let mut encrypted = clear.to_vec();
+        let tag = cipher
+            .seal_in_place_separate_tag(
+                aead::Nonce::assume_unique_for_key(nonce),
+                aead::Aad::empty(),
+                &mut encrypted,
+            )
+            .unwrap();
+        let envelope = format!(
+            "{}:{}:{}",
+            STANDARD.encode(nonce),
+            STANDARD.encode(tag),
+            STANDARD.encode(&encrypted)
+        );
+        let path = dir.join("auth.v2.file");
+        std::fs::write(&path, &envelope).unwrap();
+        for key_bytes in [key.to_vec(), STANDARD.encode(key).into_bytes()] {
+            std::fs::write(dir.join("auth.v2.key"), key_bytes).unwrap();
+            let resolved = source.resolve().await.unwrap();
+            assert!(
+                matches!(&resolved.credentials[0], Credential::FactoryOAuth { access_token, refresh_token, organization_id, .. } if access_token == "fixture-access" && refresh_token.is_empty() && organization_id.as_deref() == Some("org"))
+            );
+            assert!(
+                !serde_json::to_string(&resolved)
+                    .unwrap()
+                    .contains("owner-only-refresh")
+            );
+            assert!(
+                !serde_json::to_string(&source)
+                    .unwrap()
+                    .contains("fixture-access")
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), envelope.as_bytes());
+        }
+        std::fs::write(dir.join("auth.v2.key"), [41u8; 32]).unwrap();
+        assert!(source.resolve().await.is_err());
+        // A valid legacy sibling must not rescue a broken explicit v2 selection.
+        std::fs::write(dir.join("auth.encrypted"), clear).unwrap();
+        assert!(source.resolve().await.is_err());
+        let legacy = FactoryNativeReference {
+            directory: dir.clone(),
+            location: FactoryLocation::Legacy,
+        };
+        assert!(legacy.resolve().await.is_ok());
+        assert_ne!(legacy.identity().unwrap(), source.identity().unwrap());
+        for bytes in [b"{}".to_vec(), vec![b' '; 1024 * 1024 + 1]] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(source.resolve().await.is_err());
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert!(source.resolve().await.is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("auth.encrypted"), &path).unwrap();
+            assert!(source.resolve().await.is_err());
+            std::fs::remove_file(&path).unwrap();
+            use std::os::unix::ffi::OsStrExt;
+            let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            assert!(source.resolve().await.is_err());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn factory_registration_rejects_custom_paths_and_credentials() {
+        let base = serde_json::json!({"kind":"factory_native", "location":"v2_file"});
+        assert!(serde_json::from_value::<crate::accounts::api::SourceInput>(base.clone()).is_ok());
+        for field in [
+            "path",
+            "directory",
+            "token",
+            "refresh_token",
+            "owned",
+            "source",
+            "enabled",
+        ] {
+            let mut input = base.clone();
+            input[field] = "fixture".into();
+            assert!(serde_json::from_value::<crate::accounts::api::SourceInput>(input).is_err());
+        }
+        for location in ["default", "../../secret", "newest"] {
+            let mut input = base.clone();
+            input["location"] = location.into();
+            assert!(serde_json::from_value::<crate::accounts::api::SourceInput>(input).is_err());
+        }
+    }
     #[tokio::test]
     async fn copilot_native_pins_one_entry_and_rejects_hostile_files() {
         let dir = std::env::temp_dir().join(super::super::random_string().unwrap());

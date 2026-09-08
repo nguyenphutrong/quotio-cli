@@ -173,7 +173,7 @@ fn read_regular_file(path: &Path) -> Result<Option<Vec<u8>>, ProviderError> {
     Ok(Some(bytes))
 }
 
-async fn native_file(path: PathBuf) -> Result<Option<Vec<u8>>, ProviderError> {
+pub(crate) async fn native_file(path: PathBuf) -> Result<Option<Vec<u8>>, ProviderError> {
     match tokio::time::timeout(
         NATIVE_READ_TIMEOUT,
         tokio::task::spawn_blocking(move || read_regular_file(&path)),
@@ -186,7 +186,7 @@ async fn native_file(path: PathBuf) -> Result<Option<Vec<u8>>, ProviderError> {
     }
 }
 
-async fn native_keychain(
+pub(crate) async fn native_keychain(
     service: &'static str,
     account: Option<&str>,
 ) -> Result<Option<Vec<u8>>, ProviderError> {

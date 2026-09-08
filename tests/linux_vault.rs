@@ -229,6 +229,14 @@ async fn native_amp_reference_registers_disables_and_removes_through_rest() {
     .await;
 }
 #[tokio::test]
+async fn native_factory_reference_registers_disables_and_removes_through_rest() {
+    native_reference_lifecycle(
+        "factory", ".factory/auth.encrypted",
+        r#"{"access_token":"native-fixture-key","refresh_token":"owner-only-refresh","active_organization_id":"org"}"#,
+        serde_json::json!({"kind":"factory_native","location":"legacy"}),
+    ).await;
+}
+#[tokio::test]
 async fn native_grok_reference_registers_disables_and_removes_through_rest() {
     native_reference_lifecycle("grok", ".grok/auth.json", r#"{"https://auth.x.ai::fixture":{"key":"native-fixture-key","expires_at":"2099-01-01T00:00:00Z"},"https://auth.x.ai::other":{"key":"other-fixture-key","expires_at":"2099-01-01T00:00:00Z"}}"#, serde_json::json!({"kind":"grok_native","entry_key":"https://auth.x.ai::fixture"})).await;
 }

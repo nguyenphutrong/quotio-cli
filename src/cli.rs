@@ -188,7 +188,9 @@ impl Provider {
             Self::Codex => "ChatGPT quota via saved OAuth or installed Codex CLI",
             Self::Amp => "Quota and balances via saved API key or installed Amp CLI",
             Self::Antigravity => "Google quota API; existing Antigravity OAuth token",
-            Self::Factory => "Factory Droid quota via saved API key or FACTORY_API_KEY",
+            Self::Factory => {
+                "Factory Droid quota via saved owned/native accounts or FACTORY_API_KEY"
+            }
         }
     }
     pub fn adapter(self) -> std::sync::Arc<dyn crate::providers::ProviderAdapter> {

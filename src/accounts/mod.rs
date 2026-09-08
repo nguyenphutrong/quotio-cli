@@ -46,6 +46,8 @@ pub enum AccountError {
     Settings,
     #[error("this provider uses a native OAuth login; sign in through its app/CLI or set {0}")]
     NativeOAuth(&'static str),
+    #[error("provider denied quota access")]
+    QuotaForbidden,
     #[error("credential validation failed: {0}")]
     Provider(#[from] ProviderError),
     #[error("login timed out or was cancelled")]
@@ -60,6 +62,9 @@ pub enum AccountError {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Credential {
+    FactoryNative {
+        source: sources::FactoryNativeReference,
+    },
     FactoryOAuth {
         access_token: String,
         refresh_token: String,
@@ -150,6 +155,7 @@ impl Account {
         match self.credential {
             Credential::QuotioCustomProvider { .. } => AccountOrigin::BorrowedProxy,
             Credential::AmpNative { .. }
+            | Credential::FactoryNative { .. }
             | Credential::CopilotNative { .. }
             | Credential::ClaudeNative { .. }
             | Credential::CodexNative { .. }
@@ -214,6 +220,7 @@ impl Document {
             credential,
             Credential::QuotioCustomProvider { .. }
                 | Credential::AmpNative { .. }
+                | Credential::FactoryNative { .. }
                 | Credential::ClaudeNative { .. }
                 | Credential::CopilotNative { .. }
                 | Credential::CodexNative { .. }

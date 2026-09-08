@@ -98,6 +98,9 @@ pub fn capability(provider: Provider) -> ProviderCapability {
             "Use the existing Codex CLI login, or add a separate Quotio-managed OAuth account.",
         ),
         Provider::Amp => Some("Use the existing Amp CLI login, or add a Quotio-managed API key."),
+        Provider::Factory => Some(
+            "Register an explicit Factory credential file as read-only, or supply separately owned tokens for the default WorkOS client. Native refresh stays with Factory.",
+        ),
         Provider::Antigravity => Some(
             "Sign in with the Antigravity app, then authorize Quotio to read its existing local login.",
         ),
@@ -126,7 +129,11 @@ pub fn capability(provider: Provider) -> ProviderCapability {
     let auth = match provider {
         Provider::Codex => vec![AuthMethod::OAuth, AuthMethod::Native],
         Provider::Amp => vec![AuthMethod::ApiKey, AuthMethod::Native],
-        Provider::Factory => vec![AuthMethod::ApiKey, AuthMethod::OwnedToken],
+        Provider::Factory => vec![
+            AuthMethod::ApiKey,
+            AuthMethod::OwnedToken,
+            AuthMethod::Native,
+        ],
         Provider::Catalog("grok") => vec![AuthMethod::Native, AuthMethod::OwnedToken],
         Provider::Antigravity => vec![AuthMethod::Native],
         Provider::Catalog(_) if native.is_some() => vec![AuthMethod::Native],
@@ -161,6 +168,13 @@ pub fn capability(provider: Provider) -> ProviderCapability {
                 kind: "quotio_custom_provider",
                 platforms: vec!["macos"],
                 origin: "borrowed_proxy",
+                credential_refresh: false,
+            }]
+        } else if provider == Provider::Factory {
+            vec![SourceCapability {
+                kind: "factory_native",
+                platforms: vec!["macos", "linux"],
+                origin: "borrowed_native",
                 credential_refresh: false,
             }]
         } else if provider == Provider::Catalog("copilot") {
@@ -228,7 +242,11 @@ mod tests {
         assert_eq!(factory.account_storage_platforms, vec!["macos", "linux"]);
         assert_eq!(
             factory.auth,
-            vec![AuthMethod::ApiKey, AuthMethod::OwnedToken]
+            vec![
+                AuthMethod::ApiKey,
+                AuthMethod::OwnedToken,
+                AuthMethod::Native
+            ]
         );
         assert!(
             factory

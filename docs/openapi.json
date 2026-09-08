@@ -2053,6 +2053,7 @@
             "type": "string",
             "enum": [
               "grok_native",
+              "factory_native",
               "cursor_native",
               "amp_native",
               "codex_native",
@@ -2174,7 +2175,8 @@
                     "claude_native",
                     "copilot_native",
                     "cursor_native",
-                    "grok_native"
+                    "grok_native",
+                    "factory_native"
                   ]
                 },
                 "platforms": {
@@ -2734,6 +2736,7 @@
       },
       "AccountSourceInput": {
         "oneOf": [
+          {"$ref": "#/components/schemas/FactoryNativeInput"},
           {
             "type": "object",
             "additionalProperties": false,
@@ -2861,6 +2864,16 @@
             "additionalProperties": false
           }
         ]
+      },
+      "FactoryNativeInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "location"],
+        "properties": {
+          "kind": {"const": "factory_native"},
+          "location": {"enum": ["v2_file", "v2_login_keychain", "v2_keyring", "legacy"]}
+        },
+        "description": "Explicit read-only binding to one file under this node's standard ~/.factory directory. v2_file uses auth.v2.file and auth.v2.key. v2_login_keychain and v2_keyring use their matching files and the macOS Factory CLI Keychain service. legacy uses auth.encrypted (plaintext on macOS/Linux; encrypted requires macOS Keychain). No newest-file selection, fallback file, caller path or credential copy. Owner rotation invalidates cache; only Factory may refresh or write native credentials."
       },
       "FactoryOwnedInput": {
         "type": "object",

@@ -5,6 +5,108 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub struct FactoryProvider;
 
+pub(crate) async fn load_native(
+    source: &crate::accounts::sources::FactoryNativeReference,
+) -> Result<crate::accounts::Credential, crate::accounts::AccountError> {
+    use super::catalog::oauth_primary::{native_file, native_keychain};
+    use crate::accounts::{AccountError, sources::FactoryLocation};
+    let bytes = native_file(source.directory.join(source.location.filename()))
+        .await?
+        .ok_or(AccountError::NotFound)?;
+    if source.location == FactoryLocation::Legacy
+        && bytes.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{')
+    {
+        return parse_native(&bytes);
+    }
+    let key = if source.location == FactoryLocation::V2File {
+        native_file(source.directory.join("auth.v2.key"))
+            .await?
+            .ok_or(AccountError::NotFound)?
+    } else {
+        let mut key = None;
+        for account in [
+            Some("auth-encryption-key-security-cli"),
+            None,
+            Some("auth-encryption-key"),
+        ] {
+            key = native_keychain("Factory CLI", account).await?;
+            if key.is_some() {
+                break;
+            }
+        }
+        key.ok_or(AccountError::NotFound)?
+    };
+    parse_native(&decrypt_native(&bytes, &key)?)
+}
+fn decrypt_native(bytes: &[u8], key: &[u8]) -> Result<Vec<u8>, crate::accounts::AccountError> {
+    use crate::accounts::AccountError;
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use ring::aead;
+    let key = if key.len() == 32 {
+        key.to_vec()
+    } else {
+        STANDARD
+            .decode(
+                std::str::from_utf8(key)
+                    .map_err(|_| AccountError::Corrupt)?
+                    .trim(),
+            )
+            .map_err(|_| AccountError::Corrupt)?
+    };
+    let key = aead::LessSafeKey::new(
+        aead::UnboundKey::new(&aead::AES_256_GCM, &key).map_err(|_| AccountError::Corrupt)?,
+    );
+    let text = std::str::from_utf8(bytes).map_err(|_| AccountError::Corrupt)?;
+    let parts: Vec<_> = text.trim().split(':').collect();
+    if parts.len() != 3 {
+        return Err(AccountError::Corrupt);
+    }
+    let decode = |s| STANDARD.decode(s).map_err(|_| AccountError::Corrupt);
+    let nonce = aead::Nonce::try_assume_unique_for_key(&decode(parts[0])?)
+        .map_err(|_| AccountError::Corrupt)?;
+    let tag = decode(parts[1])?;
+    if tag.len() != 16 {
+        return Err(AccountError::Corrupt);
+    }
+    let mut ciphertext = decode(parts[2])?;
+    ciphertext.extend_from_slice(&tag);
+    Ok(key
+        .open_in_place(nonce, aead::Aad::empty(), &mut ciphertext)
+        .map_err(|_| AccountError::Corrupt)?
+        .to_vec())
+}
+fn parse_native(
+    bytes: &[u8],
+) -> Result<crate::accounts::Credential, crate::accounts::AccountError> {
+    use crate::accounts::{AccountError, Credential};
+    #[derive(Deserialize)]
+    struct Native {
+        access_token: String,
+        active_organization_id: Option<String>,
+    }
+    let native: Native = serde_json::from_slice(bytes).map_err(|_| AccountError::Corrupt)?;
+    let access_token = native.access_token.trim().to_owned();
+    let organization_id = native
+        .active_organization_id
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty());
+    if !valid_token(&access_token)
+        || organization_id
+            .as_ref()
+            .is_some_and(|id| !valid_token(id) || id.len() > 256)
+    {
+        return Err(AccountError::Corrupt);
+    }
+    // The owner's refresh token is deliberately not decoded or returned.
+    Ok(Credential::FactoryOAuth {
+        expires_at: token_expiry(&access_token),
+        access_token,
+        refresh_token: String::new(),
+        organization_id,
+        refresh_pending: false,
+    })
+}
+
 pub(crate) fn valid_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 16_384
@@ -104,18 +206,28 @@ pub(crate) async fn fetch_oauth_at(
     if *refresh_pending {
         return Err(AccountError::CommitUncertain);
     }
-    let response: Response = http::json(
-        context
-            .http
-            .get(endpoint)
-            .header(
-                "Authorization",
-                http::sensitive(&format!("Bearer {access_token}"))?,
-            )
-            .header("Accept", "application/json"),
-        context.clock.now(),
-    )
-    .await?;
+    let response = context
+        .http
+        .get(endpoint)
+        .header(
+            "Authorization",
+            http::sensitive(&format!("Bearer {access_token}"))?,
+        )
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                ProviderError::Timeout
+            } else {
+                ProviderError::Transient
+            }
+        })?;
+    // Unlike 401, a forbidden quota request must not consume a refresh token.
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        return Err(AccountError::QuotaForbidden);
+    }
+    let response: Response = http::json_response(response, context.clock.now()).await?;
     let id = organization_id
         .clone()
         .unwrap_or_else(|| "Factory Droid".into());
@@ -378,6 +490,13 @@ impl FactoryProvider {
     }
 }
 impl ProviderAdapter for FactoryProvider {
+    fn account_ref(&self) -> Option<AccountRef> {
+        Some(AccountRef {
+            origin: None,
+            id: "local".into(),
+            label: "Local Factory account".into(),
+        })
+    }
     fn id(&self) -> ProviderId {
         ProviderId("factory".into())
     }

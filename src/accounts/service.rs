@@ -503,6 +503,7 @@ pub fn default_label(
         | Credential::ClaudeNative { .. }
         | Credential::CopilotNative { .. }
         | Credential::GrokNative { .. }
+        | Credential::FactoryNative { .. }
         | Credential::CursorNative { .. } => Err(AccountError::Input),
         Credential::GrokOAuth { .. } => Ok("Grok owned account".into()),
         Credential::FactoryOAuth { .. } => Ok("Factory owned account".into()),
@@ -745,6 +746,7 @@ impl ProviderAdapter for ManagedProvider {
                 | Credential::ClaudeNative { .. }
                 | Credential::CopilotNative { .. }
                 | Credential::GrokNative { .. }
+                | Credential::FactoryNative { .. }
                 | Credential::CursorNative { .. } => serde_json::to_string(
                     &account
                         .credential
@@ -859,6 +861,7 @@ async fn local_sources(requested: &[Provider], timeout: std::time::Duration) -> 
         })
         .collect();
     for (provider, token) in [
+        (Provider::Factory, "FACTORY_API_KEY"),
         (Provider::Catalog("cursor"), "CURSOR_ACCESS_TOKEN"),
         (Provider::Catalog("claude"), "CLAUDE_OAUTH_ACCESS_TOKEN"),
         (Provider::Catalog("copilot"), "COPILOT_API_TOKEN"),
@@ -935,6 +938,9 @@ pub(crate) fn uses_native_amp_source() -> bool {
 }
 pub(crate) fn native_reference_replaces_local(provider: Provider, credential: &Credential) -> bool {
     match credential {
+        Credential::FactoryNative { .. } => {
+            provider == Provider::Factory && std::env::var_os("FACTORY_API_KEY").is_none()
+        }
         Credential::CopilotNative { .. } => {
             provider == Provider::Catalog("copilot")
                 && std::env::var_os("COPILOT_API_TOKEN").is_none()
@@ -988,26 +994,15 @@ fn choose(
         }
         match &accounts {
             Ok(accounts) => {
-                let matching: Vec<_> = accounts
-                    .iter()
-                    .filter(|a| {
-                        a.provider == provider && (provider != Provider::Factory || a.active)
-                    })
-                    .collect();
-                if provider != Provider::Factory {
-                    if (local_sources.contains(&provider) || matching.is_empty())
-                        && !matching
-                            .iter()
-                            .any(|a| native_reference_replaces_local(provider, &a.credential))
-                    {
-                        selected.push(provider.adapter());
-                    }
-                    selected.extend(matching.into_iter().map(|a| managed(vault, a)));
-                } else if let Some(account) = matching.first() {
-                    selected.push(managed(vault, account));
-                } else {
+                let matching: Vec<_> = accounts.iter().filter(|a| a.provider == provider).collect();
+                if (local_sources.contains(&provider) || matching.is_empty())
+                    && !matching
+                        .iter()
+                        .any(|a| native_reference_replaces_local(provider, &a.credential))
+                {
                     selected.push(provider.adapter());
                 }
+                selected.extend(matching.into_iter().map(|a| managed(vault, a)));
             }
             Err(_) => {
                 if local_sources.contains(&provider) {
@@ -1050,6 +1045,7 @@ async fn adapters_with_vault(
                 matches!(
                     p,
                     Provider::Codex
+                        | Provider::Factory
                         | Provider::Amp
                         | Provider::Catalog("cursor" | "grok" | "claude" | "copilot")
                 )
@@ -1271,11 +1267,13 @@ mod tests {
                 .env("HOME", &dir)
                 .env("QUOTIO_SELECTION_FIXTURE", &dir)
                 .env_remove("CLAUDE_OAUTH_ACCESS_TOKEN")
-                .env_remove("COPILOT_API_TOKEN");
+                .env_remove("COPILOT_API_TOKEN")
+                .env_remove("FACTORY_API_KEY");
             if independent {
                 command
                     .env("CLAUDE_OAUTH_ACCESS_TOKEN", "independent-claude-fixture")
-                    .env("COPILOT_API_TOKEN", "independent-copilot-fixture");
+                    .env("COPILOT_API_TOKEN", "independent-copilot-fixture")
+                    .env("FACTORY_API_KEY", "independent-factory-fixture");
             }
             let output = command.output().unwrap();
             assert!(
@@ -1297,6 +1295,16 @@ mod tests {
         let missing = dir.join("missing-native-credentials");
         assert!(!missing.exists());
         for (provider, token, credential) in [
+            (
+                Provider::Factory,
+                "FACTORY_API_KEY",
+                Credential::FactoryNative {
+                    source: super::super::sources::FactoryNativeReference {
+                        directory: missing.clone(),
+                        location: super::super::sources::FactoryLocation::Legacy,
+                    },
+                },
+            ),
             (
                 Provider::Catalog("claude"),
                 "CLAUDE_OAUTH_ACCESS_TOKEN",
@@ -1380,6 +1388,118 @@ mod tests {
         assert!(native_amp_selection(false, Some("invalid-url")));
         assert!(!native_amp_selection(true, None));
         assert!(!native_amp_selection(false, Some("https://custom.example")));
+    }
+    #[tokio::test]
+    async fn factory_native_http_fences_rotation_disable_and_owner_refresh() {
+        struct HttpQuota(String);
+        impl Operations for HttpQuota {
+            fn quota<'a>(
+                &'a self,
+                c: &'a ProviderContext,
+                p: Provider,
+                k: &'a Credential,
+            ) -> OperationFuture<'a, ProviderUsage> {
+                Box::pin(validate_with_endpoint(c, p, k, Some(&self.0)))
+            }
+            fn refresh<'a>(
+                &'a self,
+                _: &'a ProviderContext,
+                _: &'a Credential,
+            ) -> OperationFuture<'a, Credential> {
+                panic!("borrowed credentials must never refresh")
+            }
+        }
+        for status in [200, 401, 403] {
+            for rotate in [false, true] {
+                let dir = std::env::temp_dir().join(random_string().unwrap());
+                std::fs::create_dir(&dir).unwrap();
+                let path = dir.join("auth.encrypted");
+                let original = br#"{"access_token":"fixture-first","refresh_token":"owner-only"}"#;
+                std::fs::write(&path, original).unwrap();
+                let credential = Credential::FactoryNative {
+                    source: super::super::sources::FactoryNativeReference {
+                        directory: dir.clone(),
+                        location: super::super::sources::FactoryLocation::Legacy,
+                    },
+                };
+                let vault = Vault::new(Arc::new(Memory::default()), dir.join("lock"));
+                let mut tx = vault.begin().unwrap();
+                let id = tx
+                    .document
+                    .add(
+                        Provider::Factory,
+                        "Fixture",
+                        "source".into(),
+                        credential.clone(),
+                    )
+                    .unwrap();
+                let account = tx.document.accounts[0].clone();
+                assert_eq!(
+                    account.origin(),
+                    crate::domain::AccountOrigin::BorrowedNative
+                );
+                assert!(
+                    !serde_json::to_string(&tx.document)
+                        .unwrap()
+                        .contains("owner-only")
+                );
+                tx.commit().unwrap();
+                let adapter = super::managed(&vault, &account);
+                let context = http::fixture::context();
+                let before = adapter.cache_identity(&context).await.unwrap();
+                let changed = path.clone();
+                let (endpoint, server) = http::fixture::server_status_with_action(
+                    vec![(
+                        status,
+                        serde_json::json!({"usesTokenRateLimitsBilling":false}),
+                    )],
+                    move |_| {
+                        if rotate {
+                            std::fs::write(&changed, br#"{"access_token":"fixture-second"}"#)
+                                .unwrap();
+                        }
+                    },
+                )
+                .await;
+                let reader = ManagedProvider {
+                    origin: account.origin(),
+                    label: account.label.clone(),
+                    operations: Arc::new(HttpQuota(endpoint)),
+                    vault: vault.clone(),
+                    id: id.clone(),
+                    provider: Provider::Factory,
+                    provider_id: ProviderId("factory".into()),
+                };
+                let result = reader.fetch(&context).await;
+                if status == 401 {
+                    assert!(matches!(result, Err(ProviderError::OwnerRefreshRequired)));
+                } else if status == 403 {
+                    assert!(matches!(result, Err(ProviderError::Authentication)));
+                } else if rotate {
+                    assert!(matches!(result, Err(ProviderError::Transient)));
+                } else {
+                    assert!(result.is_ok());
+                }
+                let requests = server.await.unwrap();
+                assert_eq!(requests.len(), 1);
+                assert!(
+                    requests[0].starts_with("GET ") && requests[0].contains("Bearer fixture-first")
+                );
+                assert!(!requests[0].contains("owner-only"));
+                if rotate {
+                    assert_ne!(adapter.cache_identity(&context).await.unwrap(), before);
+                } else {
+                    assert_eq!(std::fs::read(&path).unwrap(), original);
+                }
+                patch(vault, id, None, None, Some(false)).await.unwrap();
+                assert!(adapter.cache_identity(&context).await.is_none());
+                assert!(matches!(
+                    adapter.fetch(&context).await,
+                    Err(ProviderError::SourceDisabled)
+                ));
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
     }
     #[tokio::test]
     async fn copilot_native_http_fences_rotation_and_disable() {
@@ -2070,6 +2190,59 @@ mod tests {
             std::fs::remove_file(entry.unwrap().path()).unwrap();
         }
         std::fs::remove_dir(path).unwrap();
+    }
+    #[tokio::test]
+    async fn factory_inflight_refresh_cancellation_and_disable_are_fenced() {
+        for cancel in [false, true] {
+            let (vault, fake, id, _, path) = setup(0, false, false, false);
+            let mut tx = vault.begin().unwrap();
+            tx.document.accounts[0].provider = Provider::Factory;
+            tx.document.accounts[0].credential = Credential::FactoryOAuth {
+                access_token: "old".into(),
+                refresh_token: "refresh".into(),
+                organization_id: None,
+                expires_at: 0,
+                refresh_pending: false,
+            };
+            tx.commit().unwrap();
+            fake.wait_for_refresh.store(true, Ordering::SeqCst);
+            let adapter = managed(vault.clone(), fake.clone(), id.clone(), Provider::Factory);
+            let running =
+                tokio::spawn(async move { adapter.read(&http::fixture::context()).await });
+            fake.started.notified().await;
+            let concurrent = managed(vault.clone(), fake.clone(), id.clone(), Provider::Factory);
+            assert!(matches!(
+                concurrent.read(&http::fixture::context()).await,
+                Err(AccountError::CommitUncertain)
+            ));
+            if cancel {
+                running.abort();
+                let _ = running.await;
+            } else {
+                patch(vault.clone(), id.clone(), None, None, Some(false))
+                    .await
+                    .unwrap();
+                fake.release_refresh.notify_one();
+                assert!(matches!(
+                    running.await.unwrap(),
+                    Err(AccountError::SourceDisabled)
+                ));
+            }
+            assert_eq!(fake.refreshes.load(Ordering::SeqCst), 1);
+            assert_eq!(fake.quota_calls.load(Ordering::SeqCst), 0);
+            let tx = vault.begin().unwrap();
+            assert!(
+                matches!(&tx.document.accounts[0].credential, Credential::FactoryOAuth { refresh_pending, refresh_token, .. } if *refresh_pending == cancel && refresh_token == if cancel {"refresh"} else {"rotated"})
+            );
+            drop(tx);
+            assert!(
+                concurrent
+                    .cache_identity(&http::fixture::context())
+                    .await
+                    .is_none()
+            );
+            cleanup(path);
+        }
     }
     #[tokio::test]
     async fn factory_rotation_and_uncertain_writes_never_replay() {

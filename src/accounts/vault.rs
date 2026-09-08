@@ -170,6 +170,7 @@ impl Vault {
                                     | super::Credential::CopilotNative { .. }
                                     | super::Credential::CursorNative { .. }
                                     | super::Credential::GrokNative { .. }
+                                    | super::Credential::FactoryNative { .. }
                             )
                         }))
                     || (doc.version < 4 && doc.accounts.iter().any(|a| !a.enabled))
