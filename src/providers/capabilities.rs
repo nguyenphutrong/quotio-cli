@@ -9,6 +9,7 @@ pub enum AuthMethod {
     #[serde(rename = "oauth")]
     OAuth,
     Native,
+    OwnedToken,
 }
 #[derive(Clone, Serialize, PartialEq, Eq)]
 pub struct SettingMetadata {
@@ -125,6 +126,7 @@ pub fn capability(provider: Provider) -> ProviderCapability {
     let auth = match provider {
         Provider::Codex => vec![AuthMethod::OAuth, AuthMethod::Native],
         Provider::Amp => vec![AuthMethod::ApiKey, AuthMethod::Native],
+        Provider::Catalog("grok") => vec![AuthMethod::Native, AuthMethod::OwnedToken],
         Provider::Antigravity => vec![AuthMethod::Native],
         Provider::Catalog(_) if native.is_some() => vec![AuthMethod::Native],
         _ if provider.api_key_name().is_some() => vec![AuthMethod::ApiKey],

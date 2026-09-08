@@ -220,13 +220,29 @@ async fn rest_reports_locked_storage_instead_of_empty_accounts() {
 
 #[tokio::test]
 async fn native_amp_reference_registers_disables_and_removes_through_rest() {
+    native_reference_lifecycle(
+        "amp",
+        ".local/share/amp/secrets.json",
+        r#"{"apiKey@https://ampcode.com/":"native-fixture-key"}"#,
+        serde_json::json!({"kind":"amp_native"}),
+    )
+    .await;
+}
+#[tokio::test]
+async fn native_grok_reference_registers_disables_and_removes_through_rest() {
+    native_reference_lifecycle("grok", ".grok/auth.json", r#"{"https://auth.x.ai::fixture":{"key":"native-fixture-key","expires_at":"2099-01-01T00:00:00Z"},"https://auth.x.ai::other":{"key":"other-fixture-key","expires_at":"2099-01-01T00:00:00Z"}}"#, serde_json::json!({"kind":"grok_native","entry_key":"https://auth.x.ai::fixture"})).await;
+}
+async fn native_reference_lifecycle(
+    provider: &str,
+    native_path: &str,
+    original: &str,
+    input: serde_json::Value,
+) {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
     let f = Fixture::new();
-    let source_dir = f.root.join(".local/share/amp");
-    fs::create_dir_all(&source_dir).unwrap();
-    let source = source_dir.join("secrets.json");
-    let original = br#"{"apiKey@https://ampcode.com/":"native-fixture-key"}"#;
+    let source = f.root.join(native_path);
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
     fs::write(&source, original).unwrap();
     fs::write(f.root.join("config.toml"), "enabled_providers = []\n").unwrap();
     let token = "fixture-management-token-1234567890123456";
@@ -288,7 +304,7 @@ async fn native_amp_reference_registers_disables_and_removes_through_rest() {
         .post(format!("{base}/v1/account-sources"))
         .bearer_auth(token)
         .header("Idempotency-Key", "native-register")
-        .json(&serde_json::json!({"kind":"amp_native"}))
+        .json(&input)
         .send()
         .await
         .unwrap();
@@ -326,7 +342,7 @@ async fn native_amp_reference_registers_disables_and_removes_through_rest() {
     let response = client
         .patch(format!("{base}/v1/settings"))
         .bearer_auth(token)
-        .json(&serde_json::json!({"revision":settings["revision"],"enabled_providers":["amp"]}))
+        .json(&serde_json::json!({"revision":settings["revision"],"enabled_providers":[provider]}))
         .send()
         .await
         .unwrap();
@@ -335,7 +351,7 @@ async fn native_amp_reference_registers_disables_and_removes_through_rest() {
     let response = client
         .post(format!("{base}/v1/refresh"))
         .bearer_auth(token)
-        .json(&serde_json::json!({"providers":["amp"],"account_id":id,"force":true}))
+        .json(&serde_json::json!({"providers":[provider],"account_id":id,"force":true}))
         .send()
         .await
         .unwrap();
@@ -343,7 +359,7 @@ async fn native_amp_reference_registers_disables_and_removes_through_rest() {
     let alias = client
         .post(format!("{base}/v1/refresh"))
         .bearer_auth(token)
-        .json(&serde_json::json!({"providers":["amp"],"account_id":"local","force":true}))
+        .json(&serde_json::json!({"providers":[provider],"account_id":"local","force":true}))
         .send()
         .await
         .unwrap();
@@ -373,7 +389,7 @@ async fn native_amp_reference_registers_disables_and_removes_through_rest() {
         .await
         .unwrap();
     finish(&client, base, token, response).await;
-    assert_eq!(fs::read(source).unwrap(), original);
+    assert_eq!(fs::read(source).unwrap(), original.as_bytes());
     child.kill().await.unwrap();
     child.wait().await.unwrap();
 }

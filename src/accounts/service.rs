@@ -25,6 +25,20 @@ fn scoped(
     credential: &Credential,
 ) -> Result<ProviderContext, AccountError> {
     let mut keys = HashMap::new();
+    if let Credential::GrokOAuth {
+        access_token,
+        refresh_pending,
+        ..
+    } = credential
+    {
+        if provider != Provider::Catalog("grok") {
+            return Err(AccountError::Unsupported);
+        }
+        if *refresh_pending {
+            return Err(AccountError::CommitUncertain);
+        }
+        keys.insert("GROK_OAUTH_TOKEN".into(), access_token.clone());
+    }
     if let Credential::CatalogKey { token, settings } = credential {
         let definition = provider
             .catalog()
@@ -192,8 +206,11 @@ async fn validate_credential(
         }
         Provider::Catalog("grok") if endpoint_override.is_some() => {
             crate::providers::catalog::oauth_editors::fetch_grok_complete_at(
-                &ctx, endpoint_override.unwrap(), None,
-            ).await?
+                &ctx,
+                endpoint_override.unwrap(),
+                None,
+            )
+            .await?
         }
         Provider::Factory => FactoryProvider.fetch(&ctx).await?,
         Provider::Codex => codex_api::fetch(&ctx, credential).await?,
@@ -448,6 +465,7 @@ pub fn default_label(
         | Credential::AmpNative { .. }
         | Credential::GrokNative { .. }
         | Credential::CursorNative { .. } => Err(AccountError::Input),
+        Credential::GrokOAuth { .. } => Ok("Grok owned account".into()),
         Credential::CodexOAuth { email, .. } => super::validate_label(email),
         Credential::ApiKey { token, .. } | Credential::CatalogKey { token, .. } => {
             let suffix =
@@ -491,7 +509,13 @@ impl Operations for Network {
         c: &'a ProviderContext,
         k: &'a Credential,
     ) -> OperationFuture<'a, Credential> {
-        Box::pin(super::oauth::refresh(c, k))
+        Box::pin(async move {
+            if matches!(k, Credential::GrokOAuth { .. }) {
+                crate::providers::catalog::oauth_editors::refresh_grok(c, k).await
+            } else {
+                super::oauth::refresh(c, k).await
+            }
+        })
     }
 }
 struct ManagedProvider {
@@ -518,14 +542,31 @@ impl ManagedProvider {
             return Err(AccountError::SourceDisabled);
         }
         let credential = account.credential;
-        if self.provider != Provider::Codex {
+        if matches!(
+            credential,
+            Credential::GrokOAuth {
+                refresh_pending: true,
+                ..
+            }
+        ) {
+            return Err(AccountError::CommitUncertain);
+        }
+        if !matches!(
+            credential,
+            Credential::CodexOAuth { .. } | Credential::GrokOAuth { .. }
+        ) {
             let usage = self
                 .operations
                 .quota(context, self.provider, &credential)
                 .await?;
             return self.verify_current(&credential, usage).await;
         }
-        let needs_refresh = matches!(&credential,Credential::CodexOAuth{expires_at,..} if *expires_at<=context.clock.now().unix_timestamp()+60);
+        let refresh_margin = if self.provider == Provider::Catalog("grok") {
+            300
+        } else {
+            60
+        };
+        let needs_refresh = matches!(&credential,Credential::CodexOAuth{expires_at,..} | Credential::GrokOAuth{expires_at,..} if *expires_at<=context.clock.now().unix_timestamp()+refresh_margin);
         if !needs_refresh {
             match self
                 .operations
@@ -557,6 +598,27 @@ impl ManagedProvider {
                 .quota(context, self.provider, &latest)
                 .await?;
             return self.verify_current(&latest, usage).await;
+        }
+        // A refresh can consume its token even if the response or vault commit is lost.
+        // Persist a fence first so later reads cannot replay that request.
+        let mut latest = latest;
+        if let Credential::GrokOAuth {
+            refresh_pending, ..
+        } = &mut latest
+        {
+            *refresh_pending = true;
+            let mut tx = begin(self.vault.clone()).await?;
+            let account = tx
+                .document
+                .accounts
+                .iter_mut()
+                .find(|a| a.id == self.id)
+                .ok_or(AccountError::NotFound)?;
+            if !account.enabled() || account.credential != credential {
+                return Err(AccountError::Busy);
+            }
+            account.credential = latest.clone();
+            commit(tx).await?;
         }
         let updated = self.operations.refresh(context, &latest).await?;
         let mut tx = begin(self.vault.clone()).await?;
@@ -619,6 +681,10 @@ impl ProviderAdapter for ManagedProvider {
             let account = account.clone();
             drop(tx);
             let scope = match &account.credential {
+                Credential::GrokOAuth {
+                    refresh_pending: true,
+                    ..
+                } => return None,
                 Credential::QuotioCustomProvider { .. }
                 | Credential::AmpNative { .. }
                 | Credential::GrokNative { .. }
@@ -653,6 +719,8 @@ impl ProviderAdapter for ManagedProvider {
     }
     fn idempotent(&self) -> bool {
         self.provider != Provider::Codex
+            && !(self.provider == Provider::Catalog("grok")
+                && self.origin == super::AccountOrigin::Owned)
     }
     fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
         Box::pin(async move {
@@ -1006,6 +1074,12 @@ mod tests {
                         doc.accounts.iter().any(|a| matches!((&a.credential,k),(Credential::CodexOAuth{refresh_token,account_id:stored,..},Credential::CodexOAuth{account_id:expected,..}) if refresh_token=="rotated" && stored==expected))
                     );
                 }
+                if let Credential::GrokOAuth { access_token, .. } = k {
+                    assert_eq!(access_token, "new");
+                    let doc: super::super::Document =
+                        serde_json::from_slice(&self.memory.read().unwrap().unwrap()).unwrap();
+                    assert!(doc.accounts.iter().any(|a| a.credential == *k));
+                }
                 if self.quota_fails {
                     return Err(ProviderError::Unavailable.into());
                 }
@@ -1038,6 +1112,28 @@ mod tests {
                     return Err(ProviderError::Transient.into());
                 }
                 let mut k = k.clone();
+                if let Credential::GrokOAuth {
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    refresh_pending,
+                } = &mut k
+                {
+                    assert!(*refresh_pending);
+                    let doc: super::super::Document =
+                        serde_json::from_slice(&self.memory.read().unwrap().unwrap()).unwrap();
+                    assert!(doc.accounts.iter().any(|a| matches!(
+                        a.credential,
+                        Credential::GrokOAuth {
+                            refresh_pending: true,
+                            ..
+                        }
+                    )));
+                    *access_token = "new".into();
+                    *refresh_token = "rotated".into();
+                    *expires_at = 3600;
+                    *refresh_pending = false;
+                }
                 if let Credential::CodexOAuth {
                     access_token,
                     refresh_token,
@@ -1231,15 +1327,31 @@ mod tests {
                 "https://auth.x.ai::second": {"key":"fixture-second", "expires_at":"2099-01-01T00:00:00Z"}
             });
             std::fs::write(&path, data.to_string()).unwrap();
-            let source = super::super::sources::GrokNativeReference { path: path.clone(), entry_key: "https://auth.x.ai::first".into() };
+            let source = super::super::sources::GrokNativeReference {
+                path: path.clone(),
+                entry_key: "https://auth.x.ai::first".into(),
+            };
             let mut second = source.clone();
             second.entry_key = "https://auth.x.ai::second".into();
             assert_ne!(source.identity().unwrap(), second.identity().unwrap());
-            assert!(source.resolve().await.unwrap().credentials != second.resolve().await.unwrap().credentials);
-            let credential = Credential::GrokNative { source: source.clone() };
+            assert!(
+                source.resolve().await.unwrap().credentials
+                    != second.resolve().await.unwrap().credentials
+            );
+            let credential = Credential::GrokNative {
+                source: source.clone(),
+            };
             let vault = Vault::new(Arc::new(Memory::default()), dir.join("lock"));
             let mut tx = vault.begin().unwrap();
-            let id = tx.document.add(Provider::Catalog("grok"), "First", source.identity().unwrap(), credential.clone()).unwrap();
+            let id = tx
+                .document
+                .add(
+                    Provider::Catalog("grok"),
+                    "First",
+                    source.identity().unwrap(),
+                    credential.clone(),
+                )
+                .unwrap();
             let account = tx.document.accounts[0].clone();
             tx.commit().unwrap();
             let adapter = super::managed(&vault, &account);
@@ -1247,14 +1359,24 @@ mod tests {
             let before = adapter.cache_identity(&context).await.unwrap();
             let changed = path.clone();
             let original = std::fs::read(&path).unwrap();
-            let (endpoint, server) = http::fixture::server_status_with_action(vec![(200, serde_json::json!({"config":{"creditUsagePercent":20}}))], move |_| {
-                if rotate {
-                    let mut data = data.clone();
-                    data["https://auth.x.ai::first"]["key"] = "fixture-rotated".into();
-                    std::fs::write(&changed, data.to_string()).unwrap();
-                }
-            }).await;
-            let result = validate_with_endpoint(&context, Provider::Catalog("grok"), &credential, Some(&endpoint)).await;
+            let (endpoint, server) = http::fixture::server_status_with_action(
+                vec![(200, serde_json::json!({"config":{"creditUsagePercent":20}}))],
+                move |_| {
+                    if rotate {
+                        let mut data = data.clone();
+                        data["https://auth.x.ai::first"]["key"] = "fixture-rotated".into();
+                        std::fs::write(&changed, data.to_string()).unwrap();
+                    }
+                },
+            )
+            .await;
+            let result = validate_with_endpoint(
+                &context,
+                Provider::Catalog("grok"),
+                &credential,
+                Some(&endpoint),
+            )
+            .await;
             if rotate {
                 assert!(matches!(result, Err(AccountError::Busy)));
                 assert_ne!(adapter.cache_identity(&context).await.unwrap(), before);
@@ -1264,11 +1386,18 @@ mod tests {
             }
             assert!(server.await.unwrap()[0].contains("Bearer fixture-first"));
             let mut tx = vault.begin().unwrap();
-            assert!(!serde_json::to_string(&tx.document).unwrap().contains("fixture-first"));
+            assert!(
+                !serde_json::to_string(&tx.document)
+                    .unwrap()
+                    .contains("fixture-first")
+            );
             tx.document.patch(&id, None, None, Some(false)).unwrap();
             tx.commit().unwrap();
             assert!(adapter.cache_identity(&context).await.is_none());
-            assert_eq!(adapter.fetch(&context).await.unwrap_err(), ProviderError::SourceDisabled);
+            assert_eq!(
+                adapter.fetch(&context).await.unwrap_err(),
+                ProviderError::SourceDisabled
+            );
             std::fs::remove_file(&path).unwrap();
             assert!(source.resolve().await.is_err());
             std::fs::remove_dir_all(dir).unwrap();
@@ -1506,6 +1635,111 @@ mod tests {
         }
         std::fs::remove_dir(path).unwrap();
     }
+    #[tokio::test]
+    async fn grok_owned_rotation_persists_before_quota_and_uncertainty_blocks_replay() {
+        for refresh_fails in [false, true] {
+            let (vault, fake, id, _, path) = setup(0, true, refresh_fails, true);
+            let mut tx = vault.begin().unwrap();
+            let account = &mut tx.document.accounts[0];
+            account.provider = Provider::Catalog("grok");
+            account.credential = Credential::GrokOAuth {
+                access_token: "old".into(),
+                refresh_token: "refresh".into(),
+                expires_at: 0,
+                refresh_pending: false,
+            };
+            tx.commit().unwrap();
+            let adapter = managed(
+                vault.clone(),
+                fake.clone(),
+                id.clone(),
+                Provider::Catalog("grok"),
+            );
+            assert!(!adapter.idempotent());
+            let context = http::fixture::context();
+            let (a, b) = tokio::join!(adapter.read(&context), adapter.read(&context));
+            assert!(a.is_err() && b.is_err());
+            assert_eq!(fake.refreshes.load(Ordering::SeqCst), 1);
+            let tx = vault.begin().unwrap();
+            assert!(
+                matches!(&tx.document.accounts[0].credential, Credential::GrokOAuth { refresh_pending, refresh_token, .. } if *refresh_pending == refresh_fails && refresh_token == if refresh_fails {"refresh"} else {"rotated"})
+            );
+            drop(tx);
+            let restarted = managed(
+                Vault::new(fake.memory.clone(), path.join("lock")),
+                fake.clone(),
+                id,
+                Provider::Catalog("grok"),
+            );
+            assert!(restarted.read(&context).await.is_err());
+            assert_eq!(fake.refreshes.load(Ordering::SeqCst), 1);
+            if refresh_fails {
+                assert_eq!(fake.quota_calls.load(Ordering::SeqCst), 0);
+                assert!(restarted.cache_identity(&context).await.is_none());
+            }
+            cleanup(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_uncertain_rotation_commit_never_replays_refresh_or_starts_quota() {
+        struct Uncertain {
+            memory: Arc<Memory>,
+            persisted: bool,
+        }
+        impl Backend for Uncertain {
+            fn read(&self) -> Result<Option<Vec<u8>>, AccountError> {
+                self.memory.read()
+            }
+            fn write(&self, bytes: &[u8]) -> Result<(), AccountError> {
+                if String::from_utf8_lossy(bytes).contains("rotated") {
+                    if self.persisted {
+                        self.memory.write(bytes)?;
+                    }
+                    return Err(AccountError::CommitUncertain);
+                }
+                self.memory.write(bytes)
+            }
+        }
+        for persisted in [false, true] {
+            let (vault, fake, id, _, path) = setup(0, false, false, false);
+            let mut tx = vault.begin().unwrap();
+            tx.document.accounts[0].provider = Provider::Catalog("grok");
+            tx.document.accounts[0].credential = Credential::GrokOAuth {
+                access_token: "old".into(),
+                refresh_token: "refresh".into(),
+                expires_at: 0,
+                refresh_pending: false,
+            };
+            tx.commit().unwrap();
+            let vault = Vault::new(
+                Arc::new(Uncertain {
+                    memory: fake.memory.clone(),
+                    persisted,
+                }),
+                path.join("lock"),
+            );
+            let adapter = managed(vault, fake.clone(), id.clone(), Provider::Catalog("grok"));
+            assert!(matches!(
+                adapter.read(&http::fixture::context()).await,
+                Err(AccountError::CommitUncertain)
+            ));
+            assert_eq!(fake.quota_calls.load(Ordering::SeqCst), 0);
+            let restarted = managed(
+                Vault::new(fake.memory.clone(), path.join("lock")),
+                fake.clone(),
+                id,
+                Provider::Catalog("grok"),
+            );
+            assert_eq!(
+                restarted.read(&http::fixture::context()).await.is_ok(),
+                persisted
+            );
+            assert_eq!(fake.refreshes.load(Ordering::SeqCst), 1);
+            cleanup(path);
+        }
+    }
+
     #[tokio::test]
     async fn disabled_owned_accounts_skip_quota_cache_and_refresh() {
         let (vault, fake, codex, amp, path) = setup(0, false, false, false);

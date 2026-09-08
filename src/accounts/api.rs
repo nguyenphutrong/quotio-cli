@@ -97,6 +97,51 @@ fn credential(input: ApiKeyInput, context: &ProviderContext) -> Result<Credentia
         Err(AccountError::Unsupported)
     }
 }
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum AccountCreateInput {
+    ApiKey(ApiKeyInput),
+    GrokOwned(GrokOwnedInput),
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrokOwnedKind {
+    GrokOwned,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrokOwnedInput {
+    pub kind: GrokOwnedKind,
+    pub label: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: i64,
+}
+pub fn prepare_grok_owned(input: GrokOwnedInput) -> Result<PreparedAccount, AccountError> {
+    let valid = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 16_384
+            && !s.chars().any(|c| c.is_control() || c.is_whitespace())
+    };
+    if !valid(&input.access_token) || !valid(&input.refresh_token) || input.expires_at < 0 {
+        return Err(AccountError::Input);
+    }
+    Ok(PreparedAccount {
+        provider: Provider::Catalog("grok"),
+        label: super::validate_label(&input.label)?,
+        identity: crate::cache::fingerprint(&["grok_owned", &input.refresh_token]),
+        credential: Credential::GrokOAuth {
+            access_token: crate::providers::catalog::oauth_editors::grok_oauth_token(
+                crate::providers::Secret(input.access_token),
+            )?
+            .0,
+            refresh_token: input.refresh_token,
+            expires_at: input.expires_at,
+            refresh_pending: false,
+        },
+    })
+}
+
 pub struct PreparedAccount {
     provider: Provider,
     label: String,
@@ -106,7 +151,9 @@ pub struct PreparedAccount {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceInput {
-    GrokNative { entry_key: String },
+    GrokNative {
+        entry_key: String,
+    },
     CursorNative {},
     AmpNative {},
     QuotioCustomProvider {
@@ -126,7 +173,11 @@ pub async fn prepare_source(input: SourceInput) -> Result<PreparedAccount, Accou
         SourceInput::GrokNative { entry_key } => {
             let source = super::sources::GrokNativeReference::system(entry_key)?;
             let resolved = source.resolve().await?;
-            (source.identity()?, Credential::GrokNative { source }, resolved)
+            (
+                source.identity()?,
+                Credential::GrokNative { source },
+                resolved,
+            )
         }
         SourceInput::CursorNative {} => {
             let source = super::sources::CursorNativeReference::system()?;

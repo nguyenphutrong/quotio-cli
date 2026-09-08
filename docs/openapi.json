@@ -478,7 +478,14 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ApiKeyInput"
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/ApiKeyInput"
+                  },
+                  {
+                    "$ref": "#/components/schemas/GrokOwnedInput"
+                  }
+                ]
               }
             }
           }
@@ -2082,7 +2089,8 @@
               "enum": [
                 "api_key",
                 "oauth",
-                "native"
+                "native",
+                "owned_token"
               ]
             }
           },
@@ -2776,7 +2784,8 @@
             ],
             "properties": {
               "kind": {
-                "const": "grok_native"
+                "const": "grok_native",
+                "description": "Read-only reference to one explicit entry in ~/.grok/auth.json. The server selects the fixed native path. Credentials stay in the native file and are never refreshed or written by Quotio."
               },
               "entry_key": {
                 "type": "string",
@@ -2787,6 +2796,44 @@
             "additionalProperties": false
           }
         ]
+      },
+      "GrokOwnedInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "label",
+          "access_token",
+          "refresh_token",
+          "expires_at"
+        ],
+        "properties": {
+          "kind": {
+            "const": "grok_owned"
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
+          "access_token": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 16384,
+            "writeOnly": true
+          },
+          "refresh_token": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 16384,
+            "writeOnly": true
+          },
+          "expires_at": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "description": "Explicit intake of separately owned Grok CLI OAuth tokens for the default Grok client. Does not read or migrate native credentials or start OAuth. Tokens are stored before any refresh. An interrupted or failed refresh is fenced until this account is removed and separately owned credentials are supplied again."
       }
     }
   },

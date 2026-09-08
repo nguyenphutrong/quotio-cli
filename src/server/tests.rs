@@ -91,6 +91,59 @@ pub(super) async fn done(state: &ApiState, id: &str) -> Operation {
     panic!("operation timeout")
 }
 #[tokio::test]
+async fn grok_owned_intake_is_explicit_secret_free_and_idempotent() {
+    let (state, dir, _) = fixture().await;
+    let body = json!({"kind":"grok_owned","label":"Owned Grok","access_token":"synthetic-grok-access","refresh_token":"synthetic-grok-refresh","expires_at":0});
+    let (_, Json(op)) = management::create(
+        State(state.clone()),
+        key("grok-intake"),
+        ApiJson(body.clone()),
+    )
+    .await
+    .unwrap_or_else(|_| panic!());
+    assert_eq!(done(&state, &op.id).await.status, "completed");
+    let (_, Json(retry)) = management::create(
+        State(state.clone()),
+        key("grok-intake"),
+        ApiJson(body.clone()),
+    )
+    .await
+    .unwrap_or_else(|_| panic!());
+    assert_eq!(retry.id, op.id);
+    let Json(accounts) = management::list(State(state.clone()))
+        .await
+        .unwrap_or_else(|_| panic!());
+    assert!(!accounts.to_string().contains("synthetic-grok"));
+    let rows = accounts["accounts"].as_array().unwrap();
+    let account = rows.iter().find(|a| a["provider"] == "grok").unwrap();
+    assert_eq!(account["origin"], "owned");
+    let id = account["id"].as_str().unwrap().to_owned();
+    for field in ["path", "entry_key", "owned", "provider"] {
+        let mut invalid = body.clone();
+        invalid[field] = "fixture".into();
+        assert!(matches!(
+            management::create(State(state.clone()), key("invalid-grok"), ApiJson(invalid)).await,
+            Err(ApiError(StatusCode::BAD_REQUEST, _))
+        ));
+    }
+    assert!(matches!(management::reference(State(state.clone()), key("invalid-source"), ApiJson(json!({"kind":"grok_native","entry_key":"https://auth.x.ai::fixture","path":"/tmp/auth.json"}))).await, Err(ApiError(StatusCode::BAD_REQUEST, _))));
+    let (_, Json(disable)) = management::patch(
+        State(state.clone()),
+        Path(id.clone()),
+        key("disable-grok"),
+        ApiJson(json!({"enabled":false})),
+    )
+    .await
+    .unwrap_or_else(|_| panic!());
+    assert_eq!(done(&state, &disable.id).await.status, "completed");
+    let (_, Json(remove)) = management::remove(State(state.clone()), Path(id), key("remove-grok"))
+        .await
+        .unwrap_or_else(|_| panic!());
+    assert_eq!(done(&state, &remove.id).await.status, "completed");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn account_http_services_are_secret_free_idempotent_and_fenced() {
     let (state, dir, id) = fixture().await;
     let Json(accounts) = management::list(State(state.clone()))

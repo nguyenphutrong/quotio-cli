@@ -1051,16 +1051,78 @@ async fn grok_token(context: &ProviderContext) -> Result<Secret, ProviderError> 
     blocking(move || grok_native_token(&path, now)).await
 }
 
+pub(crate) async fn refresh_grok(
+    context: &ProviderContext,
+    previous: &crate::accounts::Credential,
+) -> Result<crate::accounts::Credential, crate::accounts::AccountError> {
+    refresh_grok_at(context, previous, "https://auth.x.ai/oauth2/token").await
+}
+async fn refresh_grok_at(
+    context: &ProviderContext,
+    previous: &crate::accounts::Credential,
+    endpoint: &str,
+) -> Result<crate::accounts::Credential, crate::accounts::AccountError> {
+    use crate::accounts::{AccountError, Credential};
+    let Credential::GrokOAuth { refresh_token, .. } = previous else {
+        return Err(AccountError::Unsupported);
+    };
+    #[derive(serde::Deserialize)]
+    struct Tokens {
+        access_token: String,
+        refresh_token: Option<String>,
+        expires_in: i64,
+    }
+    let tokens: Tokens = crate::providers::http::json(
+        context.http.post(endpoint).form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", "b1a00492-073a-47ea-816f-4c329264a828"),
+            ("refresh_token", refresh_token.as_str()),
+        ]),
+        context.clock.now(),
+    )
+    .await?;
+    let rotated = tokens
+        .refresh_token
+        .unwrap_or_else(|| refresh_token.clone());
+    if rotated.is_empty()
+        || rotated.len() > 16_384
+        || rotated.chars().any(|c| c.is_control() || c.is_whitespace())
+        || tokens.expires_in <= 0
+    {
+        return Err(AccountError::OAuth);
+    }
+    let access = grok_oauth_token(Secret(tokens.access_token))?;
+    let expires_at = context
+        .clock
+        .now()
+        .unix_timestamp()
+        .checked_add(tokens.expires_in)
+        .ok_or(AccountError::OAuth)?;
+    Ok(Credential::GrokOAuth {
+        access_token: access.0,
+        refresh_token: rotated,
+        expires_at,
+        refresh_pending: false,
+    })
+}
+
 pub(crate) fn grok_auth_path() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".grok/auth.json"))
 }
 
-pub(crate) fn grok_entry_token(path: &Path, entry_key: &str, now: OffsetDateTime) -> Result<Secret, ProviderError> {
+pub(crate) fn grok_entry_token(
+    path: &Path,
+    entry_key: &str,
+    now: OffsetDateTime,
+) -> Result<Secret, ProviderError> {
     let bytes = read_regular_file(path, MAX_NATIVE_FILE_BYTES)?;
     let root: Value = serde_json::from_slice(&bytes).map_err(|_| ProviderError::Authentication)?;
     let entry = root.get(entry_key).ok_or(ProviderError::Authentication)?;
     let selected = serde_json::json!({entry_key: entry});
-    grok_native_token_from_bytes(&serde_json::to_vec(&selected).map_err(|_| ProviderError::Authentication)?, now)
+    grok_native_token_from_bytes(
+        &serde_json::to_vec(&selected).map_err(|_| ProviderError::Authentication)?,
+        now,
+    )
 }
 
 fn grok_native_token(path: &Path, now: OffsetDateTime) -> Result<Secret, ProviderError> {
@@ -1101,7 +1163,7 @@ fn grok_native_token_from_bytes(
     grok_oauth_token(secret_from_text(token)?)
 }
 
-fn grok_oauth_token(key: Secret) -> Result<Secret, ProviderError> {
+pub(crate) fn grok_oauth_token(key: Secret) -> Result<Secret, ProviderError> {
     let raw = key.0.trim();
     let token = raw
         .get(..7)
@@ -1564,6 +1626,54 @@ mod tests {
             open_cursor_database(&database).err(),
             Some(ProviderError::InvalidData)
         );
+    }
+
+    #[tokio::test]
+    async fn grok_owned_refresh_uses_fixed_form_and_rejects_bad_responses() {
+        use crate::accounts::Credential;
+        let old = Credential::GrokOAuth {
+            access_token: "old".into(),
+            refresh_token: "fixture+refresh&".into(),
+            expires_at: 0,
+            refresh_pending: true,
+        };
+        for (status, body, success) in [
+            (
+                200,
+                json!({"access_token":"new","refresh_token":"rotated","expires_in":3600}),
+                true,
+            ),
+            (200, json!({"access_token":"new","expires_in":3600}), true),
+            (200, json!({"access_token":"new","expires_in":0}), false),
+            (
+                200,
+                json!({"access_token":"new","refresh_token":"","expires_in":3600}),
+                false,
+            ),
+            (200, json!({"access_token":"new"}), false),
+            (401, json!({"error":"fixture"}), false),
+            (503, json!({"error":"fixture"}), false),
+        ] {
+            let (endpoint, server) =
+                crate::providers::http::fixture::server_status(vec![(status, body)]).await;
+            let result = refresh_grok_at(&context(), &old, &endpoint).await;
+            assert_eq!(result.is_ok(), success);
+            if let Ok(Credential::GrokOAuth {
+                refresh_pending,
+                expires_at,
+                ..
+            }) = result
+            {
+                assert!(!refresh_pending);
+                assert!(expires_at > 0);
+            }
+            let requests = server.await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("POST "));
+            assert!(requests[0].contains("grant_type=refresh_token"));
+            assert!(requests[0].contains("refresh_token=fixture%2Brefresh%26"));
+            assert!(!requests[0].to_ascii_lowercase().contains("authorization:"));
+        }
     }
 
     #[tokio::test]

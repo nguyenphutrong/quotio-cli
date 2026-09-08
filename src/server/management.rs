@@ -83,7 +83,7 @@ pub(super) async fn usage(State(state): State<Arc<ApiState>>, Path(id): Path<Str
     super::usage_response(&state, Some(account.provider.id()), Some(&id)).await
 }
 enum Mutation {
-    Create(api::ApiKeyInput),
+    Create(api::AccountCreateInput),
     Reference(api::SourceInput),
     Update(String, api::AccountPatch),
     Remove(String),
@@ -200,9 +200,15 @@ async fn mutate(
                 }
                 match mutation {
                     Mutation::Create(input) => {
-                        let prepared = api::prepare(&work.context, input)
-                            .await
-                            .map_err(|e| account_code(&e))?;
+                        let prepared = match input {
+                            api::AccountCreateInput::ApiKey(input) => {
+                                api::prepare(&work.context, input).await
+                            }
+                            api::AccountCreateInput::GrokOwned(input) => {
+                                api::prepare_grok_owned(input)
+                            }
+                        }
+                        .map_err(|e| account_code(&e))?;
                         let _guard = crate::accounts::service::mutation_guard(&work.commit_guard)
                             .await
                             .map_err(|e| account_code(&e))?;
