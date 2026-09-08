@@ -170,6 +170,7 @@ impl Vault {
                                     | super::Credential::CopilotNative { .. }
                                     | super::Credential::CursorNative { .. }
                                     | super::Credential::GrokNative { .. }
+                                    | super::Credential::DevinDesktopNative { .. }
                                     | super::Credential::FactoryNative { .. }
                             )
                         }))

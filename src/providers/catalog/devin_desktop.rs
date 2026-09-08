@@ -20,11 +20,83 @@ pub const DEFINITIONS: &[Definition] = &[Definition {
     fetch,
 }];
 
+pub(crate) async fn load_native(
+    source: &crate::accounts::sources::DevinDesktopNativeReference,
+) -> Result<Secret, ProviderError> {
+    use crate::accounts::sources::DevinDesktopLocation;
+    let path = source.path.clone();
+    match source.location {
+        DevinDesktopLocation::CredentialsToml => {
+            let bytes = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tokio::task::spawn_blocking(move || {
+                    super::oauth_editors::read_regular_file(&path, 1024 * 1024)
+                }),
+            )
+            .await
+            .map_err(|_| ProviderError::Timeout)?
+            .map_err(|_| ProviderError::CredentialStorage)??;
+            parse_credentials_toml(&bytes)
+        }
+        DevinDesktopLocation::StateDatabase => {
+            let bytes = super::oauth_editors::native_sqlite_rows(path,
+                "SELECT json_group_array(json_object('value',value)) FROM ItemTable WHERE key = 'windsurfAuthStatus';"
+            ).await?;
+            parse_database_rows(&bytes)
+        }
+    }
+}
+
+fn native_key(value: &str) -> Result<Secret, ProviderError> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 16384 || value.chars().any(char::is_control) {
+        return Err(ProviderError::Authentication);
+    }
+    Ok(Secret(value.into()))
+}
+
+fn parse_credentials_toml(bytes: &[u8]) -> Result<Secret, ProviderError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| ProviderError::InvalidData)?;
+    let root: toml::Table = toml::from_str(text).map_err(|_| ProviderError::InvalidData)?;
+    // Never silently send credentials intended for another server to Codeium.
+    if let Some(server) = root.get("api_server_url") {
+        match server.as_str().map(str::trim) {
+            Some("https://server.codeium.com" | "https://server.codeium.com/") => (),
+            _ => return Err(ProviderError::InvalidData),
+        }
+    }
+    native_key(
+        root.get("windsurf_api_key")
+            .and_then(toml::Value::as_str)
+            .ok_or(ProviderError::Authentication)?,
+    )
+}
+
+fn parse_database_rows(bytes: &[u8]) -> Result<Secret, ProviderError> {
+    let rows: Vec<Value> = serde_json::from_slice(bytes).map_err(|_| ProviderError::InvalidData)?;
+    if rows.len() != 1 {
+        return Err(ProviderError::Authentication);
+    }
+    let value = rows[0]
+        .get("value")
+        .and_then(Value::as_str)
+        .ok_or(ProviderError::InvalidData)?;
+    let auth: Value = serde_json::from_str(value).map_err(|_| ProviderError::InvalidData)?;
+    native_key(
+        auth.get("apiKey")
+            .and_then(Value::as_str)
+            .ok_or(ProviderError::Authentication)?,
+    )
+}
+
 fn fetch<'a>(context: &'a ProviderContext) -> FetchFuture<'a> {
     Box::pin(fetch_at(context, STATUS_URL))
 }
 
-async fn fetch_at(context: &ProviderContext, url: &str) -> Result<ProviderUsage, ProviderError> {
+pub(crate) async fn fetch_at(
+    context: &ProviderContext,
+    url: &str,
+) -> Result<ProviderUsage, ProviderError> {
     let key = common::key(context, "DEVIN_DESKTOP_API_KEY")?;
     let now = context.clock.now();
     let root: Value = common::json(
@@ -194,6 +266,149 @@ mod tests {
     };
     use serde_json::json;
     use std::sync::Arc;
+
+    #[test]
+    fn native_parsers_reject_other_servers_and_ambiguous_credentials() {
+        for suffix in [
+            "",
+            "api_server_url = 'https://server.codeium.com'",
+            "api_server_url = 'https://server.codeium.com/'",
+        ] {
+            assert_eq!(
+                parse_credentials_toml(
+                    format!("windsurf_api_key = ' fixture-key ' # comment\n{suffix}").as_bytes()
+                )
+                .unwrap()
+                .0,
+                "fixture-key"
+            );
+        }
+        for server in [
+            "''",
+            "'http://server.codeium.com'",
+            "'https://evil.example'",
+            "'https://server.codeium.com@evil.example'",
+            "'https://server.codeium.com/path'",
+            "42",
+        ] {
+            assert!(
+                parse_credentials_toml(
+                    format!("windsurf_api_key = 'fixture-key'\napi_server_url = {server}")
+                        .as_bytes()
+                )
+                .is_err()
+            );
+        }
+        for text in [
+            "",
+            "windsurf_api_key = ''",
+            "windsurf_api_key = 42",
+            "windsurf_api_key='one'\nwindsurf_api_key='two'",
+        ] {
+            assert!(parse_credentials_toml(text.as_bytes()).is_err());
+        }
+        let row = json!({"value": "{\"apiKey\":\"fixture-key\"}"});
+        assert_eq!(
+            parse_database_rows(serde_json::to_string(&vec![&row]).unwrap().as_bytes())
+                .unwrap()
+                .0,
+            "fixture-key"
+        );
+        for rows in [
+            json!([]),
+            json!([row, row]),
+            json!([{"value":"{}"}]),
+            json!([{"value":"not-json"}]),
+        ] {
+            assert!(parse_database_rows(serde_json::to_string(&rows).unwrap().as_bytes()).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_toml_read_is_bounded_read_only_and_does_not_fall_back() {
+        use crate::accounts::sources::{DevinDesktopLocation, DevinDesktopNativeReference};
+        let dir = std::env::temp_dir().join(crate::accounts::random_string().unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("credentials.toml");
+        let source = DevinDesktopNativeReference {
+            path: path.clone(),
+            location: DevinDesktopLocation::CredentialsToml,
+        };
+        let original = b"windsurf_api_key='fixture-key'\n";
+        std::fs::write(&path, original).unwrap();
+        assert_eq!(load_native(&source).await.unwrap().0, "fixture-key");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::write(&path, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        assert!(load_native(&source).await.is_err());
+        std::fs::remove_file(&path).unwrap();
+        #[cfg(unix)]
+        {
+            let other = dir.join("other");
+            std::fs::write(&other, original).unwrap();
+            std::os::unix::fs::symlink(&other, &path).unwrap();
+            assert!(load_native(&source).await.is_err());
+            assert_eq!(std::fs::read(&other).unwrap(), original);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_database_reads_committed_wal_without_source_writes() {
+        use crate::accounts::sources::{DevinDesktopLocation, DevinDesktopNativeReference};
+        use std::io::{BufRead, Write};
+        let dir = std::env::temp_dir().join(crate::accounts::random_string().unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("state.vscdb");
+        let mut owner = std::process::Command::new("/usr/bin/sqlite3")
+            .args(["-init", "/dev/null", "-batch", "-bail"])
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = owner.stdin.as_mut().unwrap();
+        writeln!(input, "PRAGMA journal_mode=WAL; CREATE TABLE ItemTable(key TEXT, value TEXT); INSERT INTO ItemTable VALUES('windsurfAuthStatus','{{\"apiKey\":\"fixture-wal-key\"}}'); SELECT 'ready';").unwrap();
+        input.flush().unwrap();
+        let mut output = std::io::BufReader::new(owner.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert!(output.read_line(&mut line).unwrap() > 0);
+            if line.trim() == "ready" {
+                break;
+            }
+        }
+        let files: Vec<_> = ["state.vscdb", "state.vscdb-wal", "state.vscdb-shm"]
+            .map(|name| {
+                let p = dir.join(name);
+                let b = std::fs::read(&p).unwrap();
+                (p, b)
+            })
+            .into();
+        let source = DevinDesktopNativeReference {
+            path: path.clone(),
+            location: DevinDesktopLocation::StateDatabase,
+        };
+        assert_eq!(load_native(&source).await.unwrap().0, "fixture-wal-key");
+        for (p, bytes) in &files {
+            assert_eq!(std::fs::read(p).unwrap(), *bytes);
+        }
+        let link = dir.join("linked.vscdb");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(
+            load_native(&DevinDesktopNativeReference {
+                path: link,
+                ..source.clone()
+            })
+            .await
+            .is_err()
+        );
+        owner.stdin.take();
+        owner.wait().unwrap();
+        std::fs::write(dir.join("state.vscdb-wal"), b"malformed").unwrap();
+        assert!(load_native(&source).await.is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn parse(plan: Value) -> Result<ProviderUsage, ProviderError> {
         parse_usage(

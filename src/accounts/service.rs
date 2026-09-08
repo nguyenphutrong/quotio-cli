@@ -207,6 +207,10 @@ async fn validate_credential(
             Some(endpoint) => AmpApiProvider.fetch_api(&ctx, endpoint).await?,
             None => AmpApiProvider.fetch(&ctx).await?,
         },
+        Provider::Catalog("devin-desktop") if endpoint_override.is_some() => {
+            crate::providers::catalog::devin_desktop::fetch_at(&ctx, endpoint_override.unwrap())
+                .await?
+        }
         Provider::Catalog("cursor") if endpoint_override.is_some() => {
             let endpoint = endpoint_override.unwrap();
             crate::providers::catalog::oauth_editors::fetch_cursor_complete_at(
@@ -503,6 +507,7 @@ pub fn default_label(
         | Credential::ClaudeNative { .. }
         | Credential::CopilotNative { .. }
         | Credential::GrokNative { .. }
+        | Credential::DevinDesktopNative { .. }
         | Credential::FactoryNative { .. }
         | Credential::CursorNative { .. } => Err(AccountError::Input),
         Credential::GrokOAuth { .. } => Ok("Grok owned account".into()),
@@ -747,6 +752,7 @@ impl ProviderAdapter for ManagedProvider {
                 | Credential::ClaudeNative { .. }
                 | Credential::CopilotNative { .. }
                 | Credential::GrokNative { .. }
+                | Credential::DevinDesktopNative { .. }
                 | Credential::FactoryNative { .. }
                 | Credential::CursorNative { .. } => serde_json::to_string(
                     &account
@@ -867,6 +873,7 @@ async fn local_sources(requested: &[Provider], timeout: std::time::Duration) -> 
         (Provider::Catalog("cursor"), "CURSOR_ACCESS_TOKEN"),
         (Provider::Catalog("claude"), "CLAUDE_OAUTH_ACCESS_TOKEN"),
         (Provider::Catalog("copilot"), "COPILOT_API_TOKEN"),
+        (Provider::Catalog("devin-desktop"), "DEVIN_DESKTOP_API_KEY"),
     ] {
         if requested.contains(&provider) && std::env::var_os(token).is_some() {
             sources.push(provider);
@@ -941,6 +948,10 @@ pub(crate) fn uses_native_amp_source() -> bool {
 }
 pub(crate) fn native_reference_replaces_local(provider: Provider, credential: &Credential) -> bool {
     match credential {
+        Credential::DevinDesktopNative { .. } => {
+            provider == Provider::Catalog("devin-desktop")
+                && std::env::var_os("DEVIN_DESKTOP_API_KEY").is_none()
+        }
         Credential::FactoryNative { .. } => {
             provider == Provider::Factory && std::env::var_os("FACTORY_API_KEY").is_none()
         }
@@ -1050,7 +1061,9 @@ async fn adapters_with_vault(
                     Provider::Codex
                         | Provider::Factory
                         | Provider::Amp
-                        | Provider::Catalog("cursor" | "grok" | "claude" | "copilot")
+                        | Provider::Catalog(
+                            "cursor" | "grok" | "claude" | "copilot" | "devin-desktop"
+                        )
                 )
             })
         {
@@ -1271,12 +1284,14 @@ mod tests {
                 .env("QUOTIO_SELECTION_FIXTURE", &dir)
                 .env_remove("CLAUDE_OAUTH_ACCESS_TOKEN")
                 .env_remove("COPILOT_API_TOKEN")
-                .env_remove("FACTORY_API_KEY");
+                .env_remove("FACTORY_API_KEY")
+                .env_remove("DEVIN_DESKTOP_API_KEY");
             if independent {
                 command
                     .env("CLAUDE_OAUTH_ACCESS_TOKEN", "independent-claude-fixture")
                     .env("COPILOT_API_TOKEN", "independent-copilot-fixture")
-                    .env("FACTORY_API_KEY", "independent-factory-fixture");
+                    .env("FACTORY_API_KEY", "independent-factory-fixture")
+                    .env("DEVIN_DESKTOP_API_KEY", "independent-desktop-fixture");
             }
             let output = command.output().unwrap();
             assert!(
@@ -1298,6 +1313,16 @@ mod tests {
         let missing = dir.join("missing-native-credentials");
         assert!(!missing.exists());
         for (provider, token, credential) in [
+            (
+                Provider::Catalog("devin-desktop"),
+                "DEVIN_DESKTOP_API_KEY",
+                Credential::DevinDesktopNative {
+                    source: super::super::sources::DevinDesktopNativeReference {
+                        path: missing.clone(),
+                        location: super::super::sources::DevinDesktopLocation::CredentialsToml,
+                    },
+                },
+            ),
             (
                 Provider::Factory,
                 "FACTORY_API_KEY",
@@ -1391,6 +1416,114 @@ mod tests {
         assert!(native_amp_selection(false, Some("invalid-url")));
         assert!(!native_amp_selection(true, None));
         assert!(!native_amp_selection(false, Some("https://custom.example")));
+    }
+    #[tokio::test]
+    async fn devin_desktop_native_http_fences_rotation_disable_and_owner_refresh() {
+        struct HttpQuota(String);
+        impl Operations for HttpQuota {
+            fn quota<'a>(
+                &'a self,
+                c: &'a ProviderContext,
+                p: Provider,
+                k: &'a Credential,
+            ) -> OperationFuture<'a, ProviderUsage> {
+                Box::pin(validate_with_endpoint(c, p, k, Some(&self.0)))
+            }
+            fn refresh<'a>(
+                &'a self,
+                _: &'a ProviderContext,
+                _: &'a Credential,
+            ) -> OperationFuture<'a, Credential> {
+                panic!("borrowed credentials must never refresh")
+            }
+        }
+        for status in [200, 401, 403] {
+            for rotate in [false, true] {
+                let dir = std::env::temp_dir().join(random_string().unwrap());
+                std::fs::create_dir(&dir).unwrap();
+                let path = dir.join("credentials.toml");
+                let original = b"windsurf_api_key = 'fixture-first'\n";
+                std::fs::write(&path, original).unwrap();
+                let credential = Credential::DevinDesktopNative {
+                    source: super::super::sources::DevinDesktopNativeReference {
+                        path: path.clone(),
+                        location: super::super::sources::DevinDesktopLocation::CredentialsToml,
+                    },
+                };
+                let vault = Vault::new(Arc::new(Memory::default()), dir.join("lock"));
+                let mut tx = vault.begin().unwrap();
+                let id = tx
+                    .document
+                    .add(
+                        Provider::Catalog("devin-desktop"),
+                        "Fixture",
+                        "source".into(),
+                        credential.clone(),
+                    )
+                    .unwrap();
+                let account = tx.document.accounts[0].clone();
+                assert_eq!(
+                    account.origin(),
+                    crate::domain::AccountOrigin::BorrowedNative
+                );
+                assert!(
+                    !serde_json::to_string(&tx.document)
+                        .unwrap()
+                        .contains("fixture-first")
+                );
+                tx.commit().unwrap();
+                let adapter = super::managed(&vault, &account);
+                let context = http::fixture::context();
+                let before = adapter.cache_identity(&context).await.unwrap();
+                let changed = path.clone();
+                let (endpoint, server) = http::fixture::server_status_with_action(
+                    vec![(
+                        status,
+                        serde_json::json!({"userStatus":{"planStatus":{"dailyQuotaRemainingPercent":50}}}),
+                    )],
+                    move |_| {
+                        if rotate {
+                            std::fs::write(&changed, b"windsurf_api_key = 'fixture-second'\n")
+                                .unwrap();
+                        }
+                    },
+                )
+                .await;
+                let reader = ManagedProvider {
+                    factory_oauth: false,
+                    origin: account.origin(),
+                    label: account.label.clone(),
+                    operations: Arc::new(HttpQuota(endpoint)),
+                    vault: vault.clone(),
+                    id: id.clone(),
+                    provider: Provider::Catalog("devin-desktop"),
+                    provider_id: ProviderId("devin-desktop".into()),
+                };
+                let result = reader.fetch(&context).await;
+                if status == 401 || status == 403 {
+                    assert!(matches!(result, Err(ProviderError::OwnerRefreshRequired)));
+                } else if rotate {
+                    assert!(matches!(result, Err(ProviderError::Transient)));
+                } else {
+                    assert!(result.is_ok());
+                }
+                let requests = server.await.unwrap();
+                assert_eq!(requests.len(), 1);
+                assert!(requests[0].starts_with("POST ") && requests[0].contains("fixture-first"));
+                if rotate {
+                    assert_ne!(adapter.cache_identity(&context).await.unwrap(), before);
+                } else {
+                    assert_eq!(std::fs::read(&path).unwrap(), original);
+                }
+                patch(vault, id, None, None, Some(false)).await.unwrap();
+                assert!(adapter.cache_identity(&context).await.is_none());
+                assert!(matches!(
+                    adapter.fetch(&context).await,
+                    Err(ProviderError::SourceDisabled)
+                ));
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
     }
     #[tokio::test]
     async fn factory_native_http_fences_rotation_disable_and_owner_refresh() {

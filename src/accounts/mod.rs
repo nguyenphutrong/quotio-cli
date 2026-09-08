@@ -62,6 +62,9 @@ pub enum AccountError {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Credential {
+    DevinDesktopNative {
+        source: sources::DevinDesktopNativeReference,
+    },
     FactoryNative {
         source: sources::FactoryNativeReference,
     },
@@ -155,6 +158,7 @@ impl Account {
         match self.credential {
             Credential::QuotioCustomProvider { .. } => AccountOrigin::BorrowedProxy,
             Credential::AmpNative { .. }
+            | Credential::DevinDesktopNative { .. }
             | Credential::FactoryNative { .. }
             | Credential::CopilotNative { .. }
             | Credential::ClaudeNative { .. }
@@ -220,6 +224,7 @@ impl Document {
             credential,
             Credential::QuotioCustomProvider { .. }
                 | Credential::AmpNative { .. }
+                | Credential::DevinDesktopNative { .. }
                 | Credential::FactoryNative { .. }
                 | Credential::ClaudeNative { .. }
                 | Credential::CopilotNative { .. }

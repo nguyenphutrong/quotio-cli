@@ -1,5 +1,5 @@
 use super::{AuthKind, Definition, common};
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use crate::providers::process;
 use crate::{
     domain::{ProviderUsage, Quota, QuotaWindow, UsageDiagnostic},
@@ -13,10 +13,10 @@ use std::{
     time::Duration,
 };
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::process::Stdio;
 use time::OffsetDateTime;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use tokio::{
     io::{AsyncReadExt, BufReader},
     process::Command,
@@ -33,10 +33,10 @@ const CURSOR_KEYCHAIN_SERVICE: &str = "cursor-access-token";
 const CURSOR_STATE_QUERY: &str =
     "SELECT value FROM ItemTable WHERE key = 'cursorAuth/accessToken' LIMIT 1;";
 const MAX_NATIVE_FILE_BYTES: u64 = 1024 * 1024;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 const MAX_CURSOR_DATABASE_BYTES: u64 = 64 * 1024 * 1024;
 const NATIVE_READ_TIMEOUT: Duration = Duration::from_secs(1);
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 const CURSOR_SQLITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub const DEFINITIONS: &[Definition] = &[
@@ -659,13 +659,13 @@ async fn cursor_token(context: &ProviderContext) -> Result<Secret, ProviderError
     secret_from_bytes(&bytes)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 struct CursorDatabase {
     directory: PathBuf,
     sources: Vec<(PathBuf, Option<std::fs::Metadata>)>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 impl Drop for CursorDatabase {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.directory);
@@ -694,7 +694,7 @@ async fn cursor_sqlite_output(database: &CursorDatabase) -> Result<Vec<u8>, Prov
     cursor_sqlite_query(database, CURSOR_STATE_QUERY).await
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 async fn cursor_sqlite_query(
     database: &CursorDatabase,
     query: &'static str,
@@ -774,17 +774,35 @@ pub(crate) struct CursorLogin {
 
 #[cfg(target_os = "macos")]
 pub(crate) async fn cursor_login(path: PathBuf) -> Result<CursorLogin, ProviderError> {
+    let query = "SELECT json_group_array(json_object('key',key,'value',value)) FROM ItemTable WHERE key IN ('cursorAuth/accessToken','cursorAuth/cachedEmail','cursorAuth/stripeMembershipType','cursorAuth/stripeSubscriptionStatus');";
+    let bytes = native_sqlite_rows(path, query).await?;
+    cursor_login_from_output(&bytes)
+}
+
+// Only fixed provider queries may call this reader. SQLite sees private copies only.
+#[cfg(unix)]
+pub(super) async fn native_sqlite_rows(
+    path: PathBuf,
+    query: &'static str,
+) -> Result<Vec<u8>, ProviderError> {
     let Some(database) = blocking(move || open_cursor_database(&path)).await? else {
         return Err(ProviderError::CredentialStorage);
     };
-    let query = "SELECT json_group_array(json_object('key',key,'value',value)) FROM ItemTable WHERE key IN ('cursorAuth/accessToken','cursorAuth/cachedEmail','cursorAuth/stripeMembershipType','cursorAuth/stripeSubscriptionStatus');";
     let bytes = tokio::time::timeout(CURSOR_SQLITE_TIMEOUT, cursor_sqlite_query(&database, query))
         .await
         .map_err(|_| ProviderError::Timeout)??;
     if !blocking(move || cursor_database_remains_safe(&database)).await? {
         return Err(ProviderError::CredentialStorage);
     }
-    cursor_login_from_output(&bytes)
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+pub(super) async fn native_sqlite_rows(
+    _: PathBuf,
+    _: &'static str,
+) -> Result<Vec<u8>, ProviderError> {
+    Err(ProviderError::Unavailable)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -829,12 +847,12 @@ fn cursor_login_from_output(bytes: &[u8]) -> Result<CursorLogin, ProviderError> 
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn open_cursor_database(path: &Path) -> Result<Option<CursorDatabase>, ProviderError> {
     open_cursor_database_with_hooks(path, || {}, || {})
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn open_cursor_database_with_hooks(
     path: &Path,
     after_capture: impl FnOnce(),
@@ -952,7 +970,7 @@ fn open_cursor_database_with_hooks(
     Ok(Some(snapshot))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn cursor_same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     a.dev() == b.dev()
@@ -964,7 +982,7 @@ fn cursor_same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
         && a.ctime_nsec() == b.ctime_nsec()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn cursor_database_remains_safe(database: &CursorDatabase) -> Result<bool, ProviderError> {
     for (path, before) in &database.sources {
         let after = regular_file(path, MAX_CURSOR_DATABASE_BYTES)?;
@@ -977,7 +995,7 @@ fn cursor_database_remains_safe(database: &CursorDatabase) -> Result<bool, Provi
     Ok(true)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn cursor_validate_wal(bytes: &[u8], page_size: usize) -> Result<usize, ProviderError> {
     // SQLite silently ignores invalid WAL headers. Reject them rather than returning
     // stale credentials from the main database. Frame recovery still belongs to SQLite.
@@ -1220,7 +1238,7 @@ fn regular_file(
     Ok(Some(metadata))
 }
 
-fn read_regular_file(path: &Path, maximum_bytes: u64) -> Result<Vec<u8>, ProviderError> {
+pub(super) fn read_regular_file(path: &Path, maximum_bytes: u64) -> Result<Vec<u8>, ProviderError> {
     let before = regular_file(path, maximum_bytes)?.ok_or(ProviderError::Authentication)?;
     let file = open_readonly_file(path)?;
     let opened = file

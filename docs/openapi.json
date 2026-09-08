@@ -2053,6 +2053,7 @@
             "type": "string",
             "enum": [
               "grok_native",
+              "devin_desktop_native",
               "factory_native",
               "cursor_native",
               "amp_native",
@@ -2176,7 +2177,8 @@
                     "copilot_native",
                     "cursor_native",
                     "grok_native",
-                    "factory_native"
+                    "factory_native",
+                    "devin_desktop_native"
                   ]
                 },
                 "platforms": {
@@ -2736,6 +2738,7 @@
       },
       "AccountSourceInput": {
         "oneOf": [
+          {"$ref": "#/components/schemas/DevinDesktopNativeInput"},
           {"$ref": "#/components/schemas/FactoryNativeInput"},
           {
             "type": "object",
@@ -2864,6 +2867,16 @@
             "additionalProperties": false
           }
         ]
+      },
+      "DevinDesktopNativeInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "location"],
+        "properties": {
+          "kind": {"const": "devin_desktop_native"},
+          "location": {"enum": ["credentials_toml", "state_database"]}
+        },
+        "description": "Read-only reference to exactly one fixed Devin Desktop source. credentials_toml reads ~/.local/share/devin/credentials.toml. state_database reads ~/Library/Application Support/Devin/User/globalStorage/state.vscdb on macOS or ~/.config/Devin/User/globalStorage/state.vscdb on Linux. No fallback, custom path, credential copy or refresh. Explicit api_server_url values other than https://server.codeium.com (with optional trailing slash) are rejected. The separate devin organization account is unchanged."
       },
       "FactoryNativeInput": {
         "type": "object",

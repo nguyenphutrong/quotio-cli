@@ -170,6 +170,13 @@ pub fn capability(provider: Provider) -> ProviderCapability {
                 origin: "borrowed_proxy",
                 credential_refresh: false,
             }]
+        } else if provider == Provider::Catalog("devin-desktop") {
+            vec![SourceCapability {
+                kind: "devin_desktop_native",
+                platforms: vec!["macos", "linux"],
+                origin: "borrowed_native",
+                credential_refresh: false,
+            }]
         } else if provider == Provider::Factory {
             vec![SourceCapability {
                 kind: "factory_native",

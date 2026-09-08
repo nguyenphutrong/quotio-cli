@@ -26,6 +26,7 @@ impl From<&super::Account> for AccountDto {
             enabled: account.enabled(),
             source_kind: match account.credential {
                 Credential::GrokNative { .. } => Some("grok_native"),
+                Credential::DevinDesktopNative { .. } => Some("devin_desktop_native"),
                 Credential::FactoryNative { .. } => Some("factory_native"),
                 Credential::CursorNative { .. } => Some("cursor_native"),
                 Credential::AmpNative { .. } => Some("amp_native"),
@@ -199,6 +200,9 @@ pub struct PreparedAccount {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceInput {
+    DevinDesktopNative {
+        location: super::sources::DevinDesktopLocation,
+    },
     FactoryNative {
         location: super::sources::FactoryLocation,
     },
@@ -224,6 +228,15 @@ pub enum SourceInput {
 }
 pub async fn prepare_source(input: SourceInput) -> Result<PreparedAccount, AccountError> {
     let (identity, credential, resolved) = match input {
+        SourceInput::DevinDesktopNative { location } => {
+            let source = super::sources::DevinDesktopNativeReference::system(location)?;
+            let resolved = source.resolve().await?;
+            (
+                source.identity()?,
+                Credential::DevinDesktopNative { source },
+                resolved,
+            )
+        }
         SourceInput::FactoryNative { location } => {
             let source = super::sources::FactoryNativeReference::system(location)?;
             let resolved = source.resolve().await?;
@@ -476,6 +489,92 @@ mod tests {
         assert_eq!(account.provider, Provider::Amp);
         assert_eq!(account.label, "saved");
         assert!(account.active);
+    }
+
+    #[test]
+    fn devin_desktop_source_registration_isolated() {
+        let dir = std::env::temp_dir().join(crate::accounts::random_string().unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "accounts::api::tests::devin_desktop_source_registration_child",
+                "--nocapture",
+            ])
+            .env("HOME", &dir)
+            .env("QUOTIO_DEVIN_SOURCE_FIXTURE", &dir)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn devin_desktop_source_registration_child() {
+        let Some(dir) = std::env::var_os("QUOTIO_DEVIN_SOURCE_FIXTURE") else {
+            return;
+        };
+        use crate::accounts::{
+            sources::{DevinDesktopLocation, DevinDesktopNativeReference},
+            vault::tests::Memory,
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let vault = Vault::new(
+            std::sync::Arc::new(Memory::default()),
+            dir.join("vault.lock"),
+        );
+        for location in [
+            DevinDesktopLocation::CredentialsToml,
+            DevinDesktopLocation::StateDatabase,
+        ] {
+            let source = DevinDesktopNativeReference::system(location).unwrap();
+            assert!(source.path.starts_with(&dir));
+            std::fs::create_dir_all(source.path.parent().unwrap()).unwrap();
+            match location {
+                DevinDesktopLocation::CredentialsToml => {
+                    std::fs::write(&source.path, "windsurf_api_key='fixture-registration-key'")
+                        .unwrap()
+                }
+                DevinDesktopLocation::StateDatabase => {
+                    let output = std::process::Command::new("/usr/bin/sqlite3").args(["-init", "/dev/null"])
+                        .arg(&source.path).arg("CREATE TABLE ItemTable(key TEXT, value TEXT); INSERT INTO ItemTable VALUES('windsurfAuthStatus','{\"apiKey\":\"fixture-registration-key\"}');").output().unwrap();
+                    assert!(output.status.success());
+                }
+            }
+            let before = std::fs::read(&source.path).unwrap();
+            let prepared = prepare_source(SourceInput::DevinDesktopNative { location })
+                .await
+                .unwrap();
+            assert_eq!(prepared.identity, source.identity().unwrap());
+            let account = save(vault.clone(), prepared).await.unwrap();
+            assert_eq!(account.provider, Provider::Catalog("devin-desktop"));
+            assert_eq!(account.source_kind, Some("devin_desktop_native"));
+            let serialized = serde_json::to_string(&account).unwrap();
+            assert!(!serialized.contains("fixture-registration-key"));
+            assert!(!serialized.contains(source.path.to_str().unwrap()));
+            assert_eq!(std::fs::read(&source.path).unwrap(), before);
+        }
+        assert_eq!(list(vault).await.unwrap().len(), 2);
+        for location in ["credentials_toml", "state_database"] {
+            let base = serde_json::json!({"kind":"devin_desktop_native", "location":location});
+            assert!(serde_json::from_value::<SourceInput>(base.clone()).is_ok());
+            for field in ["path", "source", "api_key", "api_server_url", "provider"] {
+                let mut bad = base.clone();
+                bad[field] = serde_json::json!("untrusted");
+                assert!(serde_json::from_value::<SourceInput>(bad).is_err());
+            }
+        }
+        for value in [
+            serde_json::json!({"kind":"devin_desktop_native"}),
+            serde_json::json!({"kind":"devin_desktop_native", "location":"other"}),
+        ] {
+            assert!(serde_json::from_value::<SourceInput>(value).is_err());
+        }
     }
 
     #[tokio::test]

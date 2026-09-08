@@ -237,6 +237,78 @@ impl FactoryNativeReference {
     }
 }
 
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DevinDesktopLocation {
+    CredentialsToml,
+    StateDatabase,
+}
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DevinDesktopNativeReference {
+    pub path: std::path::PathBuf,
+    pub location: DevinDesktopLocation,
+}
+impl DevinDesktopNativeReference {
+    pub fn system(location: DevinDesktopLocation) -> Result<Self, AccountError> {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .ok_or(AccountError::NotFound)?;
+        let relative = match location {
+            DevinDesktopLocation::CredentialsToml => ".local/share/devin/credentials.toml",
+            DevinDesktopLocation::StateDatabase if cfg!(target_os = "macos") => {
+                "Library/Application Support/Devin/User/globalStorage/state.vscdb"
+            }
+            DevinDesktopLocation::StateDatabase if cfg!(target_os = "linux") => {
+                ".config/Devin/User/globalStorage/state.vscdb"
+            }
+            _ => return Err(AccountError::Unsupported),
+        };
+        let source = Self {
+            path: home.join(relative),
+            location,
+        };
+        source.identity()?;
+        Ok(source)
+    }
+    pub fn identity(&self) -> Result<String, AccountError> {
+        if !self.path.is_absolute()
+            || self
+                .path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(AccountError::Input);
+        }
+        Ok(crate::cache::fingerprint(&[
+            "devin_desktop_native",
+            self.path.to_str().ok_or(AccountError::Input)?,
+            match self.location {
+                DevinDesktopLocation::CredentialsToml => "credentials_toml",
+                DevinDesktopLocation::StateDatabase => "state_database",
+            },
+        ]))
+    }
+    pub async fn resolve(&self) -> Result<Resolved, AccountError> {
+        self.identity()?;
+        let token = crate::providers::catalog::devin_desktop::load_native(self).await?;
+        Ok(Resolved {
+            label: match self.location {
+                DevinDesktopLocation::CredentialsToml => "Devin Desktop credentials.toml",
+                DevinDesktopLocation::StateDatabase => "Devin Desktop state.vscdb",
+            }
+            .into(),
+            provider: crate::cli::Provider::Catalog("devin-desktop"),
+            plan: None,
+            subscription_status: None,
+            credentials: vec![Credential::CatalogKey {
+                token: token.0,
+                settings: Default::default(),
+            }],
+        })
+    }
+}
+
 fn enabled_default() -> bool {
     true
 }
@@ -477,6 +549,11 @@ impl Credential {
         provider: crate::cli::Provider,
     ) -> Result<Option<Resolved>, AccountError> {
         match self {
+            Self::DevinDesktopNative { source }
+                if provider == crate::cli::Provider::Catalog("devin-desktop") =>
+            {
+                source.resolve().await.map(Some)
+            }
             Self::FactoryNative { source } if provider == crate::cli::Provider::Factory => {
                 source.resolve().await.map(Some)
             }
@@ -517,6 +594,7 @@ impl Credential {
                 source.resolve().await.map(Some)
             }
             Self::QuotioCustomProvider { .. }
+            | Self::DevinDesktopNative { .. }
             | Self::FactoryNative { .. }
             | Self::CodexNative { .. }
             | Self::ClaudeNative { .. }
