@@ -627,7 +627,7 @@ mod tests {
         let source = super::super::sources::KiroNativeReference::system().unwrap();
         assert_eq!(source.path, dir.join(".aws/sso/cache/kiro-auth-token.json"));
         std::fs::create_dir_all(source.path.parent().unwrap()).unwrap();
-        let bytes = br#"{"accessToken":"fixture-access","refreshToken":"owner-only","clientId":"fixture-client","profileArn":"arn:aws:codewhisperer:eu-west-1:123:profile/test"}"#;
+        let bytes = br#"{"accessToken":"fixture-access","refreshToken":"owner-only","clientId":"fixture-client","profileArn":"arn:aws:codewhisperer:eu-west-1:123456789012:profile/test"}"#;
         std::fs::write(&source.path, bytes).unwrap();
         #[cfg(unix)]
         {

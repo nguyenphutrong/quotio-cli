@@ -431,15 +431,8 @@ pub(crate) async fn refresh_kiro_at(
     else {
         return Err(AccountError::Unsupported);
     };
-    if !valid_kiro_region(region) || region.len() > 64 {
-        return Err(AccountError::Input);
-    }
+    let endpoint = kiro_refresh_destination(*auth_method, region)?;
     let social = *auth_method == KiroAuthMethod::Social;
-    let endpoint = if social {
-        format!("https://prod.{region}.auth.desktop.kiro.dev/refreshToken")
-    } else {
-        format!("https://oidc.{region}.amazonaws.com/token")
-    };
     let mut body = serde_json::json!({"refreshToken": refresh_token});
     if !social {
         body["clientId"] = client_id
@@ -515,15 +508,44 @@ fn valid_kiro_region(value: &str) -> bool {
             .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
+fn kiro_refresh_destination(
+    method: crate::accounts::KiroAuthMethod,
+    region: &str,
+) -> Result<String, crate::accounts::AccountError> {
+    if !valid_kiro_region(region) || region.len() > 64 {
+        return Err(crate::accounts::AccountError::Input);
+    }
+    Ok(match method {
+        crate::accounts::KiroAuthMethod::Social => {
+            format!("https://prod.{region}.auth.desktop.kiro.dev/refreshToken")
+        }
+        crate::accounts::KiroAuthMethod::IdC => {
+            format!("https://oidc.{region}.amazonaws.com/token")
+        }
+    })
+}
+
 fn profile_region(profile: &str) -> Result<Option<String>, ProviderError> {
     let parts: Vec<_> = profile.split(':').collect();
-    if parts.len() >= 4 && parts[0] == "arn" && parts[2] == "codewhisperer" {
-        if !valid_kiro_region(parts[3]) {
-            return Err(ProviderError::InvalidData);
-        }
-        return Ok(Some(parts[3].to_owned()));
+    if parts.len() != 6
+        || parts[0] != "arn"
+        || parts[1] != "aws"
+        || parts[2] != "codewhisperer"
+        || !valid_kiro_region(parts[3])
+        || parts[3].starts_with("cn-")
+        || parts[3].starts_with("us-gov-")
+        || parts[4].len() != 12
+        || !parts[4].bytes().all(|byte| byte.is_ascii_digit())
+        || !parts[5].strip_prefix("profile/").is_some_and(|id| {
+            !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+    {
+        return Err(ProviderError::InvalidData);
     }
-    Ok(None)
+    Ok(Some(parts[3].to_owned()))
 }
 
 fn kiro_metadata(
@@ -1506,7 +1528,7 @@ mod tests {
             "refreshToken": "refresh",
             "clientId": "client",
             "clientSecret": "secret",
-            "profileArn": "arn:aws:codewhisperer:ap-northeast-2:123:profile/test",
+            "profileArn": "arn:aws:codewhisperer:ap-northeast-2:123456789012:profile/test",
             "expiresAt": "2030-01-01T00:00:00Z"
         }))
         .unwrap();
@@ -1611,7 +1633,7 @@ mod tests {
             &format!("{base}/getUsageLimits"),
             &token(),
             "ap-northeast-2",
-            Some("arn:aws:codewhisperer:ap-northeast-2:123:profile/test"),
+            Some("arn:aws:codewhisperer:ap-northeast-2:123456789012:profile/test"),
             true,
             "fixture-machine",
         )
@@ -1721,6 +1743,46 @@ mod tests {
                 .is_err()
             );
             assert_eq!(server.await.unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn kiro_refresh_destinations_are_exact() {
+        use crate::accounts::KiroAuthMethod::{IdC, Social};
+        for region in ["us-east-1", "eu-west-1", "ap-northeast-2"] {
+            for (method, expected) in [
+                (
+                    Social,
+                    format!("https://prod.{region}.auth.desktop.kiro.dev/refreshToken"),
+                ),
+                (IdC, format!("https://oidc.{region}.amazonaws.com/token")),
+            ] {
+                assert_eq!(kiro_refresh_destination(method, region).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn kiro_profile_arn_requires_complete_supported_aws_resource() {
+        let valid = "arn:aws:codewhisperer:us-east-1:123456789012:profile/test-123";
+        assert_eq!(profile_region(valid).unwrap().as_deref(), Some("us-east-1"));
+        for invalid in [
+            "arn:aws:codewhisperer:us-east-1",
+            "arn:attacker:codewhisperer:us-east-1:123456789012:profile/test",
+            "arn:aws-cn:codewhisperer:cn-north-1:123456789012:profile/test",
+            "arn:aws:codewhisperer:cn-north-1:123456789012:profile/test",
+            "arn:aws-us-gov:codewhisperer:us-gov-west-1:123456789012:profile/test",
+            "arn:aws:codewhisperer:us-east-1::profile/test",
+            "arn:aws:codewhisperer:us-east-1:123:profile/test",
+            "arn:aws:codewhisperer:us-east-1:12345678901a:profile/test",
+            "arn:aws:codewhisperer:us-east-1:123456789012:other/test",
+            "arn:aws:codewhisperer:us-east-1:123456789012:profile/",
+            "arn:aws:codewhisperer:us-east-1:123456789012:profile/a/b",
+            "arn:aws:codewhisperer:us-east-1:123456789012:profile/a:extra",
+        ] {
+            assert!(profile_region(invalid).is_err(), "accepted {invalid}");
+            let input = serde_json::from_value(json!({"kind":"kiro_owned", "label":"Kiro", "access_token":"access", "refresh_token":"refresh", "expires_at":0, "authMethod":"Social", "region":"us-east-1", "profileArn": invalid})).unwrap();
+            assert!(kiro_owned_credential(input).is_err());
         }
     }
 
