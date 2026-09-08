@@ -86,7 +86,7 @@ async fn run() -> ExitCode {
         }
         Err(_) => {
             // Clap's default diagnostics echo input, which may accidentally be a secret.
-            eprintln!("Invalid arguments. Run quotio --help or quotio usage --help.");
+            eprintln!("Invalid arguments. Run quotio --help or quotio <command> --help.");
             return ExitCode::from(2);
         }
     };
@@ -95,8 +95,58 @@ async fn run() -> ExitCode {
             piv_envelope,
             piv_fingerprint,
             stage_dir,
+            metadata,
+            account_id,
+            provider,
+            source,
+            credential_reference,
+            service,
         } => {
             let result = (|| {
+                if let Some(metadata) = metadata {
+                    #[cfg(unix)]
+                    {
+                        use quotio::accounts::staging::{
+                            Mapping, StagingError, assess_mapping, stage_mapping,
+                        };
+                        let mapping = Mapping {
+                            account_id: account_id.as_deref().ok_or(StagingError::Mapping)?,
+                            provider: provider.as_deref().ok_or(StagingError::Mapping)?,
+                            source: source.as_deref().ok_or(StagingError::Mapping)?,
+                            credential_reference: Some(
+                                credential_reference
+                                    .as_deref()
+                                    .ok_or(StagingError::Mapping)?,
+                            ),
+                            service: service.as_deref().ok_or(StagingError::Mapping)?,
+                        };
+                        let assessment =
+                            assess_mapping(&metadata, &piv_envelope, &piv_fingerprint, &mapping)?;
+                        let receipt_id = stage_dir
+                            .as_deref()
+                            .map(|dir| stage_mapping(&assessment, dir))
+                            .transpose()?;
+                        return Ok(serde_json::json!({
+                            "plan": assessment.plan(),
+                            "receipt_id": receipt_id,
+                            "credentials_staged": false,
+                            "encrypted_artifacts_staged": stage_dir.is_some(),
+                            "accounts_imported": 0
+                        }));
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = (
+                            metadata,
+                            account_id,
+                            provider,
+                            source,
+                            credential_reference,
+                            service,
+                        );
+                        return Err(quotio::accounts::staging::StagingError::Unsupported);
+                    }
+                }
                 let plan = quotio::accounts::staging::assess(&piv_envelope, &piv_fingerprint)?;
                 let receipt_id = stage_dir
                     .as_deref()

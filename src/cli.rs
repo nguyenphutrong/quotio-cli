@@ -19,9 +19,27 @@ pub enum Command {
         /// Selected key fingerprint from Swift settings; not verified against hardware
         #[arg(long)]
         piv_fingerprint: String,
-        /// Save only an immutable assessment receipt in an existing private directory
+        /// Save assessment artifacts without replacement in an existing private directory
         #[arg(long)]
         stage_dir: Option<PathBuf>,
+        /// Explicit Swift metadata file; all mapping declarations are required together
+        #[arg(long, requires_all = ["account_id", "provider", "source", "credential_reference", "service"])]
+        metadata: Option<PathBuf>,
+        /// Exact Swift account ID (not a CLI account ID)
+        #[arg(long, requires = "metadata")]
+        account_id: Option<String>,
+        /// Exact Swift provider identifier
+        #[arg(long, requires = "metadata")]
+        provider: Option<String>,
+        /// Owned Swift source: quotioKeychain or apiKey
+        #[arg(long, requires = "metadata")]
+        source: Option<String>,
+        /// Exact credential reference; currently only keychain is supported
+        #[arg(long, requires = "metadata")]
+        credential_reference: Option<String>,
+        /// Explicit production or legacy Swift monitor-auth service
+        #[arg(long, requires = "metadata")]
+        service: Option<String>,
     },
     /// Add, select, list or remove accounts managed by Quotio
     Accounts(AccountsArgs),

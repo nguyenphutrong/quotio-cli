@@ -57,8 +57,9 @@ mistake it for a receipt. Receipt staging on other platforms is not supported.
 
 ## Explicit metadata and encrypted-file staging API
 
-The Unix library also provides `assess_mapping` and `stage_mapping`. These are not
-yet exposed by CLI flags. The existing command above remains receipt-only.
+On Unix, `migration-inspect` also accepts an explicit metadata mapping using the
+library's `assess_mapping` and `stage_mapping` operations. Without mapping flags,
+the command above remains receipt-only.
 
 `assess_mapping(metadata_path, envelope_path, fingerprint, &Mapping)` requires both
 absolute paths and explicit `account_id`, `provider`, `source`,
@@ -130,14 +131,31 @@ directory: it does not promise immutability against the owner or a process that
 can mutate files after the final check. Original
 files remain untouched. PIV encryption is never replaced with a software vault.
 
-### Proposed CLI wiring
+### CLI mapping options
 
-Require all mapping arguments together. Call `assess_mapping` for the dry run and
-serialize `assessment.plan()`. Call `stage_mapping` only with explicit staging
-consent and a supplied private directory. Print only the plan and returned receipt
-ID, report zero imported accounts, and retain blocked exit status 2. The mapping
-functions are Unix-only. Do not send these files to account intake, source
-registration, refresh, activation or hardware APIs.
+All six mapping options must be supplied together, alongside the envelope and
+fingerprint. Use the identifiers from the selected Swift record, not CLI aliases:
+
+```sh
+quotio migration-inspect \
+  --piv-envelope /absolute/path/to/filename-candidate.qsv \
+  --piv-fingerprint SELECTED_64_HEX_FINGERPRINT \
+  --metadata /absolute/path/to/accounts-v1.json \
+  --account-id SELECTED_SWIFT_ACCOUNT_ID \
+  --provider amp \
+  --source quotioKeychain \
+  --credential-reference keychain \
+  --service app.bytrong.quotio.monitor-auth
+```
+
+This is a read-only dry run. Add `--stage-dir /absolute/private/directory` to copy
+metadata, encrypted bytes and the receipt. The envelope's actual filename must
+match the formula above. Output contains only the plan, receipt ID and status
+flags. `encrypted_artifacts_staged` reports the explicit copy; `credentials_staged`
+stays false because no usable credential is unlocked. `accounts_imported` remains
+zero and the exit status remains 2. Invalid or incomplete declarations fail before
+staging. No account intake, source registration, refresh, activation, network,
+Keychain or hardware APIs are called.
 
 ## Remaining migration work
 
