@@ -562,6 +562,7 @@ impl Operations for Network {
     }
 }
 struct ManagedProvider {
+    factory_oauth: bool,
     origin: super::AccountOrigin,
     label: String,
     operations: Arc<dyn Operations>,
@@ -778,7 +779,8 @@ impl ProviderAdapter for ManagedProvider {
     }
     fn idempotent(&self) -> bool {
         self.provider != Provider::Codex
-            && !(matches!(self.provider, Provider::Factory | Provider::Catalog("grok"))
+            && !self.factory_oauth
+            && !(self.provider == Provider::Catalog("grok")
                 && self.origin == super::AccountOrigin::Owned)
     }
     fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
@@ -909,6 +911,7 @@ async fn local_sources(requested: &[Provider], timeout: std::time::Duration) -> 
 }
 fn managed(vault: &Vault, account: &Account) -> Arc<dyn ProviderAdapter> {
     Arc::new(ManagedProvider {
+        factory_oauth: matches!(account.credential, Credential::FactoryOAuth { .. }),
         origin: account.origin(),
         label: account.label.clone(),
         operations: Arc::new(Network),
@@ -1462,6 +1465,7 @@ mod tests {
                 )
                 .await;
                 let reader = ManagedProvider {
+                    factory_oauth: false,
                     origin: account.origin(),
                     label: account.label.clone(),
                     operations: Arc::new(HttpQuota(endpoint)),
@@ -1685,6 +1689,7 @@ mod tests {
                 assert_eq!(usage.account.id, "fixture-account");
                 assert_eq!(std::fs::read(&path).unwrap(), original);
                 let managed = ManagedProvider {
+                    factory_oauth: false,
                     origin: account.origin(),
                     label: account.label.clone(),
                     operations: Arc::new(Network),
@@ -2095,6 +2100,7 @@ mod tests {
                 .unwrap();
             tx.commit().unwrap();
             let adapter = ManagedProvider {
+                factory_oauth: false,
                 origin: super::super::AccountOrigin::BorrowedProxy,
                 label: "Fixture".into(),
                 operations: Arc::new(MutateDuringQuota {
@@ -2176,6 +2182,7 @@ mod tests {
         provider: Provider,
     ) -> ManagedProvider {
         ManagedProvider {
+            factory_oauth: provider == Provider::Factory,
             origin: super::super::AccountOrigin::Owned,
             label: "Test account".into(),
             vault,
@@ -2190,6 +2197,25 @@ mod tests {
             std::fs::remove_file(entry.unwrap().path()).unwrap();
         }
         std::fs::remove_dir(path).unwrap();
+    }
+    #[test]
+    fn factory_saved_api_keys_keep_idempotent_quota_reads() {
+        let (vault, _, _, _, path) = setup(0, false, false, false);
+        let account = Account {
+            id: "fixture".into(),
+            provider: Provider::Factory,
+            label: "API key".into(),
+            identity: "fixture".into(),
+            active: true,
+            enabled: true,
+            credential: Credential::ApiKey {
+                token: "fixture".into(),
+                region: None,
+                organization: None,
+            },
+        };
+        assert!(super::managed(&vault, &account).idempotent());
+        cleanup(path);
     }
     #[tokio::test]
     async fn factory_inflight_refresh_cancellation_and_disable_are_fenced() {
