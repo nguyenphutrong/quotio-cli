@@ -35,17 +35,6 @@ impl VaultNamespace {
     }
 }
 
-fn account_data_directory(
-    explicit: Option<PathBuf>,
-    platform: Option<PathBuf>,
-) -> Result<PathBuf, AccountError> {
-    match explicit {
-        Some(path) if path.is_absolute() => Ok(path),
-        Some(_) => Err(AccountError::Storage),
-        None => platform.ok_or(AccountError::Storage),
-    }
-}
-
 impl FromStr for VaultNamespace {
     type Err = &'static str;
 
@@ -198,23 +187,32 @@ pub struct Transaction {
 }
 impl Vault {
     pub fn system() -> Result<Self, AccountError> {
-        Self::system_with_interaction(true, None)
+        Self::system_with_interaction(true, None, None)
     }
     pub fn for_usage() -> Result<Self, AccountError> {
-        Self::system_with_interaction(false, None)
+        Self::system_with_interaction(false, None, None)
     }
-    pub fn isolated_for_management(namespace: &VaultNamespace) -> Result<Self, AccountError> {
-        Self::system_with_interaction(true, Some(namespace))
+    pub fn isolated_for_management(
+        namespace: &VaultNamespace,
+        data_directory: &std::path::Path,
+    ) -> Result<Self, AccountError> {
+        if !data_directory.is_absolute() {
+            return Err(AccountError::Storage);
+        }
+        Self::system_with_interaction(true, Some(namespace), Some(data_directory.to_owned()))
     }
     fn system_with_interaction(
         _interactive: bool,
         namespace: Option<&VaultNamespace>,
+        isolated_directory: Option<PathBuf>,
     ) -> Result<Self, AccountError> {
-        let directory = account_data_directory(
-            std::env::var_os("QUOTIO_ACCOUNT_DATA_DIR").map(PathBuf::from),
-            directories::ProjectDirs::from("", "", "quotio")
-                .map(|dirs| dirs.data_local_dir().to_owned()),
-        )?;
+        let directory = match (namespace, isolated_directory) {
+            (Some(_), Some(directory)) => directory,
+            (None, None) => directories::ProjectDirs::from("", "", "quotio")
+                .map(|dirs| dirs.data_local_dir().to_owned())
+                .ok_or(AccountError::Storage)?,
+            _ => return Err(AccountError::Storage),
+        };
         #[cfg(target_os = "linux")]
         let backend: Arc<dyn Backend> = match super::encrypted_file::EncryptedFile::from_environment(
             &directory.join(
@@ -816,19 +814,18 @@ pub(crate) mod tests {
         }
     }
     #[test]
-    fn account_data_directory_requires_an_absolute_override() {
-        let platform = PathBuf::from("/platform/accounts");
-        let isolated = PathBuf::from("/isolated/accounts");
-        assert_eq!(
-            account_data_directory(Some(isolated.clone()), Some(platform.clone())).unwrap(),
-            isolated
+    fn isolated_account_data_directory_must_be_absolute() {
+        let namespace: VaultNamespace = "manual-test".parse().unwrap();
+        assert!(
+            Vault::isolated_for_management(&namespace, std::path::Path::new("relative")).is_err()
         );
+        let isolated =
+            Vault::isolated_for_management(&namespace, std::path::Path::new("/isolated/accounts"))
+                .unwrap();
         assert_eq!(
-            account_data_directory(None, Some(platform.clone())).unwrap(),
-            platform
+            isolated.lock_path,
+            PathBuf::from("/isolated/accounts/accounts-manual-test.lock")
         );
-        assert!(account_data_directory(Some(PathBuf::from("relative")), None).is_err());
-        assert!(account_data_directory(None, None).is_err());
     }
     #[cfg(target_os = "macos")]
     #[test]

@@ -34,6 +34,8 @@ fn server_argument_contract() {
         "--parent-pipe",
         "--account-vault-namespace",
         "manual-test",
+        "--account-data-dir",
+        "/tmp/quotio-manual-test",
     ])
     .unwrap()
     .command
@@ -51,6 +53,7 @@ fn server_argument_contract() {
         vec!["--listen", "example.com:6767"],
         vec!["--token", "must-not-be-in-argv"],
         vec!["--account-vault-namespace", "manual-test"],
+        vec!["--account-data-dir", "/tmp/quotio-manual-test"],
         vec!["--manage", "--account-vault-namespace", "../production"],
         vec![
             "--manage",
@@ -75,6 +78,7 @@ async fn startup_rejects_remote_bind_empty_selection_and_occupied_port() {
         timeout: Some(1),
         no_saved_accounts: true,
         account_vault_namespace: None,
+        account_data_dir: None,
         manage: false,
         public_url: None,
         allow_origin: vec![],

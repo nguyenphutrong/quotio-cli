@@ -306,8 +306,11 @@ pub struct ServeArgs {
     #[arg(long)]
     pub no_saved_accounts: bool,
     /// Store managed accounts in a separate application-owned vault namespace
-    #[arg(long, requires_all = ["manage", "parent_pipe"], conflicts_with = "no_saved_accounts")]
+    #[arg(long, requires_all = ["manage", "parent_pipe", "account_data_dir"], conflicts_with = "no_saved_accounts")]
     pub account_vault_namespace: Option<crate::accounts::vault::VaultNamespace>,
+    /// Store isolated account locks and platform vault data in this absolute directory
+    #[arg(long, requires = "account_vault_namespace")]
+    pub account_data_dir: Option<PathBuf>,
     /// Enable account/auth/settings/refresh writes; requires QUOTIO_SERVER_TOKEN
     #[arg(long)]
     pub manage: bool,
