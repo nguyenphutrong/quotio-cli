@@ -62,6 +62,11 @@ pub enum AccountError {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Credential {
+    CopilotOAuth {
+        access_token: String,
+        account_id: String,
+        login: String,
+    },
     ClaudeOAuth {
         access_token: String,
         refresh_token: String,
@@ -287,6 +292,9 @@ impl Document {
                 | Credential::GrokNative { .. }
         ) {
             self.version = self.version.max(3);
+        }
+        if matches!(credential, Credential::CopilotOAuth { .. }) {
+            self.version = self.version.max(6);
         }
         self.accounts.push(Account {
             id: id.clone(),

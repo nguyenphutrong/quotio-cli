@@ -80,7 +80,7 @@ pub async fn run(
             if !region_valid || (provider != Provider::Factory && organization.is_some()) {
                 return Err(AccountError::Unsupported);
             }
-            if provider == Provider::Catalog("claude") && !token_stdin {
+            if matches!(provider, Provider::Catalog("claude" | "copilot")) && !token_stdin {
                 if region.is_some() || organization.is_some() || !settings.is_empty() {
                     return Err(AccountError::Unsupported);
                 }
@@ -93,15 +93,33 @@ pub async fn run(
                 let session = manager
                     .begin_for(provider, label, super::oauth::OAuthMode::Relay)
                     .await?;
-                eprintln!("Open this URL to sign in to Claude:\n{}", session.url);
-                // The terminal never launches a browser for manual-code login.
-                let code = tokio::time::timeout(
-                    std::time::Duration::from_secs(180),
-                    super::input::read_oauth_code(),
-                )
-                .await
-                .map_err(|_| AccountError::Cancelled)??;
-                let session = manager.manual_code(&session.id, &code).await?;
+                eprintln!("Open this URL to sign in:\n{}", session.url);
+                // These workflows display user actions without launching a browser.
+                let session = if let Some(code) = &session.user_code {
+                    eprintln!("Enter this code: {code}");
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        let current = manager.get(&session.id).await?;
+                        match current.status {
+                            super::oauth::SessionStatus::Waiting
+                            | super::oauth::SessionStatus::Processing => (),
+                            super::oauth::SessionStatus::Completed => break current,
+                            super::oauth::SessionStatus::Expired
+                            | super::oauth::SessionStatus::Cancelled => {
+                                return Err(AccountError::Cancelled);
+                            }
+                            super::oauth::SessionStatus::Failed => return Err(AccountError::OAuth),
+                        }
+                    }
+                } else {
+                    let code = tokio::time::timeout(
+                        std::time::Duration::from_secs(180),
+                        super::input::read_oauth_code(),
+                    )
+                    .await
+                    .map_err(|_| AccountError::Cancelled)??;
+                    manager.manual_code(&session.id, &code).await?
+                };
                 return Ok(format!(
                     "Account saved: {}\n",
                     session.account_id.ok_or(AccountError::OAuth)?

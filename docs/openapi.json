@@ -2094,6 +2094,7 @@
       "ProviderCapability": {
         "type": "object",
         "properties": {
+          "oauth_workflow": { "enum": ["browser_callback", "manual_code", "device_code"] },
           "provider": {
             "$ref": "#/components/schemas/ProviderId"
           },
@@ -2403,7 +2404,7 @@
         "type": "object",
         "properties": {
           "provider": {
-            "enum": ["codex", "claude"]
+            "enum": ["codex", "claude", "copilot"]
           },
           "label": {
             "type": [
@@ -2437,8 +2438,9 @@
       "Session": {
         "type": "object",
         "properties": {
-          "provider": { "enum": ["codex", "claude"] },
-          "workflow": { "enum": ["browser_callback", "manual_code"] },
+          "provider": { "enum": ["codex", "claude", "copilot"] },
+          "workflow": { "enum": ["browser_callback", "manual_code", "device_code"] },
+          "user_code": { "type": "string", "description": "GitHub user-facing code for device_code sessions. Never the private device token." },
           "id": {
             "type": "string"
           },

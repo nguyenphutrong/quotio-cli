@@ -50,6 +50,12 @@ fn scoped(
         }
         keys.insert("GROK_OAUTH_TOKEN".into(), access_token.clone());
     }
+    if let Credential::CopilotOAuth { access_token, .. } = credential {
+        if provider != Provider::Catalog("copilot") {
+            return Err(AccountError::Unsupported);
+        }
+        keys.insert("COPILOT_API_TOKEN".into(), access_token.clone());
+    }
     if let Credential::ClaudeOAuth { access_token, .. } = credential {
         if provider != Provider::Catalog("claude") {
             return Err(AccountError::Unsupported);
@@ -271,6 +277,11 @@ async fn validate_credential(
     };
     if let Credential::ClaudeOAuth {
         account_id, email, ..
+    }
+    | Credential::CopilotOAuth {
+        account_id,
+        login: email,
+        ..
     } = credential
     {
         usage.account.id = account_id.clone();
@@ -527,6 +538,7 @@ pub fn default_label(
         | Credential::DevinDesktopNative { .. }
         | Credential::FactoryNative { .. }
         | Credential::CursorNative { .. } => Err(AccountError::Input),
+        Credential::CopilotOAuth { login, .. } => super::validate_label(login),
         Credential::GrokOAuth { .. } => Ok("Grok owned account".into()),
         Credential::FactoryOAuth { .. } => Ok("Factory owned account".into()),
         Credential::CodexOAuth { email, .. } | Credential::ClaudeOAuth { email, .. } => {
@@ -2491,6 +2503,30 @@ mod tests {
         cleanup(path);
     }
     #[tokio::test]
+    async fn copilot_owned_reads_never_refresh_or_rewrite_tokens() {
+        let (vault, fake, id, _, path) = setup(0, false, false, true);
+        let mut tx = vault.begin().unwrap();
+        tx.document.accounts[0].provider = Provider::Catalog("copilot");
+        let credential = Credential::CopilotOAuth {
+            access_token: "fixture-token".into(),
+            account_id: "42".into(),
+            login: "fixture-login".into(),
+        };
+        tx.document.accounts[0].credential = credential.clone();
+        tx.document.version = 6;
+        tx.commit().unwrap();
+        let adapter = managed(
+            vault.clone(),
+            fake.clone(),
+            id,
+            Provider::Catalog("copilot"),
+        );
+        assert!(adapter.read(&http::fixture::context()).await.is_err());
+        assert_eq!(fake.refreshes.load(Ordering::SeqCst), 0);
+        assert!(vault.begin().unwrap().document.accounts[0].credential == credential);
+        cleanup(path);
+    }
+    #[tokio::test]
     async fn claude_refresh_fence_survives_failure_restart_and_removal() {
         for failure in [false, true] {
             let (vault, fake, id, _, path) = setup(0, false, failure, false);
@@ -2627,7 +2663,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn factory_rotation_and_uncertain_writes_never_replay() {
+    async fn factory_and_claude_rotation_and_uncertain_writes_never_replay() {
         struct FailingWrite {
             memory: Arc<Memory>,
             mode: u8,
@@ -2647,17 +2683,35 @@ mod tests {
                 self.memory.write(bytes)
             }
         }
-        for mode in 0..=4 {
+        for (provider, mode) in [Provider::Factory, Provider::Catalog("claude")]
+            .into_iter()
+            .flat_map(|p| (0..=4).map(move |mode| (p, mode)))
+        {
             let (vault, fake, id, _, path) = setup(0, false, mode == 4, true);
             let mut tx = vault.begin().unwrap();
-            tx.document.accounts[0].provider = Provider::Factory;
-            tx.document.accounts[0].credential = Credential::FactoryOAuth {
-                access_token: "old".into(),
-                refresh_token: "refresh".into(),
-                organization_id: Some("org".into()),
-                expires_at: 0,
-                refresh_pending: false,
+            tx.document.accounts[0].provider = provider;
+            tx.document.accounts[0].credential = if provider == Provider::Factory {
+                Credential::FactoryOAuth {
+                    access_token: "old".into(),
+                    refresh_token: "refresh".into(),
+                    organization_id: Some("org".into()),
+                    expires_at: 0,
+                    refresh_pending: false,
+                }
+            } else {
+                Credential::ClaudeOAuth {
+                    access_token: "old".into(),
+                    refresh_token: "refresh".into(),
+                    account_id: "id".into(),
+                    email: "demo@example.com".into(),
+                    expires_at: 0,
+                    refresh_pending: false,
+                }
             };
+            let credential = tx.document.accounts[0].credential.clone();
+            tx.document
+                .reserve_factory_refresh(&id, &credential)
+                .unwrap();
             tx.commit().unwrap();
             let failing = Vault::new(
                 Arc::new(FailingWrite {
@@ -2666,7 +2720,7 @@ mod tests {
                 }),
                 path.join("lock"),
             );
-            let adapter = managed(failing, fake.clone(), id.clone(), Provider::Factory);
+            let adapter = managed(failing, fake.clone(), id.clone(), provider);
             assert!(!adapter.idempotent());
             let context = http::fixture::context();
             assert!(adapter.read(&context).await.is_err());
@@ -2683,7 +2737,7 @@ mod tests {
                     Vault::new(fake.memory.clone(), path.join("lock")),
                     fake.clone(),
                     id,
-                    Provider::Factory,
+                    provider,
                 );
                 assert!(restarted.read(&context).await.is_err());
                 assert_eq!(fake.refreshes.load(Ordering::SeqCst), 1);

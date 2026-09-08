@@ -39,7 +39,7 @@ Without `--provider`, the server uses `enabled_providers` from the existing CLI 
 
 The same adapters and collector used by `quotio usage` fetch data. Existing provider
 credential refresh behavior still applies, including managed OAuth token rotation.
-The read-only default has no account or settings writes. `--manage` adds the managed API described in [openapi.json](openapi.json): account mutations, Codex OAuth session relay/loopback callbacks, settings updates, and asynchronous refresh. Codex OAuth sessions can create a managed Codex account through the session and callback routes; other native provider logins still happen in the supported provider CLI or application.
+The read-only default has no account or settings write routes. `--manage` adds the managed API described in [the OpenAPI contract](openapi.json): account mutations, Codex/Claude/Copilot OAuth sessions, settings updates, and asynchronous refresh. Quota collection can still refresh separately owned credentials. Borrowed native logins never refresh or write their source.
 
 ## Routes
 
@@ -53,7 +53,7 @@ The read-only default has no account or settings writes. `--manage` adds the man
 | `GET /v1/status` | Refresh state and current settings revision |
 | `GET /v1/accounts` and `/v1/accounts/{id}` | Managed account metadata; available in read-only mode when account storage is enabled |
 | `POST/PATCH/DELETE /v1/accounts...` | Asynchronous managed account mutations; require `Idempotency-Key` (1–128 visible ASCII characters) |
-| `POST /v1/auth/sessions` and callback routes | Codex OAuth relay or loopback session lifecycle (requires `--manage`) |
+| `POST /v1/auth/sessions` and callback routes | Managed Codex, Claude and Copilot sessions (requires `--manage`) |
 | `GET /v1/settings` | Current settings and revision; available in read-only mode |
 | `PATCH /v1/settings` | Optimistic revision patch; requires `--manage` |
 | `POST /v1/refresh` | Asynchronous refresh request (requires `--manage`) |
@@ -86,10 +86,54 @@ curl -H "Authorization: Bearer $QUOTIO_SERVER_TOKEN" http://127.0.0.1:6767/v1/op
 
 Settings patches include the current `revision`; a stale revision returns 409
 `revision_conflict`, so read `GET /v1/settings` and retry. `POST /v1/refresh` returns
-202 with an operation ID. OAuth begins with `POST /v1/auth/sessions` using
-`callback_mode` `relay` or `loopback`; open the returned URL, paste the redirect URL
-into the callback endpoint for relay mode, then poll the session with `GET` or cancel
-it with `DELETE`.
+202 with an operation ID.
+
+### Managed OAuth sessions
+
+Start with `POST /v1/auth/sessions`, supplying `provider` and an optional `label`.
+The response adds `provider`, `workflow`, and optional `user_code` to the existing
+`id`, `url`, `expires_at`, `status`, `account_id`, and `error_code` fields.
+Provider capabilities also expose `oauth_workflow` and `start_oauth`.
+
+| Provider | Workflow | User action |
+| --- | --- | --- |
+| `codex` | `browser_callback` | Open `url`. For `callback_mode: relay`, send `{"callback_url":"..."}` to `POST /v1/auth/sessions/{id}/callback`. `loopback` remains supported. |
+| `claude` | `manual_code` | Open `url`, then send `{"code":"..."}` to the callback route. A code with `#state` must match the backend's state. |
+| `copilot` | `device_code` | Open `url` and enter `user_code`. Do not call the callback route. The backend polls GitHub. |
+
+Claude and Copilot accept only the default `callback_mode: relay`; this field is
+retained for Codex compatibility. Submit exactly one callback field. Never include
+codes in a URL query or log them. The backend owns proof-key generation, state,
+exchange, provider polling and credential storage. Swift only retains the session
+ID, renders the user action, submits the Claude code, and polls the local session.
+
+Poll `GET /v1/auth/sessions/{id}`. `waiting` permits cancellation with `DELETE` on
+the same route. `processing` means exchange or persistence has been claimed;
+cancellation then returns `account_busy`, and the client must keep polling.
+Terminal states are `completed`, `failed`, `cancelled`, and `expired`. A completed
+session returns the saved account ID. No response contains access, refresh or
+private device tokens. An uncertain storage result requires inspecting accounts
+before starting another login.
+
+Codex and Claude wait up to 180 seconds for user input. Copilot uses GitHub's
+expiry, waits at least five seconds between polls, and adds five seconds after
+each `slow_down`. Pending responses do not create accounts. Cancellation or expiry
+stops polling and discards late tokens before persistence. Sessions live in memory;
+a backend restart requires a new session, not reuse of an authorization code.
+
+Claude refresh uses a durable marker written before the token request. A timeout,
+invalid response, or uncertain write leaves that marker in place, preventing replay.
+Current and past refresh-token fingerprints remain reserved after account deletion.
+These reservations require vault format 6, which older backends reject. Recovery
+requires a fresh login, not copying the same refresh token into another account.
+Copilot stores the GitHub token only after `/user` identifies the account. It has no
+refresh-token grant; a rejected token requires a new login. Copilot login does not
+require a paid quota response.
+
+The terminal also supports `quotio accounts add --provider claude` and
+`quotio accounts add --provider copilot`. Both print the user action without opening a browser.
+Claude reads its code from a hidden terminal prompt. `--token-stdin` is not an OAuth
+code input mode. No native provider file or Keychain item is imported by these flows.
 
 Provider capabilities include `auth`, supported operations, native-login instructions,
 and field metadata. Use each setting's `field_path` to place its value in an account

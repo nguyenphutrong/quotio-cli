@@ -161,7 +161,11 @@ impl Vault {
                     || (doc.version < 6
                         && (!doc.claude_refresh_owners.is_empty()
                             || doc.accounts.iter().any(|a| {
-                                matches!(a.credential, super::Credential::ClaudeOAuth { .. })
+                                matches!(
+                                    a.credential,
+                                    super::Credential::ClaudeOAuth { .. }
+                                        | super::Credential::CopilotOAuth { .. }
+                                )
                             })))
                     || (doc.version == 1 && !doc.mutation_receipts.is_empty())
                     || (doc.version < 3
@@ -245,6 +249,10 @@ impl Transaction {
         self.backend.write(&bytes)
     }
 }
+#[cfg(test)]
+#[path = "fixtures/pre_claude_reservations.rs"]
+mod pre_claude_reservations;
+
 #[cfg(test)]
 #[path = "fixtures/pre_factory_reservations.rs"]
 mod pre_factory_reservations;
@@ -389,8 +397,19 @@ pub(crate) mod tests {
         drop(tx);
         let bytes = memory.read().unwrap().unwrap();
         assert_old_reader_rejects(&bytes);
+        assert!(matches!(
+            pre_claude_reservations::read(&bytes),
+            Err(AccountError::Corrupt)
+        ));
         let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         value["version"] = 5.into();
+        let old = pre_claude_reservations::read(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(
+            serde_json::to_value(old)
+                .unwrap()
+                .get("claude_refresh_owners")
+                .is_none()
+        );
         memory.write(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(matches!(vault.begin(), Err(AccountError::Corrupt)));
         std::fs::remove_dir_all(dir).unwrap();

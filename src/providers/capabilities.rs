@@ -41,6 +41,8 @@ pub struct SourceCapability {
 pub struct ProviderCapability {
     pub provider: Provider,
     pub auth: Vec<AuthMethod>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_workflow: Option<crate::accounts::oauth::Workflow>,
     pub settings: Vec<SettingMetadata>,
     /// Usage collection works on every supported platform.
     pub usage_platform: &'static str,
@@ -127,7 +129,7 @@ pub fn capability(provider: Provider) -> ProviderCapability {
         _ => None,
     };
     let auth = match provider {
-        Provider::Codex | Provider::Catalog("claude") => {
+        Provider::Codex | Provider::Catalog("claude" | "copilot") => {
             vec![AuthMethod::OAuth, AuthMethod::Native]
         }
         Provider::Amp => vec![AuthMethod::ApiKey, AuthMethod::Native],
@@ -151,11 +153,18 @@ pub fn capability(provider: Provider) -> ProviderCapability {
             Operation::RemoveAccount,
         ]);
     }
-    if provider == Provider::Codex {
+    let oauth_workflow = match provider {
+        Provider::Codex => Some(crate::accounts::oauth::Workflow::BrowserCallback),
+        Provider::Catalog("claude") => Some(crate::accounts::oauth::Workflow::ManualCode),
+        Provider::Catalog("copilot") => Some(crate::accounts::oauth::Workflow::DeviceCode),
+        _ => None,
+    };
+    if oauth_workflow.is_some() {
         operations.push(Operation::StartOAuth);
     }
     ProviderCapability {
         provider,
+        oauth_workflow,
         auth,
         settings,
         usage_platform: "all",

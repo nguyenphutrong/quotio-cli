@@ -10,14 +10,16 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
+    time::Instant,
 };
 
 pub(crate) mod claude;
+mod copilot;
 
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -248,11 +250,14 @@ pub enum SessionStatus {
 pub enum Workflow {
     BrowserCallback,
     ManualCode,
+    DeviceCode,
 }
 #[derive(Clone, Serialize)]
 pub struct SessionDto {
     pub provider: crate::cli::Provider,
     pub workflow: Workflow,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_code: Option<String>,
     pub id: String,
     pub url: String,
     pub expires_at: i64,
@@ -265,6 +270,8 @@ pub struct SessionDto {
 struct PendingSession {
     provider: crate::cli::Provider,
     workflow: Workflow,
+    user_code: Option<String>,
+    lifetime: Duration,
     authorization: Option<Authorization>,
     url: String,
     label: Option<String>,
@@ -307,6 +314,7 @@ impl OAuthSessionManager {
         SessionDto {
             provider: session.provider,
             workflow: session.workflow,
+            user_code: session.user_code.clone(),
             id,
             url: session.url.clone(),
             expires_at: session.expires_at,
@@ -319,7 +327,7 @@ impl OAuthSessionManager {
         let now = Instant::now();
         for session in sessions.sessions.values_mut() {
             if session.status == SessionStatus::Waiting
-                && now.duration_since(session.created) >= Duration::from_secs(180)
+                && now.duration_since(session.created) >= session.lifetime
             {
                 session.status = SessionStatus::Expired;
                 session.authorization = None;
@@ -328,7 +336,8 @@ impl OAuthSessionManager {
         }
         sessions.sessions.retain(|_, session| {
             session.status == SessionStatus::Processing
-                || now.duration_since(session.created) <= Duration::from_secs(900)
+                || now.duration_since(session.created)
+                    <= session.lifetime + Duration::from_secs(720)
         });
         if sessions.sessions.len() > 128 {
             let mut ids: Vec<_> = sessions
@@ -362,6 +371,14 @@ impl OAuthSessionManager {
         label: Option<String>,
         mode: OAuthMode,
     ) -> Result<SessionDto, AccountError> {
+        if provider == crate::cli::Provider::Catalog("copilot") {
+            if !matches!(mode, OAuthMode::Relay) {
+                return Err(AccountError::Unsupported);
+            }
+            return self
+                .begin_device(label, copilot::Endpoints::default())
+                .await;
+        }
         let workflow = match provider {
             crate::cli::Provider::Codex => Workflow::BrowserCallback,
             crate::cli::Provider::Catalog("claude") if matches!(mode, OAuthMode::Relay) => {
@@ -405,6 +422,8 @@ impl OAuthSessionManager {
             PendingSession {
                 provider,
                 workflow,
+                user_code: None,
+                lifetime: Duration::from_secs(180),
                 authorization: Some(authorization),
                 url,
                 label,
@@ -437,6 +456,139 @@ impl OAuthSessionManager {
             sessions.sessions.get(&id).expect("inserted"),
         ))
     }
+    async fn begin_device(
+        &self,
+        label: Option<String>,
+        endpoints: copilot::Endpoints,
+    ) -> Result<SessionDto, AccountError> {
+        if let Some(label) = &label {
+            super::validate_label(label)?;
+        }
+        {
+            let mut sessions = self.sessions.lock().await;
+            Self::prune(&mut sessions);
+            if sessions.sessions.len() >= 128 {
+                return Err(AccountError::Busy);
+            }
+        }
+        let started = Instant::now();
+        let device = tokio::time::timeout(
+            Duration::from_secs(30),
+            copilot::begin(&self.context, &endpoints.device),
+        )
+        .await
+        .map_err(|_| AccountError::Cancelled)??;
+        let lifetime = Duration::from_secs(device.expires_in);
+        let remaining = lifetime
+            .checked_sub(started.elapsed())
+            .filter(|d| !d.is_zero())
+            .ok_or(AccountError::Cancelled)?;
+        let id = random_string()?;
+        let expires_at = self
+            .context
+            .clock
+            .now()
+            .unix_timestamp()
+            .checked_add(remaining.as_secs() as i64 + i64::from(remaining.subsec_nanos() != 0))
+            .ok_or(AccountError::OAuth)?;
+        let mut sessions = self.sessions.lock().await;
+        Self::prune(&mut sessions);
+        if sessions.sessions.len() >= 128 {
+            return Err(AccountError::Busy);
+        }
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        let session = PendingSession {
+            provider: crate::cli::Provider::Catalog("copilot"),
+            workflow: Workflow::DeviceCode,
+            user_code: Some(device.user_code),
+            lifetime,
+            authorization: None,
+            url: device.verification_uri,
+            label,
+            expires_at,
+            created: started,
+            status: SessionStatus::Waiting,
+            account_id: None,
+            error_code: None,
+            cancel: cancel.clone(),
+        };
+        let dto = Self::dto(id.clone(), &session);
+        sessions.sessions.insert(id.clone(), session);
+        let manager = self.clone();
+        tokio::spawn(async move {
+            manager
+                .poll_device(
+                    id,
+                    device.device_code,
+                    device.interval.max(5),
+                    started + lifetime,
+                    cancel,
+                    endpoints,
+                )
+                .await;
+        });
+        Ok(dto)
+    }
+    async fn end_device(&self, id: &str, status: SessionStatus, error_code: Option<&'static str>) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.sessions.get_mut(id)
+            && session.status == SessionStatus::Waiting
+        {
+            session.status = status;
+            session.error_code = error_code;
+        }
+    }
+    async fn poll_device(
+        &self,
+        id: String,
+        device_code: String,
+        mut interval: u64,
+        deadline: Instant,
+        cancel: Arc<tokio::sync::Notify>,
+        endpoints: copilot::Endpoints,
+    ) {
+        let result = tokio::select! {
+            _ = cancel.notified() => return,
+            _ = tokio::time::sleep_until(deadline) => { self.end_device(&id, SessionStatus::Expired, None).await; return; },
+            result = async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(interval)).await;
+                    if Instant::now() >= deadline { self.end_device(&id, SessionStatus::Expired, None).await; return Ok(None); }
+                    let response = tokio::time::timeout(Duration::from_secs(30), copilot::poll(&self.context, &endpoints.token, &device_code)).await.map_err(|_| AccountError::Cancelled)??;
+                    match response {
+                        copilot::Poll::Pending => (),
+                        copilot::Poll::SlowDown => interval = interval.saturating_add(5),
+                        copilot::Poll::Expired => { self.end_device(&id, SessionStatus::Expired, None).await; return Ok(None); },
+                        copilot::Poll::Denied => { self.end_device(&id, SessionStatus::Cancelled, None).await; return Ok(None); },
+                        copilot::Poll::Token(token) => return tokio::time::timeout(Duration::from_secs(30), copilot::credential(&self.context, &endpoints.profile, token)).await.map_err(|_| AccountError::Cancelled)?.map(Some),
+                    }
+                }
+            } => result,
+        };
+        let credential = match result {
+            Ok(Some(credential)) => credential,
+            Ok(None) => return,
+            Err(error) => {
+                self.end_device(&id, SessionStatus::Failed, Some(Self::failure_code(&error)))
+                    .await;
+                return;
+            }
+        };
+        let label = {
+            let mut sessions = self.sessions.lock().await;
+            Self::prune(&mut sessions);
+            let Some(session) = sessions.sessions.get_mut(&id) else {
+                return;
+            };
+            if session.status != SessionStatus::Waiting {
+                return;
+            }
+            session.status = SessionStatus::Processing;
+            session.label.clone()
+        };
+        // Once claimed, persistence completes even if the polling client disconnects.
+        let _ = self.finish(&id, Ok(credential), label).await;
+    }
     pub async fn get(&self, id: &str) -> Result<SessionDto, AccountError> {
         let mut sessions = self.sessions.lock().await;
         Self::prune(&mut sessions);
@@ -445,7 +597,7 @@ impl OAuthSessionManager {
             .get_mut(id)
             .ok_or(AccountError::NotFound)?;
         if session.status == SessionStatus::Waiting
-            && Instant::now().duration_since(session.created) >= Duration::from_secs(180)
+            && Instant::now().duration_since(session.created) >= session.lifetime
         {
             session.status = SessionStatus::Expired;
         }
@@ -535,22 +687,22 @@ impl OAuthSessionManager {
         let provider = self.get(id).await?.provider;
         let result = async {
             let credential = credential?;
-            let usage = tokio::time::timeout(
-                Duration::from_secs(30),
-                service::validate(&self.context, provider, &credential),
-            )
-            .await
-            .map_err(|_| AccountError::Cancelled)??;
+            let identity = if let Credential::CopilotOAuth { account_id, .. } = &credential {
+                account_id.clone()
+            } else {
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    service::validate(&self.context, provider, &credential),
+                )
+                .await
+                .map_err(|_| AccountError::Cancelled)??
+                .account
+                .id
+            };
             let label = service::default_label(label.as_deref(), &credential)?;
             let _guard = service::mutation_guard(&self.commit_guard).await?;
-            let account_id = service::add(
-                self.vault.clone(),
-                provider,
-                label,
-                credential,
-                usage.account.id,
-            )
-            .await?;
+            let account_id =
+                service::add(self.vault.clone(), provider, label, credential, identity).await?;
             self.generation.fetch_add(1, Ordering::SeqCst);
             Ok::<_, AccountError>(account_id)
         }
@@ -909,6 +1061,123 @@ mod session_tests {
         );
     }
 
+    fn device_response(expires_in: u64) -> Value {
+        serde_json::json!({"device_code":"private-device", "user_code":"PUBLIC-CODE", "verification_uri":"https://github.com/login/device", "expires_in":expires_in, "interval":5})
+    }
+    fn device_endpoints(url: &str) -> copilot::Endpoints {
+        copilot::Endpoints {
+            device: url.into(),
+            token: url.into(),
+            profile: url.into(),
+        }
+    }
+    #[tokio::test]
+    async fn copilot_pending_slow_down_persists_only_after_identity() {
+        let manager = manager();
+        let (url, task) = http::fixture::server(vec![
+            device_response(900),
+            serde_json::json!({"error":"authorization_pending"}),
+            serde_json::json!({"error":"slow_down"}),
+            serde_json::json!({"access_token":"private-token"}),
+            serde_json::json!({"login":"fixture-login", "id":42}),
+        ])
+        .await;
+        let started = Instant::now();
+        let session = manager
+            .begin_device(None, device_endpoints(&url))
+            .await
+            .unwrap();
+        assert_eq!(session.workflow, Workflow::DeviceCode);
+        assert_eq!(session.user_code.as_deref(), Some("PUBLIC-CODE"));
+        assert!(
+            manager
+                .manual_code(&session.id, "wrong-workflow")
+                .await
+                .is_err()
+        );
+        assert!(manager.vault.begin().unwrap().document.accounts.is_empty());
+        let completed = tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                let current = manager.get(&session.id).await.unwrap();
+                if current.status != SessionStatus::Waiting
+                    && current.status != SessionStatus::Processing
+                {
+                    break current;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(completed.status, SessionStatus::Completed);
+        assert!(started.elapsed() >= Duration::from_secs(20));
+        assert!(
+            !serde_json::to_string(&completed)
+                .unwrap()
+                .contains("private-")
+        );
+        let tx = manager.vault.begin().unwrap();
+        assert_eq!(tx.document.accounts.len(), 1);
+        assert!(
+            matches!(&tx.document.accounts[0].credential, Credential::CopilotOAuth { access_token, account_id, .. } if access_token == "private-token" && account_id == "42")
+        );
+        assert_eq!(
+            tx.document.accounts[0].origin(),
+            super::super::AccountOrigin::Owned
+        );
+        drop(tx);
+        assert_eq!(task.await.unwrap().len(), 5);
+    }
+    #[tokio::test]
+    async fn copilot_cancel_expiry_and_denial_never_persist() {
+        for outcome in [
+            "cancel",
+            "expiry",
+            "access_denied",
+            "expired_token",
+            "unknown-private-error",
+        ] {
+            let manager = manager();
+            let mut responses = vec![device_response(if outcome == "expiry" { 1 } else { 900 })];
+            if !matches!(outcome, "cancel" | "expiry") {
+                responses.push(serde_json::json!({"error":outcome}));
+            }
+            let (url, task) = http::fixture::server(responses).await;
+            let session = manager
+                .begin_device(None, device_endpoints(&url))
+                .await
+                .unwrap();
+            if outcome == "cancel" {
+                manager.cancel(&session.id).await.unwrap();
+            }
+            let terminal = tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    let current = manager.get(&session.id).await.unwrap();
+                    if current.status != SessionStatus::Waiting {
+                        break current;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                terminal.status,
+                match outcome {
+                    "cancel" | "access_denied" => SessionStatus::Cancelled,
+                    "expiry" | "expired_token" => SessionStatus::Expired,
+                    _ => SessionStatus::Failed,
+                }
+            );
+            assert!(
+                !serde_json::to_string(&terminal)
+                    .unwrap()
+                    .contains("private-")
+            );
+            assert!(manager.vault.begin().unwrap().document.accounts.is_empty());
+            task.await.unwrap();
+        }
+    }
     #[tokio::test]
     async fn claude_manual_workflow_is_typed_and_single_use() {
         let manager = manager();
