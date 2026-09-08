@@ -554,7 +554,16 @@ impl OAuthSessionManager {
                 loop {
                     tokio::time::sleep(Duration::from_secs(interval)).await;
                     if Instant::now() >= deadline { self.end_device(&id, SessionStatus::Expired, None).await; return Ok(None); }
-                    let response = tokio::time::timeout(Duration::from_secs(30), copilot::poll(&self.context, &endpoints.token, &device_code)).await.map_err(|_| AccountError::Cancelled)??;
+                    let response = match tokio::time::timeout(Duration::from_secs(30), copilot::poll(&self.context, &endpoints.token, &device_code)).await {
+                        Ok(Ok(response)) => response,
+                        // RFC 8628 §3.5: reduce frequency after connection timeouts.
+                        // Keep the original session deadline, including backoff waits.
+                        Err(_) | Ok(Err(AccountError::Provider(crate::error::ProviderError::Timeout | crate::error::ProviderError::Transient))) => {
+                            interval = interval.saturating_mul(2).min(3600);
+                            continue;
+                        }
+                        Ok(Err(error)) => return Err(error),
+                    };
                     match response {
                         copilot::Poll::Pending => (),
                         copilot::Poll::SlowDown => interval = interval.saturating_add(5),
@@ -1129,6 +1138,165 @@ mod session_tests {
         );
         drop(tx);
         assert_eq!(task.await.unwrap().len(), 5);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn copilot_retries_timeout_and_transport_with_backoff_before_expiry() {
+        let awake = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        for request_timeout in [None, Some(10)] {
+            let mut manager = manager();
+            if let Some(seconds) = request_timeout {
+                manager.context.http = reqwest::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(Duration::from_secs(seconds))
+                    .build()
+                    .unwrap();
+            }
+            let (url, mut requests, server) = controlled_http().await;
+            let worker = manager.clone();
+            let begin =
+                tokio::spawn(
+                    async move { worker.begin_device(None, device_endpoints(&url)).await },
+                );
+            let (_, response) = requests.recv().await.unwrap();
+            response.send(device_response(900).to_string()).unwrap();
+            let session = begin.await.unwrap().unwrap();
+            let (pending_at, response) = next_http_request(&mut requests).await;
+            response
+                .send(serde_json::json!({"error":"authorization_pending"}).to_string())
+                .unwrap();
+            let (slow_at, response) = next_http_request(&mut requests).await;
+            assert!(slow_at - pending_at >= Duration::from_secs(5));
+            response
+                .send(serde_json::json!({"error":"slow_down"}).to_string())
+                .unwrap();
+            let (timeout_at, held_response) = next_http_request(&mut requests).await;
+            assert!(timeout_at - slow_at >= Duration::from_secs(10));
+            // A real connection remains open but sends no headers or body.
+            let (transport_at, response) = next_http_request(&mut requests).await;
+            assert!(
+                transport_at - timeout_at
+                    >= Duration::from_secs(request_timeout.unwrap_or(30) + 20)
+            );
+            drop(held_response);
+            assert_eq!(
+                manager.get(&session.id).await.unwrap().status,
+                SessionStatus::Waiting
+            );
+            // Closing the next socket without a response exercises reqwest transport errors.
+            drop(response);
+            let (token_at, response) = next_http_request(&mut requests).await;
+            assert!(token_at - transport_at >= Duration::from_secs(40));
+            response
+                .send(serde_json::json!({"access_token":"private-token"}).to_string())
+                .unwrap();
+            let (_, response) = next_http_request(&mut requests).await;
+            response
+                .send(serde_json::json!({"login":"fixture-login", "id":42}).to_string())
+                .unwrap();
+            let completed = loop {
+                let current = manager.get(&session.id).await.unwrap();
+                if current.status == SessionStatus::Completed {
+                    break current;
+                }
+                assert!(matches!(
+                    current.status,
+                    SessionStatus::Waiting | SessionStatus::Processing
+                ));
+                tokio::task::yield_now().await;
+            };
+            assert!(
+                !serde_json::to_string(&completed)
+                    .unwrap()
+                    .contains("private-")
+            );
+            assert_eq!(manager.vault.begin().unwrap().document.accounts.len(), 1);
+            server.abort();
+        }
+        awake.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn copilot_retry_backoff_obeys_original_expiry_and_cancel() {
+        let awake = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        for cancel in [false, true] {
+            let manager = manager();
+            let (url, mut requests, server) = controlled_http().await;
+            let worker = manager.clone();
+            let started = Instant::now();
+            let begin =
+                tokio::spawn(
+                    async move { worker.begin_device(None, device_endpoints(&url)).await },
+                );
+            let (_, response) = requests.recv().await.unwrap();
+            response.send(device_response(42).to_string()).unwrap();
+            let session = begin.await.unwrap().unwrap();
+            let (_, held_response) = next_http_request(&mut requests).await;
+            tokio::time::advance(Duration::from_secs(30)).await;
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                manager.get(&session.id).await.unwrap().status,
+                SessionStatus::Waiting
+            );
+            if cancel {
+                manager.cancel(&session.id).await.unwrap();
+            }
+            tokio::time::advance(
+                (started + Duration::from_secs(42)).saturating_duration_since(Instant::now()),
+            )
+            .await;
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            let terminal = manager.get(&session.id).await.unwrap();
+            assert_eq!(
+                terminal.status,
+                if cancel {
+                    SessionStatus::Cancelled
+                } else {
+                    SessionStatus::Expired
+                }
+            );
+            assert!(requests.try_recv().is_err());
+            assert!(manager.vault.begin().unwrap().document.accounts.is_empty());
+            assert!(
+                !serde_json::to_string(&terminal)
+                    .unwrap()
+                    .contains("private-")
+            );
+            drop(held_response);
+            server.abort();
+        }
+        awake.abort();
+    }
+
+    async fn next_http_request(
+        requests: &mut tokio::sync::mpsc::UnboundedReceiver<(
+            Instant,
+            tokio::sync::oneshot::Sender<String>,
+        )>,
+    ) -> (Instant, tokio::sync::oneshot::Sender<String>) {
+        for _ in 0..480 {
+            // Give real socket I/O a turn without advancing the injected clock.
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            if let Ok(request) = requests.try_recv() {
+                return request;
+            }
+            tokio::time::advance(Duration::from_millis(250)).await;
+        }
+        panic!("expected loopback request within virtual polling budget");
     }
     #[tokio::test]
     async fn copilot_cancel_expiry_and_denial_never_persist() {
