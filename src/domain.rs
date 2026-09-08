@@ -151,6 +151,8 @@ pub struct UsageDiagnostic {
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_reset_credits: Option<CodexResetCreditInventory>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<UsageDiagnostic>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,6 +160,19 @@ pub struct ProviderUsage {
     pub provider: ProviderId,
     pub account: AccountIdentity,
     pub windows: Vec<QuotaWindow>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CodexResetCreditInventory {
+    pub available_count: u64,
+    pub credits: Vec<CodexResetCredit>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub fetched_at: OffsetDateTime,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CodexResetCredit {
+    pub id: String,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
 }
 #[derive(Debug, Serialize)]
 pub struct ProviderFailure {

@@ -1943,6 +1943,9 @@
             "items": {
               "$ref": "#/components/schemas/UsageDiagnostic"
             }
+          },
+          "codex_reset_credits": {
+            "$ref": "#/components/schemas/CodexResetCreditInventory"
           }
         },
         "additionalProperties": false,
@@ -2835,6 +2838,55 @@
           }
         },
         "description": "Explicit intake of separately owned Grok CLI OAuth tokens for the default Grok client. Does not read or migrate native credentials or start OAuth. Tokens are stored before any refresh. An interrupted or failed refresh is fenced until this account is removed and separately owned credentials are supplied again."
+      },
+      "CodexResetCreditInventory": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "available_count",
+          "credits",
+          "fetched_at"
+        ],
+        "properties": {
+          "available_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Provider available_count, not the filtered record count."
+          },
+          "credits": {
+            "type": "array",
+            "description": "Available, unexpired credits; absent expiry is retained. Expiring records sort first. Read-only inventory, never consumes a credit.",
+            "items": {
+              "$ref": "#/components/schemas/CodexResetCredit"
+            }
+          },
+          "fetched_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CodexResetCredit": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "expires_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "description": "Domain-separated SHA-256; never the provider credit ID."
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        }
       }
     }
   },

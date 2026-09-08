@@ -77,6 +77,7 @@ pub async fn fetch(
         context,
         credential,
         "https://chatgpt.com/backend-api/wham/usage",
+        "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
     )
     .await
 }
@@ -84,6 +85,7 @@ async fn fetch_at(
     context: &ProviderContext,
     credential: &Credential,
     endpoint: &str,
+    inventory_endpoint: &str,
 ) -> Result<ProviderUsage, ProviderError> {
     let Credential::CodexOAuth {
         access_token,
@@ -109,14 +111,138 @@ async fn fetch_at(
     .await?;
     let mut usage = parse(value, email, context.clock.now())?;
     usage.account.id = account_id.clone();
+    match supplemental(context, access_token, account_id, inventory_endpoint, true)
+        .await
+        .and_then(|value| parse_inventory(value, context.clock.now()))
+    {
+        Ok(inventory) => usage.codex_reset_credits = Some(inventory),
+        Err(code) => usage.diagnostics.push(UsageDiagnostic {
+            source: "codex_reset_credits".into(),
+            code,
+        }),
+    }
     Ok(usage)
 }
+async fn supplemental(
+    context: &ProviderContext,
+    access_token: &str,
+    account_id: &str,
+    endpoint: &str,
+    inventory: bool,
+) -> Result<Value, ProviderError> {
+    let mut request = context
+        .http
+        .get(endpoint)
+        .header(
+            "Authorization",
+            http::sensitive(&format!("Bearer {access_token}"))?,
+        )
+        .header("ChatGPT-Account-Id", http::sensitive(account_id)?)
+        .header("Accept", "application/json")
+        .header("Originator", "Codex Desktop")
+        .timeout(std::time::Duration::from_secs(4));
+    if inventory {
+        request = request.header("OpenAI-Beta", "codex-1");
+    }
+    http::json(request, context.clock.now()).await
+}
+
+fn parse_inventory(
+    value: Value,
+    now: time::OffsetDateTime,
+) -> Result<CodexResetCreditInventory, ProviderError> {
+    #[derive(serde::Deserialize)]
+    struct Payload {
+        available_count: u64,
+        credits: Vec<Credit>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Credit {
+        id: String,
+        status: String,
+        #[serde(default, with = "time::serde::rfc3339::option")]
+        expires_at: Option<time::OffsetDateTime>,
+    }
+    let payload: Payload = serde_json::from_value(value).map_err(|_| ProviderError::InvalidData)?;
+    let mut credits: Vec<_> = payload
+        .credits
+        .into_iter()
+        .filter(|credit| {
+            credit.status == "available" && credit.expires_at.is_none_or(|expiry| expiry > now)
+        })
+        .collect();
+    credits.sort_by(|a, b| match (a.expires_at, b.expires_at) {
+        (Some(a_date), Some(b_date)) => a_date.cmp(&b_date).then_with(|| a.id.cmp(&b.id)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.id.cmp(&b.id),
+    });
+    Ok(CodexResetCreditInventory {
+        available_count: payload.available_count,
+        fetched_at: now,
+        credits: credits
+            .into_iter()
+            .map(|credit| {
+                let digest = ring::digest::digest(
+                    &ring::digest::SHA256,
+                    format!("com.quotio.codex.reset-credit-id.v1\0{}", credit.id).as_bytes(),
+                );
+                CodexResetCredit {
+                    id: digest
+                        .as_ref()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                    expires_at: credit.expires_at,
+                }
+            })
+            .collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inventory_preserves_source_count_and_filters_without_exposing_ids() {
+        let now = time::macros::datetime!(2026-09-07 0:00 UTC);
+        let inventory = parse_inventory(
+            json!({"available_count":9,"credits":[
+                {"id":"no-expiry-secret","status":"available"},
+                {"id":"future-secret","status":"available","expires_at":"2026-09-08T00:00:00.123Z"},
+                {"id":"expired-secret","status":"available","expires_at":"2026-09-07T00:00:00Z"},
+                {"id":"used-secret","status":"consumed"}
+            ]}),
+            now,
+        )
+        .unwrap();
+        assert_eq!(inventory.available_count, 9);
+        assert_eq!(inventory.credits.len(), 2);
+        assert!(inventory.credits[0].expires_at.is_some());
+        assert!(inventory.credits[1].expires_at.is_none());
+        assert_eq!(inventory.credits[0].id.len(), 64);
+        assert!(
+            !serde_json::to_string(&inventory)
+                .unwrap()
+                .contains("secret")
+        );
+        for value in [
+            json!({"available_count":-1,"credits":[]}),
+            json!({"available_count":0,"credits":[{"id":"x","status":"available","expires_at":"bad"}]}),
+        ] {
+            assert!(matches!(
+                parse_inventory(value, now),
+                Err(ProviderError::InvalidData)
+            ));
+        }
+    }
+
     #[tokio::test]
-    async fn direct_quota_preserves_identity_headers_and_sparse_windows() {
-        let (url,task)=http::fixture::server(vec![json!({"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":604800}},"additional_rate_limits":[{"limit_name":"GPT Spark","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000}}}]})]).await;
+    async fn invalid_inventory_keeps_quota_and_scoped_diagnostic() {
+        let (url, task) = http::fixture::server(vec![
+            json!({"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000}}}),
+            json!({"available_count":"provider-secret","credits":[]}),
+        ]).await;
         let credential = Credential::CodexOAuth {
             access_token: "synthetic-token".into(),
             refresh_token: "refresh".into(),
@@ -125,7 +251,50 @@ mod tests {
             email: "demo@example.com".into(),
             expires_at: 0,
         };
-        let usage = fetch_at(&http::fixture::context(), &credential, &url)
+        let mut usage = fetch_at(&http::fixture::context(), &credential, &url, &url)
+            .await
+            .unwrap();
+        assert_eq!(usage.windows.len(), 1);
+        assert!(usage.codex_reset_credits.is_none());
+        assert_eq!(usage.diagnostics[0].source, "codex_reset_credits");
+        usage.account_ref = Some(AccountRef {
+            id: "saved-a".into(),
+            label: "A".into(),
+            origin: None,
+        });
+        // Supplemental data and diagnostics survive the same serialization used by the cache.
+        let usage = serde_json::from_value(serde_json::to_value(usage).unwrap()).unwrap();
+        let mut report = UsageReport {
+            schema_version: 1,
+            generated_at: http::fixture::context().clock.now(),
+            providers: vec![usage],
+            failures: vec![],
+        };
+        report.include_diagnostics();
+        assert_eq!(
+            report.failures[0].account_ref.as_ref().unwrap().id,
+            "saved-a"
+        );
+        assert!(
+            !serde_json::to_string(&report)
+                .unwrap()
+                .contains("provider-secret")
+        );
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_quota_preserves_identity_headers_and_sparse_windows() {
+        let (url,task)=http::fixture::server(vec![json!({"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":604800}},"additional_rate_limits":[{"limit_name":"GPT Spark","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000}}}]}), json!({"available_count":0,"credits":[]})]).await;
+        let credential = Credential::CodexOAuth {
+            access_token: "synthetic-token".into(),
+            refresh_token: "refresh".into(),
+            id_token: "id".into(),
+            account_id: "workspace-a".into(),
+            email: "demo@example.com".into(),
+            expires_at: 0,
+        };
+        let usage = fetch_at(&http::fixture::context(), &credential, &url, &url)
             .await
             .unwrap();
         assert_eq!(usage.windows.len(), 2);
@@ -141,5 +310,9 @@ mod tests {
         );
         assert!(req[0].contains("Bearer synthetic-token"));
         assert!(!req[0].to_lowercase().contains("cookie:"));
+        assert!(req.iter().all(|request| request.starts_with("GET ")));
+        assert!(req[1].to_lowercase().contains("openai-beta: codex-1"));
+        assert!(req[1].to_lowercase().contains("originator: codex desktop"));
+        assert_eq!(usage.codex_reset_credits.unwrap().available_count, 0);
     }
 }

@@ -398,6 +398,7 @@ impl AntigravityProvider {
             }
         };
         Ok(ProviderUsage {
+            codex_reset_credits: None,
             diagnostics: vec![],
             account_ref: None,
             provider: self.id(),

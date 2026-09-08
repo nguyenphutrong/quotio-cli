@@ -278,6 +278,7 @@ mod tests {
             schema_version: 1,
             generated_at: now,
             providers: vec![crate::domain::ProviderUsage {
+                codex_reset_credits: None,
                 diagnostics: vec![crate::domain::UsageDiagnostic {
                     source: "fixture".into(),
                     code: crate::error::ProviderError::Transient,

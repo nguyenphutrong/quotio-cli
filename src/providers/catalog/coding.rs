@@ -537,6 +537,7 @@ async fn clinepass_at(
         return Err(ProviderError::QuotaUnavailable);
     }
     Ok(ProviderUsage {
+        codex_reset_credits: None,
         provider: crate::domain::ProviderId("clinepass".into()),
         account: common::account_identity("clinepass", &key, "personal"),
         account_ref: None,
