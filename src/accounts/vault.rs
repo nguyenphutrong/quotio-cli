@@ -157,7 +157,7 @@ impl Vault {
                 }
                 let doc: Document =
                     serde_json::from_slice(&bytes).map_err(|_| AccountError::Corrupt)?;
-                if !matches!(doc.version, 1..=4)
+                if !matches!(doc.version, 1..=5)
                     || (doc.version == 1 && !doc.mutation_receipts.is_empty())
                     || (doc.version < 3
                         && doc.accounts.iter().any(|a| {
@@ -224,7 +224,12 @@ fn acquire(path: &std::path::Path) -> Result<VaultLock, AccountError> {
     Ok(VaultLock { file: lock })
 }
 impl Transaction {
-    pub fn commit(self) -> Result<(), AccountError> {
+    pub fn commit(mut self) -> Result<(), AccountError> {
+        // Also upgrade reservations written by pre-format-5 builds, even when
+        // this mutation touches only an unrelated account or retry receipt.
+        if !self.document.factory_refresh_owners.is_empty() {
+            self.document.version = self.document.version.max(5);
+        }
         let bytes = serde_json::to_vec(&self.document).map_err(|_| AccountError::Corrupt)?;
         if bytes.len() > 1024 * 1024 {
             return Err(AccountError::Input);
@@ -232,6 +237,10 @@ impl Transaction {
         self.backend.write(&bytes)
     }
 }
+#[cfg(test)]
+#[path = "fixtures/pre_factory_reservations.rs"]
+mod pre_factory_reservations;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -314,6 +323,98 @@ pub(crate) mod tests {
         assert!(matches!(vault.begin(), Err(AccountError::Corrupt)));
         std::fs::remove_dir_all(dir).unwrap();
     }
+    pub(crate) fn assert_old_reader_rejects(bytes: &[u8]) {
+        assert!(matches!(
+            pre_factory_reservations::read(bytes),
+            Err(AccountError::Corrupt)
+        ));
+    }
+
+    pub(crate) fn factory_credential() -> Credential {
+        Credential::FactoryOAuth {
+            access_token: "fixture-access".into(),
+            refresh_token: "fixture-refresh".into(),
+            organization_id: Some("fixture-org".into()),
+            expires_at: 0,
+            refresh_pending: true,
+        }
+    }
+
+    #[test]
+    fn factory_reservations_require_format_five_through_all_mutations() {
+        let memory = Arc::new(Memory::default());
+        let dir = std::env::temp_dir().join(random_string().unwrap());
+        let vault = Vault::new(memory.clone(), dir.join("lock"));
+        let mut tx = vault.begin().unwrap();
+        let factory = tx
+            .document
+            .add(
+                Provider::Factory,
+                "Factory",
+                "factory".into(),
+                factory_credential(),
+            )
+            .unwrap();
+        tx.commit().unwrap();
+        assert_old_reader_rejects(&memory.read().unwrap().unwrap());
+        let mut tx = vault.begin().unwrap();
+        let other = tx
+            .document
+            .add(Provider::Amp, "Other", "other".into(), credential())
+            .unwrap();
+        tx.commit().unwrap();
+        for action in 0..5 {
+            let mut tx = vault.begin().unwrap();
+            match action {
+                0 => tx.document.rename(&other, "Renamed").unwrap(),
+                1 => tx.document.patch(&other, None, None, Some(false)).unwrap(),
+                2 => tx.document.select(&other).unwrap(),
+                3 => tx.document.remove(&factory).unwrap(),
+                _ => tx.document.remove(&other).unwrap(),
+            }
+            tx.commit().unwrap();
+            let bytes = memory.read().unwrap().unwrap();
+            assert_old_reader_rejects(&bytes);
+            let tx = vault.begin().unwrap();
+            assert_eq!(tx.document.version, 5);
+            assert_eq!(tx.document.factory_refresh_owners.len(), 1);
+        }
+        // A pre-fix document is accepted by the old model, which drops the ledger.
+        // Any current write must upgrade it, including an unrelated rename.
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&memory.read().unwrap().unwrap()).unwrap();
+        value["version"] = 4.into();
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let old = pre_factory_reservations::read(&bytes).unwrap();
+        assert!(
+            serde_json::to_value(old)
+                .unwrap()
+                .get("factory_refresh_owners")
+                .is_none()
+        );
+        memory.write(&bytes).unwrap();
+        let mut tx = vault.begin().unwrap();
+        let other = tx
+            .document
+            .add(Provider::Amp, "Other", "other".into(), credential())
+            .unwrap();
+        tx.document.rename(&other, "Renamed").unwrap();
+        tx.commit().unwrap();
+        assert_old_reader_rejects(&memory.read().unwrap().unwrap());
+        let mut tx = vault.begin().unwrap();
+        assert!(matches!(
+            tx.document.add(
+                Provider::Factory,
+                "Replay",
+                "new-org".into(),
+                factory_credential()
+            ),
+            Err(AccountError::Duplicate)
+        ));
+        drop(tx);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn transactions_select_remove_and_rollback() {
         let memory = Arc::new(Memory::default());

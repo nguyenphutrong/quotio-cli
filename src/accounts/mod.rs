@@ -223,6 +223,7 @@ impl Document {
         }
         self.factory_refresh_owners
             .insert(fingerprint, id.to_owned());
+        self.version = self.version.max(5);
         Ok(())
     }
     pub fn add(
@@ -341,7 +342,7 @@ impl Document {
             if let Credential::AmpNative { source } = &mut account.credential {
                 source.enabled = enabled;
             }
-            self.version = 4;
+            self.version = self.version.max(4);
         }
         if active == Some(false) {
             return Err(AccountError::Unsupported);

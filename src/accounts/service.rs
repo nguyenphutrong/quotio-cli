@@ -3233,6 +3233,45 @@ mod receipt_tests {
     }
 
     #[tokio::test]
+    async fn uncertain_factory_receipt_keeps_reservations_and_rejects_old_reader() {
+        use crate::accounts::vault::tests::{assert_old_reader_rejects, factory_credential};
+        let path = std::env::temp_dir().join(crate::accounts::random_string().unwrap());
+        let backend = Arc::new(UncertainWrite(Memory::default()));
+        let vault = Vault::new(backend.clone(), path.clone());
+        let intent = intent("factory-uncertain", "create");
+        assert!(matches!(
+            commit_once(vault.clone(), intent.clone(), |document| {
+                document.add(
+                    Provider::Factory,
+                    "Factory",
+                    "fixture".into(),
+                    factory_credential(),
+                )
+            })
+            .await,
+            Err(AccountError::CommitUncertain)
+        ));
+        let before = backend.read().unwrap().unwrap();
+        assert_old_reader_rejects(&before);
+        let id = mutation_receipt(vault.clone(), &intent)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            commit_once(vault.clone(), intent, |_| panic!("must not replay"))
+                .await
+                .unwrap(),
+            id
+        );
+        assert_eq!(backend.read().unwrap().unwrap(), before);
+        let tx = vault.begin().unwrap();
+        assert_eq!(tx.document.version, 5);
+        assert_eq!(tx.document.factory_refresh_owners.len(), 1);
+        drop(tx);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn replay_after_reopening_vault_does_not_repeat_write_or_resurrect_deleted_account() {
         let (vault, backend, path) = fixture();
         let id = commit_once(vault.clone(), intent("intent", "create"), create)

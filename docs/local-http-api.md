@@ -415,6 +415,26 @@ accounts default to enabled; the prior Amp reference flag remains respected. Old
 binaries reject format 4 instead of ignoring disabled accounts. Adding another
 source or recording a mutation receipt preserves the newer format version.
 
+### Factory refresh ownership and vault format 5
+
+Owned Factory OAuth refresh tokens remain reserved to one account, regardless of
+organization. The vault keeps fingerprints of current and previous refresh tokens
+after rotation and account removal. Deleting an account does not release these
+reservations or allow a failed refresh to be retried under a new account. Recover
+with fresh, separately owned credentials, not a previously registered refresh token.
+If `organization_id` is supplied, the access token must contain the same WorkOS
+`org_id` claim. A missing or mismatched claim blocks the quota request.
+
+Writing refresh reservations upgrades the vault document to format 5 in the same
+atomic write. Current readers accept formats 1–5. A write to an existing older-format
+document containing reservations also upgrades it, even for an unrelated account
+rename. Later writes preserve format 5 and the reservations, including removal of
+the last account and receipt recovery after an uncertain commit. Binaries that only
+support formats 1–4 reject format 5 rather than silently dropping the reservations.
+Do not downgrade after this write or manually lower the document version. This is
+an internal account-storage change, not an HTTP API schema version change or a
+migration of the Swift application's vault.
+
 ### Cursor quota endpoints
 
 Cursor collection combines `auth/usage-summary` with the existing current-period

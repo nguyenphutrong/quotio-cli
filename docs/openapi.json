@@ -2899,7 +2899,7 @@
           "refresh_token": {"type": "string", "minLength": 1, "maxLength": 16384, "writeOnly": true},
           "organization_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 256}
         },
-        "description": "Separately owned Factory OAuth tokens for WorkOS client_01HNM792M5G5G1A2THWPXKFMXB only. Global Factory endpoint only; no custom client ID, region, endpoint or browser login. JWT expiry is read from the access token; unknown expiry triggers refresh. Tokens are persisted before refresh, and rotation before quota. Interrupted or failed refresh is durably fenced; remove the account and supply separately owned credentials to recover. Does not transfer ownership of a native login."
+        "description": "Separately owned Factory OAuth tokens for WorkOS client_01HNM792M5G5G1A2THWPXKFMXB only. Global Factory endpoint only; no custom client ID, region, endpoint or browser login. JWT expiry is read from the access token; unknown expiry triggers refresh. Tokens are persisted before refresh, and rotation before quota. Interrupted or failed refresh is durably fenced. Refresh-token fingerprints remain reserved to their account after rotation or removal, across organizations; deleting an account does not permit registering its old refresh tokens again. Recover with fresh, separately owned credentials. If organization_id is supplied, the access token must contain a matching WorkOS org_id claim before quota is requested; a missing or mismatched claim is rejected. Reservation writes require vault format 5, which older binaries reject. Does not transfer ownership of a native login."
       },
       "GrokOwnedInput": {
         "type": "object",
