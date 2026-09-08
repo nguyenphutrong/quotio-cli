@@ -166,8 +166,10 @@ impl Provider {
         }
     }
     pub fn supports_accounts(self) -> bool {
-        matches!(self, Self::Codex | Self::Catalog("cursor" | "grok" | "claude"))
-            || self.api_key_name().is_some()
+        matches!(
+            self,
+            Self::Codex | Self::Catalog("cursor" | "grok" | "claude" | "copilot")
+        ) || self.api_key_name().is_some()
     }
 
     pub fn description(self) -> &'static str {

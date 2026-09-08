@@ -167,6 +167,7 @@ impl Vault {
                                     | super::Credential::AmpNative { .. }
                                     | super::Credential::CodexNative { .. }
                                     | super::Credential::ClaudeNative { .. }
+                                    | super::Credential::CopilotNative { .. }
                                     | super::Credential::CursorNative { .. }
                                     | super::Credential::GrokNative { .. }
                             )

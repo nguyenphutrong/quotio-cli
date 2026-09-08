@@ -4,6 +4,100 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum CopilotLocation {
+    Apps,
+    Hosts,
+    GhKeychain,
+}
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CopilotNativeReference {
+    pub location: CopilotLocation,
+    pub path: Option<std::path::PathBuf>,
+    pub entry_key: String,
+}
+impl CopilotNativeReference {
+    pub fn system(location: CopilotLocation, entry_key: String) -> Result<Self, AccountError> {
+        let path = match location {
+            CopilotLocation::Apps | CopilotLocation::Hosts => Some(
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .ok_or(AccountError::NotFound)?
+                    .join(match location {
+                        CopilotLocation::Apps => ".config/github-copilot/apps.json",
+                        _ => ".config/github-copilot/hosts.json",
+                    }),
+            ),
+            CopilotLocation::GhKeychain => {
+                if !cfg!(target_os = "macos") {
+                    return Err(AccountError::Unsupported);
+                }
+                None
+            }
+        };
+        let source = Self {
+            location,
+            path,
+            entry_key,
+        };
+        source.identity()?;
+        Ok(source)
+    }
+    pub fn identity(&self) -> Result<String, AccountError> {
+        let key = &self.entry_key;
+        if key.len() > 256 || key.is_empty() || key.chars().any(char::is_control) {
+            return Err(AccountError::Input);
+        }
+        let location = match (self.location, &self.path) {
+            (CopilotLocation::Apps | CopilotLocation::Hosts, Some(path))
+                if path.is_absolute()
+                    && !path
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir)) =>
+            {
+                if !(key == "github.com"
+                    || key.strip_prefix("github.com:").is_some_and(|suffix| {
+                        !suffix.is_empty()
+                            && suffix
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+                    }))
+                {
+                    return Err(AccountError::Input);
+                }
+                path.to_str().ok_or(AccountError::Input)?
+            }
+            (CopilotLocation::GhKeychain, None) => "gh:github.com",
+            _ => return Err(AccountError::Input),
+        };
+        Ok(crate::cache::fingerprint(&[
+            "copilot_native",
+            location,
+            key,
+        ]))
+    }
+    pub async fn resolve(&self) -> Result<Resolved, AccountError> {
+        self.identity()?;
+        let token = crate::providers::catalog::oauth_primary::copilot_reference_token(
+            self.path.clone(),
+            &self.entry_key,
+        )
+        .await?;
+        Ok(Resolved {
+            label: format!("Copilot {}", &self.identity()?[..8]),
+            provider: crate::cli::Provider::Catalog("copilot"),
+            plan: None,
+            subscription_status: None,
+            credentials: vec![Credential::CatalogKey {
+                token: token.0,
+                settings: Default::default(),
+            }],
+        })
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ClaudeLocation {
     CodeFile,
     CodeKeychain,
@@ -311,6 +405,11 @@ impl Credential {
         provider: crate::cli::Provider,
     ) -> Result<Option<Resolved>, AccountError> {
         match self {
+            Self::CopilotNative { source }
+                if provider == crate::cli::Provider::Catalog("copilot") =>
+            {
+                source.resolve().await.map(Some)
+            }
             Self::ClaudeNative { source }
                 if provider == crate::cli::Provider::Catalog("claude") =>
             {
@@ -345,6 +444,7 @@ impl Credential {
             Self::QuotioCustomProvider { .. }
             | Self::CodexNative { .. }
             | Self::ClaudeNative { .. }
+            | Self::CopilotNative { .. }
             | Self::AmpNative { .. }
             | Self::GrokNative { .. }
             | Self::CursorNative { .. } => Err(AccountError::Unsupported),
@@ -544,6 +644,76 @@ fn read_preferences(_: QuotioDomain) -> Result<Vec<u8>, AccountError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn copilot_native_pins_one_entry_and_rejects_hostile_files() {
+        let dir = std::env::temp_dir().join(super::super::random_string().unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("apps.json");
+        let source = CopilotNativeReference {
+            location: CopilotLocation::Apps,
+            path: Some(path.clone()),
+            entry_key: "github.com:chosen".into(),
+        };
+        std::fs::write(&path, br#"{"github.com:other":{"oauth_token":"wrong"}}"#).unwrap();
+        assert!(source.resolve().await.is_err());
+        std::fs::write(&path, br#"{"github.com:other":{"oauth_token":"wrong"},"github.com:chosen":{"oauth_token":"right"}}"#).unwrap();
+        let resolved = source.resolve().await.unwrap();
+        assert!(
+            matches!(&resolved.credentials[0], Credential::CatalogKey { token, .. } if token == "right")
+        );
+        let mut other = source.clone();
+        other.entry_key = "github.com:other".into();
+        assert_ne!(source.identity().unwrap(), other.identity().unwrap());
+        for key in [
+            "",
+            "github.enterprise",
+            "github.com:",
+            "github.com:../../secret",
+        ] {
+            other.entry_key = key.into();
+            assert!(other.identity().is_err());
+        }
+        std::fs::write(&path, vec![b' '; 1024 * 1024 + 1]).unwrap();
+        assert!(source.resolve().await.is_err());
+        std::fs::remove_file(&path).unwrap();
+        #[cfg(unix)]
+        {
+            let other = dir.join("other.json");
+            std::fs::write(&other, br#"{"github.com:chosen":{"oauth_token":"right"}}"#).unwrap();
+            std::os::unix::fs::symlink(&other, &path).unwrap();
+            assert!(source.resolve().await.is_err());
+        }
+        assert!(matches!(
+            Credential::CopilotNative { source }
+                .resolve_reference(crate::cli::Provider::Amp)
+                .await,
+            Err(AccountError::Unsupported)
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn copilot_native_registration_rejects_paths_and_credentials() {
+        use crate::accounts::api::SourceInput;
+        let base = serde_json::json!({"kind":"copilot_native","location":"apps","entry_key":"github.com:fixture"});
+        assert!(serde_json::from_value::<SourceInput>(base.clone()).is_ok());
+        for field in [
+            "path",
+            "token",
+            "refresh_token",
+            "owned",
+            "source",
+            "enabled",
+        ] {
+            let mut value = base.clone();
+            value[field] = "fixture".into();
+            assert!(serde_json::from_value::<SourceInput>(value).is_err());
+        }
+        for location in ["proxy", "gh_file", "default"] {
+            let mut value = base.clone();
+            value["location"] = location.into();
+            assert!(serde_json::from_value::<SourceInput>(value).is_err());
+        }
+    }
     #[test]
     fn claude_native_registration_rejects_paths_credentials_and_desktop() {
         use crate::accounts::api::SourceInput;

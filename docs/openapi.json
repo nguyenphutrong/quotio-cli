@@ -2054,6 +2054,7 @@
               "amp_native",
               "codex_native",
               "claude_native",
+              "copilot_native",
               "quotio_custom_provider"
             ]
           }
@@ -2168,6 +2169,7 @@
                     "amp_native",
                     "codex_native",
                     "claude_native",
+                    "copilot_native",
                     "cursor_native",
                     "grok_native"
                   ]
@@ -2729,6 +2731,25 @@
       },
       "AccountSourceInput": {
         "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "location", "entry_key"],
+            "properties": {
+              "kind": {"const": "copilot_native"},
+              "location": {
+                "type": "string",
+                "enum": ["apps", "hosts", "gh_keychain"],
+                "description": "apps and hosts pin ~/.config/github-copilot/apps.json or hosts.json. gh_keychain reads the gh:github.com service on macOS only. Read-only; no refresh, fallback or proxy discovery."
+              },
+              "entry_key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "description": "Exact JSON entry, github.com or github.com:<app-id>. For gh_keychain, the exact Keychain account."
+              }
+            }
+          },
           {
             "type": "object",
             "additionalProperties": false,

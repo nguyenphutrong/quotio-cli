@@ -76,6 +76,9 @@ pub enum Credential {
     ClaudeNative {
         source: sources::ClaudeNativeReference,
     },
+    CopilotNative {
+        source: sources::CopilotNativeReference,
+    },
     CursorNative {
         source: sources::CursorNativeReference,
     },
@@ -139,6 +142,7 @@ impl Account {
         match self.credential {
             Credential::QuotioCustomProvider { .. } => AccountOrigin::BorrowedProxy,
             Credential::AmpNative { .. }
+            | Credential::CopilotNative { .. }
             | Credential::ClaudeNative { .. }
             | Credential::CodexNative { .. }
             | Credential::CursorNative { .. }
@@ -203,6 +207,7 @@ impl Document {
             Credential::QuotioCustomProvider { .. }
                 | Credential::AmpNative { .. }
                 | Credential::ClaudeNative { .. }
+                | Credential::CopilotNative { .. }
                 | Credential::CodexNative { .. }
                 | Credential::CursorNative { .. }
                 | Credential::GrokNative { .. }

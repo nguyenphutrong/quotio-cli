@@ -176,6 +176,21 @@ fn codex_source_rest_runs_with_an_isolated_home() {
     let original = br#"{"tokens":{"access_token":"synthetic-native-secret","account_id":"fixture-id","refresh_token":"synthetic-owner-refresh"}}"#;
     let path = dir.join(".codex/auth.json");
     std::fs::write(&path, original).unwrap();
+    let native_fixtures = [
+        (
+            ".claude/.credentials.json",
+            r#"{"claudeAiOauth":{"accessToken":"synthetic-claude-secret","refreshToken":"owner-refresh"}}"#,
+        ),
+        (
+            ".config/github-copilot/apps.json",
+            r#"{"github.com:fixture":{"oauth_token":"synthetic-copilot-secret"}}"#,
+        ),
+    ];
+    for (relative, bytes) in native_fixtures {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -194,6 +209,9 @@ fn codex_source_rest_runs_with_an_isolated_home() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(std::fs::read(&path).unwrap(), original);
+    for (relative, bytes) in native_fixtures {
+        assert_eq!(std::fs::read(dir.join(relative)).unwrap(), bytes.as_bytes());
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }
 #[tokio::test]
@@ -221,6 +239,9 @@ async fn codex_source_rest_child() {
         .unwrap();
     let base = format!("http://{address}");
     for input in [
+        json!({"kind":"copilot_native","location":"proxy","entry_key":"github.com"}),
+        json!({"kind":"copilot_native","location":"apps","entry_key":"github.com","path":"/tmp/untrusted"}),
+        json!({"kind":"copilot_native","location":"apps","entry_key":"github.com","refresh_token":"fixture"}),
         json!({"kind":"claude_native","location":"desktop"}),
         json!({"kind":"claude_native","location":"code_file","path":"/tmp/untrusted"}),
         json!({"kind":"claude_native","location":"code_file","refresh_token":"fixture"}),
@@ -234,6 +255,31 @@ async fn codex_source_rest_child() {
             .await
             .unwrap();
         assert_eq!(response.status(), 400);
+    }
+    for input in [
+        json!({"kind":"claude_native","location":"code_file"}),
+        json!({"kind":"copilot_native","location":"apps","entry_key":"github.com:fixture"}),
+    ] {
+        let kind = input["kind"].as_str().unwrap();
+        let request = || {
+            client
+                .post(format!("{base}/v1/account-sources"))
+                .bearer_auth(token)
+                .header("Idempotency-Key", kind)
+                .json(&input)
+        };
+        let response = request().send().await.unwrap();
+        assert_eq!(response.status(), 202);
+        let operation: Value = response.json().await.unwrap();
+        let completed =
+            serde_json::to_value(done(&state, operation["id"].as_str().unwrap()).await).unwrap();
+        assert_eq!(completed["status"], "completed", "{completed}");
+        assert!(
+            !completed.to_string().contains("synthetic-")
+                && !completed.to_string().contains("owner-refresh")
+        );
+        let replay: Value = request().send().await.unwrap().json().await.unwrap();
+        assert_eq!(operation["id"], replay["id"]);
     }
     let input = json!({"kind":"codex_native"});
     let unauth = client

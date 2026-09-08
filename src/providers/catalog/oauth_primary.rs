@@ -188,7 +188,7 @@ async fn native_file(path: PathBuf) -> Result<Option<Vec<u8>>, ProviderError> {
 
 async fn native_keychain(
     service: &'static str,
-    account: Option<&'static str>,
+    account: Option<&str>,
 ) -> Result<Option<Vec<u8>>, ProviderError> {
     let account = account.map(str::to_owned);
     match tokio::time::timeout(
@@ -690,6 +690,33 @@ fn copilot_keychain_token(bytes: &[u8]) -> Result<Option<Secret>, ProviderError>
     token(value)
 }
 
+pub(crate) async fn copilot_reference_token(
+    path: Option<PathBuf>,
+    entry: &str,
+) -> Result<Secret, ProviderError> {
+    match path {
+        Some(path) => {
+            let bytes = native_file(path)
+                .await?
+                .ok_or(ProviderError::Authentication)?;
+            let value = json_payload(&bytes)?;
+            let raw = value
+                .as_object()
+                .and_then(|object| object.get(entry))
+                .and_then(|entry| entry.get("oauth_token"))
+                .and_then(Value::as_str)
+                .ok_or(ProviderError::Authentication)?;
+            token(raw)?.ok_or(ProviderError::Authentication)
+        }
+        None => {
+            let bytes = native_keychain("gh:github.com", Some(entry))
+                .await?
+                .ok_or(ProviderError::Authentication)?;
+            copilot_keychain_token(&bytes)?.ok_or(ProviderError::Authentication)
+        }
+    }
+}
+
 async fn native_copilot_token() -> Result<Secret, ProviderError> {
     let mut last = ProviderError::Authentication;
     if let Some(home) = home_dir() {
@@ -935,7 +962,7 @@ fn copilot_usage(value: &Value, now: OffsetDateTime) -> Result<CopilotUsage, Pro
     Ok(CopilotUsage { plan, windows })
 }
 
-async fn fetch_copilot_at(
+pub(crate) async fn fetch_copilot_at(
     context: &ProviderContext,
     endpoint: &str,
 ) -> Result<ProviderUsage, ProviderError> {

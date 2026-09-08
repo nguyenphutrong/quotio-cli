@@ -30,6 +30,7 @@ impl From<&super::Account> for AccountDto {
                 Credential::AmpNative { .. } => Some("amp_native"),
                 Credential::CodexNative { .. } => Some("codex_native"),
                 Credential::ClaudeNative { .. } => Some("claude_native"),
+                Credential::CopilotNative { .. } => Some("copilot_native"),
                 Credential::QuotioCustomProvider { .. } => Some("quotio_custom_provider"),
                 _ => None,
             },
@@ -153,6 +154,10 @@ pub struct PreparedAccount {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceInput {
+    CopilotNative {
+        location: super::sources::CopilotLocation,
+        entry_key: String,
+    },
     ClaudeNative {
         location: super::sources::ClaudeLocation,
     },
@@ -171,6 +176,18 @@ pub enum SourceInput {
 }
 pub async fn prepare_source(input: SourceInput) -> Result<PreparedAccount, AccountError> {
     let (identity, credential, resolved) = match input {
+        SourceInput::CopilotNative {
+            location,
+            entry_key,
+        } => {
+            let source = super::sources::CopilotNativeReference::system(location, entry_key)?;
+            let resolved = source.resolve().await?;
+            (
+                source.identity()?,
+                Credential::CopilotNative { source },
+                resolved,
+            )
+        }
         SourceInput::ClaudeNative { location } => {
             let source = super::sources::ClaudeNativeReference::system(location)?;
             let resolved = source.resolve().await?;

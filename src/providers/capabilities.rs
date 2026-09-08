@@ -162,6 +162,13 @@ pub fn capability(provider: Provider) -> ProviderCapability {
                 origin: "borrowed_proxy",
                 credential_refresh: false,
             }]
+        } else if provider == Provider::Catalog("copilot") {
+            vec![SourceCapability {
+                kind: "copilot_native",
+                platforms: vec!["macos", "linux"],
+                origin: "borrowed_native",
+                credential_refresh: false,
+            }]
         } else if provider == Provider::Catalog("claude") {
             vec![SourceCapability {
                 kind: "claude_native",
