@@ -126,6 +126,7 @@ pub fn capability(provider: Provider) -> ProviderCapability {
     let auth = match provider {
         Provider::Codex => vec![AuthMethod::OAuth, AuthMethod::Native],
         Provider::Amp => vec![AuthMethod::ApiKey, AuthMethod::Native],
+        Provider::Factory => vec![AuthMethod::ApiKey, AuthMethod::OwnedToken],
         Provider::Catalog("grok") => vec![AuthMethod::Native, AuthMethod::OwnedToken],
         Provider::Antigravity => vec![AuthMethod::Native],
         Provider::Catalog(_) if native.is_some() => vec![AuthMethod::Native],
@@ -225,7 +226,10 @@ mod tests {
     fn registry_metadata_and_core_settings_are_exposed_without_environment_names() {
         let factory = capability(Provider::Factory);
         assert_eq!(factory.account_storage_platforms, vec!["macos", "linux"]);
-        assert_eq!(factory.auth, vec![AuthMethod::ApiKey]);
+        assert_eq!(
+            factory.auth,
+            vec![AuthMethod::ApiKey, AuthMethod::OwnedToken]
+        );
         assert!(
             factory
                 .settings

@@ -4,6 +4,137 @@ use serde::Deserialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub struct FactoryProvider;
+
+pub(crate) fn valid_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 16_384
+        && !value.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+// WorkOS uses JWT expiry. Opaque or malformed tokens need refresh, as in Swift.
+pub(crate) fn token_expiry(token: &str) -> i64 {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let parts: Vec<_> = token.split('.').collect();
+    if parts.len() != 3 {
+        return 0;
+    }
+    URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| value.get("exp").and_then(serde_json::Value::as_i64))
+        .filter(|expiry| *expiry >= 0)
+        .unwrap_or(0)
+}
+pub(crate) async fn refresh(
+    context: &ProviderContext,
+    previous: &crate::accounts::Credential,
+) -> Result<crate::accounts::Credential, crate::accounts::AccountError> {
+    refresh_at(
+        context,
+        previous,
+        "https://api.workos.com/user_management/authenticate",
+    )
+    .await
+}
+async fn refresh_at(
+    context: &ProviderContext,
+    previous: &crate::accounts::Credential,
+    endpoint: &str,
+) -> Result<crate::accounts::Credential, crate::accounts::AccountError> {
+    use crate::accounts::{AccountError, Credential};
+    let Credential::FactoryOAuth {
+        refresh_token,
+        organization_id,
+        ..
+    } = previous
+    else {
+        return Err(AccountError::Unsupported);
+    };
+    #[derive(Deserialize)]
+    struct Tokens {
+        access_token: String,
+        refresh_token: Option<String>,
+    }
+    let mut form = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token.as_str()),
+        ("client_id", "client_01HNM792M5G5G1A2THWPXKFMXB"),
+    ];
+    if let Some(org) = organization_id {
+        form.push(("organization_id", org));
+    }
+    let tokens: Tokens = http::json(
+        context
+            .http
+            .post(endpoint)
+            .header("Accept", "application/json")
+            .form(&form),
+        context.clock.now(),
+    )
+    .await?;
+    let rotated = tokens
+        .refresh_token
+        .unwrap_or_else(|| refresh_token.clone());
+    if !valid_token(&tokens.access_token) || !valid_token(&rotated) {
+        return Err(AccountError::OAuth);
+    }
+    Ok(Credential::FactoryOAuth {
+        expires_at: token_expiry(&tokens.access_token),
+        access_token: tokens.access_token,
+        refresh_token: rotated,
+        organization_id: organization_id.clone(),
+        refresh_pending: false,
+    })
+}
+pub(crate) async fn fetch_oauth_at(
+    context: &ProviderContext,
+    credential: &crate::accounts::Credential,
+    endpoint: &str,
+) -> Result<ProviderUsage, crate::accounts::AccountError> {
+    use crate::accounts::{AccountError, Credential};
+    let Credential::FactoryOAuth {
+        access_token,
+        organization_id,
+        refresh_pending,
+        ..
+    } = credential
+    else {
+        return Err(AccountError::Unsupported);
+    };
+    if *refresh_pending {
+        return Err(AccountError::CommitUncertain);
+    }
+    let response: Response = http::json(
+        context
+            .http
+            .get(endpoint)
+            .header(
+                "Authorization",
+                http::sensitive(&format!("Bearer {access_token}"))?,
+            )
+            .header("Accept", "application/json"),
+        context.clock.now(),
+    )
+    .await?;
+    let id = organization_id
+        .clone()
+        .unwrap_or_else(|| "Factory Droid".into());
+    Ok(ProviderUsage {
+        codex_profile: None,
+        codex_reset_credits: None,
+        diagnostics: vec![],
+        account_ref: None,
+        provider: ProviderId("factory".into()),
+        account: AccountIdentity {
+            id: id.clone(),
+            label: id,
+            plan: None,
+            subscription_status: None,
+        },
+        windows: parse_windows(response, context.clock.now())?,
+    })
+}
+
 #[derive(Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct Identity {
@@ -264,6 +395,66 @@ impl ProviderAdapter for FactoryProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn workos_contract_rotation_and_quota_are_separate() {
+        use crate::accounts::Credential;
+        let credential = Credential::FactoryOAuth {
+            access_token: "old".into(),
+            refresh_token: "refresh+&".into(),
+            organization_id: Some("org+&".into()),
+            expires_at: 0,
+            refresh_pending: true,
+        };
+        for rotated in [None, Some("rotated")] {
+            let (endpoint, server) = http::fixture::server(vec![
+                serde_json::json!({"access_token":"new", "refresh_token":rotated}),
+            ])
+            .await;
+            let updated = refresh_at(&http::fixture::context(), &credential, &endpoint)
+                .await
+                .unwrap();
+            assert!(
+                matches!(&updated, Credential::FactoryOAuth { refresh_token, refresh_pending: false, expires_at: 0, .. } if refresh_token == rotated.unwrap_or("refresh+&"))
+            );
+            let requests = server.await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("POST "));
+            assert!(requests[0].contains("client_id=client_01HNM792M5G5G1A2THWPXKFMXB"));
+            assert!(requests[0].contains("refresh_token=refresh%2B%26"));
+            assert!(requests[0].contains("organization_id=org%2B%26"));
+            assert!(
+                requests[0]
+                    .to_lowercase()
+                    .contains("application/x-www-form-urlencoded")
+            );
+            let (endpoint, server) = http::fixture::server(vec![
+                serde_json::json!({"usesTokenRateLimitsBilling":false}),
+            ])
+            .await;
+            let usage = fetch_oauth_at(&http::fixture::context(), &updated, &endpoint)
+                .await
+                .unwrap();
+            assert_eq!(usage.account.id, "org+&");
+            assert_eq!(usage.windows[0].note.as_deref(), Some("legacy-billing"));
+            let requests = server.await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("GET ") && requests[0].contains("Bearer new"));
+            assert!(!requests[0].to_lowercase().contains("x-factory-org-id"));
+        }
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"access_token":""}),
+            serde_json::json!({"access_token":"new", "refresh_token":""}),
+        ] {
+            let (endpoint, server) = http::fixture::server(vec![body]).await;
+            assert!(
+                refresh_at(&http::fixture::context(), &credential, &endpoint)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(server.await.unwrap().len(), 1);
+        }
+    }
     fn identity() -> Identity {
         Identity {
             user_id: "demo-user".into(),

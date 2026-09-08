@@ -105,6 +105,7 @@ fn credential(input: ApiKeyInput, context: &ProviderContext) -> Result<Credentia
 pub enum AccountCreateInput {
     ApiKey(ApiKeyInput),
     GrokOwned(GrokOwnedInput),
+    FactoryOwned(FactoryOwnedInput),
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -140,6 +141,49 @@ pub fn prepare_grok_owned(input: GrokOwnedInput) -> Result<PreparedAccount, Acco
             .0,
             refresh_token: input.refresh_token,
             expires_at: input.expires_at,
+            refresh_pending: false,
+        },
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactoryOwnedKind {
+    FactoryOwned,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FactoryOwnedInput {
+    pub kind: FactoryOwnedKind,
+    pub label: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub organization_id: Option<String>,
+}
+pub fn prepare_factory_owned(input: FactoryOwnedInput) -> Result<PreparedAccount, AccountError> {
+    use crate::providers::factory::{token_expiry, valid_token};
+    if !valid_token(&input.access_token)
+        || !valid_token(&input.refresh_token)
+        || input
+            .organization_id
+            .as_ref()
+            .is_some_and(|id| !valid_token(id) || id.len() > 256)
+    {
+        return Err(AccountError::Input);
+    }
+    Ok(PreparedAccount {
+        provider: Provider::Factory,
+        label: super::validate_label(&input.label)?,
+        identity: crate::cache::fingerprint(&[
+            "factory_owned",
+            &input.refresh_token,
+            input.organization_id.as_deref().unwrap_or(""),
+        ]),
+        credential: Credential::FactoryOAuth {
+            expires_at: token_expiry(&input.access_token),
+            access_token: input.access_token,
+            refresh_token: input.refresh_token,
+            organization_id: input.organization_id,
             refresh_pending: false,
         },
     })

@@ -484,6 +484,9 @@
                   },
                   {
                     "$ref": "#/components/schemas/GrokOwnedInput"
+                  },
+                  {
+                    "$ref": "#/components/schemas/FactoryOwnedInput"
                   }
                 ]
               }
@@ -2858,6 +2861,19 @@
             "additionalProperties": false
           }
         ]
+      },
+      "FactoryOwnedInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "label", "access_token", "refresh_token"],
+        "properties": {
+          "kind": {"const": "factory_owned"},
+          "label": {"type": "string", "minLength": 1, "maxLength": 80},
+          "access_token": {"type": "string", "minLength": 1, "maxLength": 16384, "writeOnly": true},
+          "refresh_token": {"type": "string", "minLength": 1, "maxLength": 16384, "writeOnly": true},
+          "organization_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 256}
+        },
+        "description": "Separately owned Factory OAuth tokens for WorkOS client_01HNM792M5G5G1A2THWPXKFMXB only. Global Factory endpoint only; no custom client ID, region, endpoint or browser login. JWT expiry is read from the access token; unknown expiry triggers refresh. Tokens are persisted before refresh, and rotation before quota. Interrupted or failed refresh is durably fenced; remove the account and supply separately owned credentials to recover. Does not transfer ownership of a native login."
       },
       "GrokOwnedInput": {
         "type": "object",

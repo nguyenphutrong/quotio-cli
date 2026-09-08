@@ -204,6 +204,9 @@ async fn mutate(
                             api::AccountCreateInput::ApiKey(input) => {
                                 api::prepare(&work.context, input).await
                             }
+                            api::AccountCreateInput::FactoryOwned(input) => {
+                                api::prepare_factory_owned(input)
+                            }
                             api::AccountCreateInput::GrokOwned(input) => {
                                 api::prepare_grok_owned(input)
                             }

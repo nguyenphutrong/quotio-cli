@@ -25,6 +25,13 @@ fn scoped(
     credential: &Credential,
 ) -> Result<ProviderContext, AccountError> {
     let mut keys = HashMap::new();
+    if let Credential::FactoryOAuth {
+        refresh_pending: true,
+        ..
+    } = credential
+    {
+        return Err(AccountError::CommitUncertain);
+    }
     if let Credential::GrokOAuth {
         access_token,
         refresh_pending,
@@ -226,6 +233,14 @@ async fn validate_credential(
             crate::providers::catalog::oauth_primary::fetch_copilot_at(
                 &ctx,
                 endpoint_override.unwrap(),
+            )
+            .await?
+        }
+        Provider::Factory if matches!(credential, Credential::FactoryOAuth { .. }) => {
+            crate::providers::factory::fetch_oauth_at(
+                context,
+                credential,
+                endpoint_override.unwrap_or("https://api.factory.ai/api/billing/limits"),
             )
             .await?
         }
@@ -490,6 +505,7 @@ pub fn default_label(
         | Credential::GrokNative { .. }
         | Credential::CursorNative { .. } => Err(AccountError::Input),
         Credential::GrokOAuth { .. } => Ok("Grok owned account".into()),
+        Credential::FactoryOAuth { .. } => Ok("Factory owned account".into()),
         Credential::CodexOAuth { email, .. } => super::validate_label(email),
         Credential::ApiKey { token, .. } | Credential::CatalogKey { token, .. } => {
             let suffix =
@@ -534,7 +550,9 @@ impl Operations for Network {
         k: &'a Credential,
     ) -> OperationFuture<'a, Credential> {
         Box::pin(async move {
-            if matches!(k, Credential::GrokOAuth { .. }) {
+            if matches!(k, Credential::FactoryOAuth { .. }) {
+                crate::providers::factory::refresh(c, k).await
+            } else if matches!(k, Credential::GrokOAuth { .. }) {
                 crate::providers::catalog::oauth_editors::refresh_grok(c, k).await
             } else {
                 super::oauth::refresh(c, k).await
@@ -571,13 +589,18 @@ impl ManagedProvider {
             Credential::GrokOAuth {
                 refresh_pending: true,
                 ..
+            } | Credential::FactoryOAuth {
+                refresh_pending: true,
+                ..
             }
         ) {
             return Err(AccountError::CommitUncertain);
         }
         if !matches!(
             credential,
-            Credential::CodexOAuth { .. } | Credential::GrokOAuth { .. }
+            Credential::CodexOAuth { .. }
+                | Credential::GrokOAuth { .. }
+                | Credential::FactoryOAuth { .. }
         ) {
             let usage = self
                 .operations
@@ -590,7 +613,7 @@ impl ManagedProvider {
         } else {
             60
         };
-        let needs_refresh = matches!(&credential,Credential::CodexOAuth{expires_at,..} | Credential::GrokOAuth{expires_at,..} if *expires_at<=context.clock.now().unix_timestamp()+refresh_margin);
+        let needs_refresh = matches!(&credential,Credential::CodexOAuth{expires_at,..} | Credential::GrokOAuth{expires_at,..} | Credential::FactoryOAuth{expires_at,..} if *expires_at<=context.clock.now().unix_timestamp()+refresh_margin);
         if !needs_refresh {
             match self
                 .operations
@@ -627,6 +650,9 @@ impl ManagedProvider {
         // Persist a fence first so later reads cannot replay that request.
         let mut latest = latest;
         if let Credential::GrokOAuth {
+            refresh_pending, ..
+        }
+        | Credential::FactoryOAuth {
             refresh_pending, ..
         } = &mut latest
         {
@@ -708,6 +734,10 @@ impl ProviderAdapter for ManagedProvider {
                 Credential::GrokOAuth {
                     refresh_pending: true,
                     ..
+                }
+                | Credential::FactoryOAuth {
+                    refresh_pending: true,
+                    ..
                 } => return None,
                 Credential::QuotioCustomProvider { .. }
                 | Credential::AmpNative { .. }
@@ -746,7 +776,7 @@ impl ProviderAdapter for ManagedProvider {
     }
     fn idempotent(&self) -> bool {
         self.provider != Provider::Codex
-            && !(self.provider == Provider::Catalog("grok")
+            && !(matches!(self.provider, Provider::Factory | Provider::Catalog("grok"))
                 && self.origin == super::AccountOrigin::Owned)
     }
     fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
@@ -1138,7 +1168,9 @@ mod tests {
                         doc.accounts.iter().any(|a| matches!((&a.credential,k),(Credential::CodexOAuth{refresh_token,account_id:stored,..},Credential::CodexOAuth{account_id:expected,..}) if refresh_token=="rotated" && stored==expected))
                     );
                 }
-                if let Credential::GrokOAuth { access_token, .. } = k {
+                if let Credential::GrokOAuth { access_token, .. }
+                | Credential::FactoryOAuth { access_token, .. } = k
+                {
                     assert_eq!(access_token, "new");
                     let doc: super::super::Document =
                         serde_json::from_slice(&self.memory.read().unwrap().unwrap()).unwrap();
@@ -1181,6 +1213,13 @@ mod tests {
                     refresh_token,
                     expires_at,
                     refresh_pending,
+                }
+                | Credential::FactoryOAuth {
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    refresh_pending,
+                    ..
                 } = &mut k
                 {
                     assert!(*refresh_pending);
@@ -1189,6 +1228,9 @@ mod tests {
                     assert!(doc.accounts.iter().any(|a| matches!(
                         a.credential,
                         Credential::GrokOAuth {
+                            refresh_pending: true,
+                            ..
+                        } | Credential::FactoryOAuth {
                             refresh_pending: true,
                             ..
                         }
@@ -2029,6 +2071,75 @@ mod tests {
         }
         std::fs::remove_dir(path).unwrap();
     }
+    #[tokio::test]
+    async fn factory_rotation_and_uncertain_writes_never_replay() {
+        struct FailingWrite {
+            memory: Arc<Memory>,
+            mode: u8,
+        }
+        impl Backend for FailingWrite {
+            fn read(&self) -> Result<Option<Vec<u8>>, AccountError> {
+                self.memory.read()
+            }
+            fn write(&self, bytes: &[u8]) -> Result<(), AccountError> {
+                let rotated = String::from_utf8_lossy(bytes).contains("rotated");
+                if (self.mode == 1 && !rotated) || (self.mode >= 2 && rotated) {
+                    if self.mode == 3 {
+                        self.memory.write(bytes)?;
+                    }
+                    return Err(AccountError::CommitUncertain);
+                }
+                self.memory.write(bytes)
+            }
+        }
+        for mode in 0..=4 {
+            let (vault, fake, id, _, path) = setup(0, false, mode == 4, true);
+            let mut tx = vault.begin().unwrap();
+            tx.document.accounts[0].provider = Provider::Factory;
+            tx.document.accounts[0].credential = Credential::FactoryOAuth {
+                access_token: "old".into(),
+                refresh_token: "refresh".into(),
+                organization_id: Some("org".into()),
+                expires_at: 0,
+                refresh_pending: false,
+            };
+            tx.commit().unwrap();
+            let failing = Vault::new(
+                Arc::new(FailingWrite {
+                    memory: fake.memory.clone(),
+                    mode,
+                }),
+                path.join("lock"),
+            );
+            let adapter = managed(failing, fake.clone(), id.clone(), Provider::Factory);
+            assert!(!adapter.idempotent());
+            let context = http::fixture::context();
+            assert!(adapter.read(&context).await.is_err());
+            assert_eq!(
+                fake.refreshes.load(Ordering::SeqCst),
+                usize::from(mode != 1)
+            );
+            assert_eq!(
+                fake.quota_calls.load(Ordering::SeqCst),
+                usize::from(mode == 0)
+            );
+            if mode != 1 {
+                let restarted = managed(
+                    Vault::new(fake.memory.clone(), path.join("lock")),
+                    fake.clone(),
+                    id,
+                    Provider::Factory,
+                );
+                assert!(restarted.read(&context).await.is_err());
+                assert_eq!(fake.refreshes.load(Ordering::SeqCst), 1);
+                if mode == 2 || mode == 4 {
+                    assert!(restarted.cache_identity(&context).await.is_none());
+                }
+            }
+            cleanup(path);
+        }
+    }
+
     #[tokio::test]
     async fn grok_owned_rotation_persists_before_quota_and_uncertainty_blocks_replay() {
         for refresh_fails in [false, true] {

@@ -60,6 +60,14 @@ pub enum AccountError {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Credential {
+    FactoryOAuth {
+        access_token: String,
+        refresh_token: String,
+        organization_id: Option<String>,
+        expires_at: i64,
+        #[serde(default)]
+        refresh_pending: bool,
+    },
     GrokOAuth {
         access_token: String,
         refresh_token: String,
