@@ -1,7 +1,7 @@
 # Offline PIV envelope assessment
 
 `migration-inspect` checks one explicitly supplied Swift `.qsv` file. It can save
-an immutable assessment receipt. It does **not** stage credentials or perform an
+an assessment receipt without replacing existing files. It does **not** stage credentials or perform an
 account migration. Every result reports `migration_blocked: true` and exits with
 status 2, including when receipt staging succeeds.
 
@@ -71,10 +71,20 @@ Validation follows the inspected Swift `FileAccountMetadataRepository` payload a
 - The root contains `accounts` and `disabledAccountIDs`.
 - Each account has `id`, `provider`, `accountKey`, `displayName` and `source`.
   Optional fields are `credentialReference`, `canDelete` and `isDisabled`.
-- Account IDs must be unique. Disabled IDs must be unique and refer to a record.
-  Unknown fields, invalid types, control characters and unsupported sources fail.
-- The selected record must match every declaration exactly. References are compared
-  as metadata only, never opened. A `keychain` reference is not a file path.
+- Account IDs and disabled IDs must be unique, nonempty strings without control
+  characters (at most 4096 bytes). Disabled IDs may refer to native accounts that
+  Swift discovers but does not persist. They are preserved without discovery.
+  Unknown fields, invalid types and unsupported sources fail.
+- The selected record must match every declaration exactly. Only `quotioKeychain`
+  and `apiKey` with the literal `keychain` reference are supported. Selected
+  `nativeCredential`, `localIDE` and `legacyCLIProxy` records are rejected.
+- Supported providers are `claude`, `codex`, `antigravity`, `kiro`, `github-copilot`,
+  `cursor`, `factory-droid`, `devin`, `grok`, `openrouter`, `amp`, `glm`, `warp`, and
+  `clinepass`. The service must be `monitor-auth` under `app.bytrong.quotio`,
+  `dev.quotio.desktop`, `proseek.io.vn.Quotio`, or `com.quotio` (joined with a dot),
+  matching Swift's credential store and production/legacy identities. Other
+  services and references fail, even if the filename matches.
+  References are metadata only, never opened; `keychain` is not a file path.
 - The receipt retains record and repository disabled flags separately. Swift's
   selection policy uses the repository disabled-ID set; the tool does not enable
   an account or resolve differing flags by changing the source.
@@ -113,7 +123,11 @@ path lookup. It does not promise that the owner app has stopped changing its fil
 A restart reassesses the supplied files and verifies already published artifacts.
 A partial stage can leave complete artifacts without a receipt; rerunning completes
 it without replacing them. Changed source bytes produce new artifacts and receipts.
-Changed or unsafe destination bytes fail rather than being overwritten. Original
+Destination verification checks bytes, descriptor/path identity, permissions and
+change timestamps before and after reading and syncing. Detected changes fail
+rather than being overwritten. This requires a trusted owner-controlled 0700
+directory: it does not promise immutability against the owner or a process that
+can mutate files after the final check. Original
 files remain untouched. PIV encryption is never replaced with a software vault.
 
 ### Proposed CLI wiring

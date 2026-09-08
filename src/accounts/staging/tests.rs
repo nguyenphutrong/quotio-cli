@@ -205,7 +205,7 @@ fn mapping() -> Mapping<'static> {
         provider: "amp",
         source: "quotioKeychain",
         credential_reference: Some("keychain"),
-        service: "fixture-service",
+        service: "app.bytrong.quotio.monitor-auth",
     }
 }
 
@@ -214,7 +214,7 @@ fn mapping_files(f: &Fixture) -> (PathBuf, PathBuf) {
     fs::write(&metadata, br#"{"accounts":[{"id":"fixture-account","provider":"amp","accountKey":"fixture-label","displayName":"fixture-name","source":"quotioKeychain","credentialReference":"keychain","canDelete":true,"isDisabled":false}],"disabledAccountIDs":["fixture-account"]}"#).unwrap();
     let envelope = f.0.join(format!(
         "{}.qsv",
-        digest(b"fixture-service\0fixture-account")
+        digest(b"app.bytrong.quotio.monitor-auth\0fixture-account")
     ));
     fs::rename(f.envelope(), &envelope).unwrap();
     (metadata, envelope)
@@ -227,6 +227,8 @@ fn mapping_stages_exact_encrypted_bytes_with_private_restart_and_concurrent_rece
     let (metadata, envelope) = mapping_files(&f);
     let original_metadata = fs::read(&metadata).unwrap();
     let original_envelope = fs::read(&envelope).unwrap();
+    let metadata_mode = fs::metadata(&metadata).unwrap().mode();
+    let envelope_mode = fs::metadata(&envelope).unwrap().mode();
     let assess = || assess_mapping(&metadata, &envelope, &"a".repeat(64), &mapping()).unwrap();
     let snapshot = assess();
     let json = serde_json::to_string(snapshot.plan()).unwrap();
@@ -264,6 +266,8 @@ fn mapping_stages_exact_encrypted_bytes_with_private_restart_and_concurrent_rece
     assert_eq!(fs::metadata(&receipt).unwrap().ino(), inode);
     assert_eq!(fs::read(&metadata).unwrap(), original_metadata);
     assert_eq!(fs::read(&envelope).unwrap(), original_envelope);
+    assert_eq!(fs::metadata(&metadata).unwrap().mode(), metadata_mode);
+    assert_eq!(fs::metadata(&envelope).unwrap().mode(), envelope_mode);
     let staged = dest.0.join(format!("{}.qsv", digest(&original_envelope)));
     assert_eq!(fs::read(&staged).unwrap(), original_envelope);
     assert_eq!(fs::metadata(&staged).unwrap().mode() & 0o777, 0o600);
@@ -309,7 +313,7 @@ fn mapping_rejects_ambiguity_unknown_dates_mismatch_and_unsafe_sources() {
                 let account = value["accounts"][0].clone();
                 value["accounts"].as_array_mut().unwrap().push(account);
             }
-            1 => value["disabledAccountIDs"] = serde_json::json!(["unknown"]),
+            1 => value["disabledAccountIDs"] = serde_json::json!(["unknown", "unknown"]),
             2 => value["accounts"][0]["expiresAt"] = 0.into(),
             _ => value["accounts"][0]["source"] = "path/with\ncontrol".into(),
         }
@@ -338,6 +342,87 @@ fn mapping_destination_descriptor_stays_pinned_when_directory_is_renamed() {
     unix::save_to(&pinned, "fixture.json", b"fixture").unwrap();
     assert!(!target.join("fixture.json").exists());
     assert_eq!(fs::read(moved.join("fixture.json")).unwrap(), b"fixture");
+}
+
+#[test]
+fn mappings_reject_matching_borrowed_and_unknown_declarations() {
+    let f = Fixture::new();
+    let (metadata, envelope) = mapping_files(&f);
+    let valid: serde_json::Value = serde_json::from_slice(&fs::read(&metadata).unwrap()).unwrap();
+    for (field, value) in [
+        ("source", "nativeCredential"),
+        ("source", "localIDE"),
+        ("source", "legacyCLIProxy"),
+        ("provider", "unknown"),
+        ("credentialReference", "arbitrary"),
+    ] {
+        let mut payload = valid.clone();
+        payload["accounts"][0][field] = value.into();
+        fs::write(&metadata, serde_json::to_vec(&payload).unwrap()).unwrap();
+        let mut declaration = mapping();
+        match field {
+            "source" => declaration.source = value,
+            "provider" => declaration.provider = value,
+            _ => declaration.credential_reference = Some(value),
+        }
+        assert!(assess_mapping(&metadata, &envelope, &"a".repeat(64), &declaration).is_err());
+    }
+    fs::write(&metadata, serde_json::to_vec(&valid).unwrap()).unwrap();
+    let mut declaration = mapping();
+    declaration.service = "arbitrary-service";
+    let renamed = f.0.join(format!(
+        "{}.qsv",
+        digest(b"arbitrary-service\0fixture-account")
+    ));
+    fs::rename(&envelope, &renamed).unwrap();
+    assert!(assess_mapping(&metadata, &renamed, &"a".repeat(64), &declaration).is_err());
+}
+
+#[test]
+fn unmatched_disabled_native_ids_are_preserved_without_discovery() {
+    let f = Fixture::new();
+    let (metadata, envelope) = mapping_files(&f);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metadata).unwrap()).unwrap();
+    value["disabledAccountIDs"] = serde_json::json!(["native-not-persisted"]);
+    fs::write(&metadata, serde_json::to_vec(&value).unwrap()).unwrap();
+    let assessment = assess_mapping(&metadata, &envelope, &"a".repeat(64), &mapping()).unwrap();
+    assert!(!assessment.plan.repository_disabled);
+    assert_eq!(assessment.metadata, fs::read(&metadata).unwrap());
+    for id in ["", "bad\nidentifier"] {
+        value["disabledAccountIDs"] = serde_json::json!([id]);
+        fs::write(&metadata, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(assess_mapping(&metadata, &envelope, &"a".repeat(64), &mapping()).is_err());
+    }
+}
+
+#[test]
+fn destination_mutations_during_verification_are_detected() {
+    for preexisting in [false, true] {
+        for replace in [false, true] {
+            let f = Fixture::new();
+            let path = f.0.join("receipt.json");
+            if preexisting {
+                unix::save(&f.0, "receipt.json", b"expected").unwrap();
+            }
+            let mutated = std::cell::Cell::new(false);
+            let result = unix::save_with_sync(&f.0, "receipt.json", b"expected", |file| {
+                // Directory sync occurs after publication and after receipt read.
+                if file.metadata()?.is_dir() && !mutated.replace(true) {
+                    if replace {
+                        let replacement = f.0.join("replacement");
+                        fs::write(&replacement, b"expected")?;
+                        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600))?;
+                        fs::rename(replacement, &path)?;
+                    } else {
+                        fs::write(&path, b"modified")?;
+                    }
+                }
+                file.sync_all()
+            });
+            assert!(matches!(result, Err(StagingError::Conflict)));
+        }
+    }
 }
 
 #[test]

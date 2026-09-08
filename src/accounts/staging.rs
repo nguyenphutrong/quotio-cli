@@ -106,7 +106,7 @@ pub fn assess(path: &Path, fingerprint: &str) -> Result<Plan, StagingError> {
     })
 }
 
-/// Stage the assessment, never the credential. A content-addressed receipt is immutable.
+/// Stage the assessment, never the credential. Existing receipts are never replaced.
 /// Reruns verify bytes and sync the existing receipt instead of writing it again.
 pub fn stage(plan: &Plan, directory: &Path) -> Result<String, StagingError> {
     let bytes = serde_json::to_vec(plan).map_err(|_| StagingError::Storage)?;
@@ -240,7 +240,7 @@ pub fn assess_mapping(
     if payload
         .disabled_account_ids
         .iter()
-        .any(|id| !ids.contains(id.as_str()) || !disabled.insert(id.as_str()))
+        .any(|id| !identifier(id) || !disabled.insert(id.as_str()))
     {
         return Err(StagingError::Mapping);
     }
@@ -249,7 +249,37 @@ pub fn assess_mapping(
         .iter()
         .find(|a| a.id == mapping.account_id)
         .ok_or(StagingError::Mapping)?;
-    if account.provider != mapping.provider
+    // Swift's owned credential vault uses monitor-auth and the literal keychain reference.
+    // Borrowed records must never be promoted merely by renaming an envelope.
+    let known_provider = matches!(
+        mapping.provider,
+        "claude"
+            | "codex"
+            | "antigravity"
+            | "kiro"
+            | "github-copilot"
+            | "cursor"
+            | "factory-droid"
+            | "devin"
+            | "grok"
+            | "openrouter"
+            | "amp"
+            | "glm"
+            | "warp"
+            | "clinepass"
+    );
+    let known_service = matches!(
+        mapping.service,
+        "app.bytrong.quotio.monitor-auth"
+            | "dev.quotio.desktop.monitor-auth"
+            | "proseek.io.vn.Quotio.monitor-auth"
+            | "com.quotio.monitor-auth"
+    );
+    if !known_provider
+        || !known_service
+        || !matches!(mapping.source, "quotioKeychain" | "apiKey")
+        || mapping.credential_reference != Some("keychain")
+        || account.provider != mapping.provider
         || account.source != mapping.source
         || account.credential_reference.as_deref() != mapping.credential_reference
     {
@@ -308,7 +338,7 @@ pub fn assess_mapping(
     })
 }
 
-/// Explicit staging only. Publish immutable artifacts first and the receipt last.
+/// Explicit staging only. Publish artifacts without replacement, then the receipt.
 /// Rerunning a fresh assessment verifies existing bytes and completes partial staging.
 #[cfg(unix)]
 pub fn stage_mapping(
@@ -390,6 +420,19 @@ mod unix {
                 && m.uid() == unsafe { libc::geteuid() }
                 && (!private || m.mode() & 0o077 == 0)
         })
+    }
+
+    fn unchanged(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+        a.dev() == b.dev()
+            && a.ino() == b.ino()
+            && a.len() == b.len()
+            && a.mode() == b.mode()
+            && a.uid() == b.uid()
+            && a.nlink() == b.nlink()
+            && a.mtime() == b.mtime()
+            && a.mtime_nsec() == b.mtime_nsec()
+            && a.ctime() == b.ctime()
+            && a.ctime_nsec() == b.ctime_nsec()
     }
 
     pub(super) fn read_input(path: &Path) -> Result<Vec<u8>, StagingError> {
@@ -494,6 +537,7 @@ mod unix {
             if !regular(&existing, true) {
                 return Err(StagingError::Conflict);
             }
+            let before = existing.metadata().map_err(|_| StagingError::Conflict)?;
             let mut saved = Vec::new();
             (&mut existing)
                 .take(LIMIT + 1)
@@ -502,9 +546,24 @@ mod unix {
             if saved != bytes {
                 return Err(StagingError::Conflict);
             }
+            let stable = || {
+                let after = existing.metadata().map_err(|_| StagingError::Conflict)?;
+                let named = openat(dir, &name, libc::O_RDONLY)
+                    .and_then(|f| f.metadata())
+                    .map_err(|_| StagingError::Conflict)?;
+                if !regular(&existing, true)
+                    || !unchanged(&before, &after)
+                    || !unchanged(&after, &named)
+                {
+                    return Err(StagingError::Conflict);
+                }
+                Ok(())
+            };
+            stable()?;
             sync(&existing)
                 .and_then(|_| sync(dir))
-                .map_err(|_| StagingError::CommitUncertain)
+                .map_err(|_| StagingError::CommitUncertain)?;
+            stable()
         };
         match openat(dir, &name, libc::O_RDONLY) {
             Ok(_) => return verify(),
