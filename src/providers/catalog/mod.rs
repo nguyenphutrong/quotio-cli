@@ -21,6 +21,7 @@ pub mod azure;
 pub mod balances;
 pub mod coding;
 pub mod common;
+pub mod devin_desktop;
 pub mod doubao;
 pub mod gateways;
 pub mod infrastructure;
@@ -37,6 +38,7 @@ pub fn definitions() -> impl Iterator<Item = &'static Definition> {
         coding::DEFINITIONS,
         gateways::DEFINITIONS,
         tools::DEFINITIONS,
+        devin_desktop::DEFINITIONS,
         oauth_primary::DEFINITIONS,
         oauth_editors::DEFINITIONS,
         oauth_cloud::DEFINITIONS,
@@ -132,7 +134,7 @@ mod registry_tests {
                 definition
                     .id
                     .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
             );
             assert!(
                 definition
