@@ -76,6 +76,100 @@ pub(super) async fn fixture() -> (Arc<ApiState>, std::path::PathBuf, String) {
     )
 }
 #[test]
+fn grok_local_alias_runs_with_an_isolated_home() {
+    let dir = std::env::temp_dir().join(accounts::random_string().unwrap());
+    std::fs::create_dir(&dir).unwrap();
+    for independent_token in [false, true] {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "server::tests::grok_local_alias_child",
+                "--nocapture",
+            ])
+            .env("HOME", &dir)
+            .env("QUOTIO_GROK_ALIAS_FIXTURE", &dir)
+            .env_remove("GROK_OAUTH_TOKEN");
+        if independent_token {
+            command.env("GROK_OAUTH_TOKEN", "synthetic-independent-token");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn grok_local_alias_child() {
+    let Ok(home) = std::env::var("QUOTIO_GROK_ALIAS_FIXTURE") else {
+        return;
+    };
+    assert_eq!(std::env::var("HOME").unwrap(), home);
+    assert!(std::path::Path::new(&home).starts_with(std::env::temp_dir()));
+    let (mut state, dir, _) = fixture().await;
+    Arc::get_mut(&mut state).unwrap().no_saved_accounts = false;
+    state.settings.write().await.values.enabled_providers = vec!["grok".into()];
+    // Deliberately absent: rejection must not resolve the native credential.
+    let source = accounts::sources::GrokNativeReference {
+        path: dir.join("missing-auth.json"),
+        entry_key: "https://auth.x.ai::fixture".into(),
+    };
+    let vault = state.vault.as_ref().unwrap();
+    let mut tx = vault.begin().unwrap();
+    let id = tx
+        .document
+        .add(
+            Provider::Catalog("grok"),
+            "Native Grok",
+            source.identity().unwrap(),
+            Credential::GrokNative { source },
+        )
+        .unwrap();
+    tx.document.patch(&id, None, None, Some(false)).unwrap();
+    tx.commit().unwrap();
+    let result =
+        management::validate_refresh_account(&state, Provider::Catalog("grok"), "local").await;
+    if std::env::var_os("GROK_OAUTH_TOKEN").is_some() {
+        assert!(
+            result.is_ok(),
+            "independent environment token remains available"
+        );
+    } else {
+        assert!(matches!(
+            result,
+            Err(ApiError(
+                StatusCode::CONFLICT,
+                "registered_source_requires_account_id"
+            ))
+        ));
+        let result = manual_refresh(
+            State(state.clone()),
+            ApiJson(RefreshRequest {
+                providers: vec![Provider::Catalog("grok")],
+                account_id: Some("local".into()),
+                force: true,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ApiError(
+                StatusCode::CONFLICT,
+                "registered_source_requires_account_id"
+            ))
+        ));
+        assert!(state.pending.lock().await.is_empty());
+        assert!(state.jobs.lock().unwrap().is_empty());
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn codex_source_rest_runs_with_an_isolated_home() {
     let dir = std::env::temp_dir().join(accounts::random_string().unwrap());
     std::fs::create_dir_all(dir.join(".codex")).unwrap();
