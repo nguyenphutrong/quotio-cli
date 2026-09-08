@@ -259,6 +259,21 @@ async fn usage_response(
         Ok(value) => value,
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "encoding_failed"),
     };
+    // A server snapshot can outlive its earliest reset credit between refreshes.
+    for (entry, usage) in value["providers"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .zip(&report.providers)
+    {
+        if usage
+            .reset_credits
+            .as_ref()
+            .is_some_and(|c| !c.valid_at(state.context.clock.now()))
+        {
+            entry.as_object_mut().unwrap().remove("reset_credits");
+        }
+    }
     for field in ["providers", "failures"] {
         value[field].as_array_mut().unwrap().retain(|entry| {
             provider.is_none_or(|p| entry["provider"] == p)

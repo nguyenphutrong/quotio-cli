@@ -149,8 +149,26 @@ pub struct UsageDiagnostic {
     pub source: String,
     pub code: ProviderError,
 }
+/// Banked Codex quota resets, not monetary credits. Counts are observations,
+/// never a guarantee that a credit has not since been redeemed elsewhere.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ResetCredits {
+    pub available_count: u64,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub earliest_expires_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub fetched_at: OffsetDateTime,
+    pub source: String,
+}
+impl ResetCredits {
+    pub fn valid_at(&self, now: OffsetDateTime) -> bool {
+        now >= self.fetched_at && self.earliest_expires_at.is_none_or(|at| at > now)
+    }
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_credits: Option<ResetCredits>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<UsageDiagnostic>,
     #[serde(skip_serializing_if = "Option::is_none")]

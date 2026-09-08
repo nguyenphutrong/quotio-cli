@@ -65,6 +65,16 @@ entry includes its provider, account identity, optional account reference, and q
 windows. Each window retains its own `fetched_at`, reset time, and provenance.
 Unknown usage stays unknown; it is never replaced with zero.
 
+Codex entries may also contain the optional `reset_credits` snapshot described in
+the [output contract](../README.md#output-contract): `available_count`, nullable
+`earliest_expires_at`, `fetched_at`, and `source`. These are banked quota resets,
+not monetary credits. Omission is unknown, not zero. Credit failures retain quota
+and add `codex_reset_credits` diagnostics. All usage GET routes expose this field
+in read-only mode, without `--manage`; there is no redeem/consume route. Use the
+credit observation timestamp for freshness, not report generation time. Known
+expired balances are omitted even between background refreshes. API/schema v1
+is unchanged under the additive-field policy.
+
 A provider route returns all accounts for that provider, including local and saved
 accounts after the collector's normal deduplication. Disabled and unknown providers
 return 404. Route IDs are canonical IDs from `/v1/providers`; CLI aliases are not

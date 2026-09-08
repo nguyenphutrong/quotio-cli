@@ -6,6 +6,7 @@ pub mod capabilities;
 pub mod catalog;
 pub mod codex;
 pub mod codex_api;
+mod codex_reset_credits;
 pub mod factory;
 pub(crate) mod http;
 pub mod key_api;

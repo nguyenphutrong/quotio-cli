@@ -71,6 +71,10 @@ fn parse(
     value: Value,
     now: OffsetDateTime,
 ) -> Result<ProviderUsage, ProviderError> {
+    let credits = value
+        .get("rateLimitResetCredits")
+        .filter(|v| !v.is_null())
+        .cloned();
     let limits: Limits = serde_json::from_value(value).map_err(|_| ProviderError::InvalidData)?;
     let buckets = match limits.rate_limits_by_limit_id {
         Some(map) if !map.is_empty() => map,
@@ -155,7 +159,8 @@ fn parse(
         windows.extend(bucket_windows.into_iter().map(|(_, window)| window));
     }
     let email = account.email.ok_or(ProviderError::InvalidData)?;
-    Ok(ProviderUsage {
+    let mut usage = ProviderUsage {
+        reset_credits: None,
         diagnostics: vec![],
         account_ref: None,
         provider: ProviderId("codex".into()),
@@ -166,7 +171,14 @@ fn parse(
             label: email,
         },
         windows,
-    })
+    };
+    if let Some(credits) = credits {
+        super::codex_reset_credits::attach(
+            &mut usage,
+            super::codex_reset_credits::parse(credits, true, now),
+        );
+    }
+    Ok(usage)
 }
 pub(crate) fn parse_direct(
     email: &str,
@@ -326,6 +338,36 @@ mod tests {
     fn identity() -> Account {
         account(json!({"account":{"type":"chatgpt","email":"demo@example.com","planType":"pro"}}))
             .unwrap()
+    }
+    #[test]
+    fn optional_native_reset_summary_preserves_quota_on_malformed_details() {
+        for (credits, expected, diagnostic) in [
+            (Value::Null, None, false),
+            (json!({"availableCount":3}), Some(3), false),
+            (json!({"availableCount":0,"credits":[]}), Some(0), false),
+            (json!({"availableCount":"secret-sentinel"}), None, true),
+        ] {
+            let usage = parse(identity(), json!({"rateLimits":{"primary":{"usedPercent":20}},"rateLimitResetCredits":credits}), OffsetDateTime::UNIX_EPOCH).unwrap();
+            assert_eq!(usage.windows[0].quota, Quota::from_used(Some(20.0)));
+            assert_eq!(
+                usage.reset_credits.as_ref().map(|c| c.available_count),
+                expected
+            );
+            assert_eq!(!usage.diagnostics.is_empty(), diagnostic);
+            assert!(
+                !serde_json::to_string(&usage)
+                    .unwrap()
+                    .contains("secret-sentinel")
+            );
+        }
+        let old = parse(
+            identity(),
+            json!({"rateLimits":{"primary":{"usedPercent":20}}}),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        assert!(old.reset_credits.is_none());
+        assert!(old.diagnostics.is_empty());
     }
     #[test]
     fn prefer_all_buckets_and_omit_missing_windows() {

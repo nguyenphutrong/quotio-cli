@@ -487,6 +487,42 @@ JSON has `schema_version: 1`, RFC 3339 `generated_at`, `providers`, and `failure
 Arrays preserve request order within successes and failures. Each provider contains
 `provider`, `account` with `id` and `label`, and an arbitrary number of `windows`.
 
+Codex optionally includes `reset_credits`, an observation of banked **quota resets**,
+not monetary credits, consumption, or a computed pool-restoration percentage:
+
+```json
+{"reset_credits":{"available_count":2,"earliest_expires_at":"2026-10-01T00:00:00Z","fetched_at":"2026-09-08T12:00:00Z","source":"codex_api"}}
+```
+
+Saved OAuth accounts read `GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`
+with their own access token and ChatGPT account ID. Native Codex reads optional
+`rateLimitResetCredits` from `account/rateLimits/read`; older CLIs that omit it
+remain unsupported (no credential-file scraping or invented count). The count is
+the upstream authoritative `available_count` / `availableCount`, not the length
+of the detail list (which Codex documents may be capped). Earliest expiry considers
+only available Codex reset rows with future expiries, ignoring redeemed, expired,
+unknown-status and other-reset-type rows. Native count-only summaries preserve
+the upstream count with unknown expiry; native detail failures can be hidden by
+Codex's own count-only fallback and cannot be diagnosed by Quotio.
+`earliest_expires_at: null` means no expiry is known, not unlimited validity.
+
+An omitted `reset_credits` means unknown/unsupported/failed lookup, **not zero**.
+Lookup errors preserve subscription windows and add a sanitized diagnostic with
+`source: codex_reset_credits` (also included in report failures, exit 1). Zero is
+reported only after a successful lookup. No credit IDs, tokens or redemption API
+are exposed. Read-only `serve` is sufficient; no `--manage` is needed.
+
+Use `reset_credits.fetched_at`, never `generated_at`, for balance age. Fresh cache
+hits retain this timestamp. Stale quota fallback drops the balance; reaching its
+earliest known expiry triggers a cache refresh and suppresses the old balance,
+including from HTTP snapshots between refreshes. Count-only observations cannot
+predict expiry, and credits may be redeemed elsewhere after any observation.
+Clients should show the observation age and apply their own freshness limit.
+This is additive: schema/API version 1 is unchanged.
+
+Upstream contracts: [Codex account protocol](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/account.rs)
+and [WHAM reset-credit client](https://github.com/openai/codex/blob/main/codex-rs/backend-client/src/client/rate_limit_resets.rs).
+
 Each window contains `label`, `quota`, nullable `resets_at`, `provenance` with
 `source` and `confidence`, and RFC 3339 `fetched_at`. Timestamps include an offset.
 Optional `consumption` records `used` and `unit` independently of any cap or balance,

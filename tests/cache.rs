@@ -39,6 +39,7 @@ struct Adapter {
     calls: AtomicUsize,
     fails: AtomicBool,
     partial: AtomicBool,
+    reset_credits: Mutex<Option<quotio::domain::ResetCredits>>,
 }
 impl Adapter {
     fn new(account: &str) -> Arc<Self> {
@@ -51,6 +52,7 @@ impl Adapter {
             calls: AtomicUsize::new(0),
             fails: AtomicBool::new(false),
             partial: AtomicBool::new(false),
+            reset_credits: Mutex::new(None),
         })
     }
 }
@@ -86,6 +88,7 @@ impl ProviderAdapter for Adapter {
             }
             let mut usage = MockProvider.fetch(context).await?;
             usage.provider = self.id();
+            usage.reset_credits = self.reset_credits.lock().unwrap().clone();
             if self.partial.load(Ordering::SeqCst) {
                 usage.diagnostics.push(quotio::domain::UsageDiagnostic {
                     source: "fixture_endpoint".into(),
@@ -158,6 +161,72 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+#[tokio::test]
+async fn reset_credit_cache_preserves_age_isolates_accounts_and_drops_stale_balance() {
+    let f = Fixture::new();
+    let a = Adapter::new("a");
+    let b = Adapter::new("b");
+    let now = f.clock.now();
+    for (adapter, count) in [(&a, 2), (&b, 5)] {
+        *adapter.reset_credits.lock().unwrap() = Some(quotio::domain::ResetCredits {
+            available_count: count,
+            earliest_expires_at: Some(now + time::Duration::seconds(100)),
+            fetched_at: now,
+            source: "codex_api".into(),
+        });
+    }
+    f.collect(vec![a.clone(), b.clone()], false).await;
+    f.clock.0.fetch_add(99, Ordering::SeqCst);
+    let cached = f.collect(vec![b.clone(), a.clone()], false).await;
+    assert_eq!(
+        cached.providers[0]
+            .reset_credits
+            .as_ref()
+            .unwrap()
+            .available_count,
+        5
+    );
+    assert_eq!(
+        cached.providers[1]
+            .reset_credits
+            .as_ref()
+            .unwrap()
+            .available_count,
+        2
+    );
+    assert_eq!(
+        cached.providers[1]
+            .reset_credits
+            .as_ref()
+            .unwrap()
+            .fetched_at,
+        now
+    );
+    assert_eq!(a.calls.load(Ordering::SeqCst), 1);
+    // Expiry forces fetch before the quota TTL. A failed fetch retains quota only.
+    f.clock.0.fetch_add(1, Ordering::SeqCst);
+    a.fails.store(true, Ordering::SeqCst);
+    let expired = f.collect(vec![a.clone()], false).await;
+    assert_eq!(a.calls.load(Ordering::SeqCst), 2);
+    assert!(!expired.providers[0].windows.is_empty());
+    assert!(expired.providers[0].reset_credits.is_none());
+    assert_eq!(expired.providers[0].windows[0].fetched_at, now);
+    // Login change never restores the previous login's credits or quota.
+    *a.login.lock().unwrap() = "new-login".into();
+    assert!(f.collect(vec![a.clone()], false).await.providers.is_empty());
+    // An optional lookup failure replaces an old success, not just its windows.
+    *b.reset_credits.lock().unwrap() = None;
+    b.partial.store(true, Ordering::SeqCst);
+    let partial = f.collect(vec![b.clone()], true).await;
+    assert!(partial.providers[0].reset_credits.is_none());
+    assert_eq!(partial.exit_code(), 1);
+    assert!(
+        f.collect(vec![b.clone()], false).await.providers[0]
+            .reset_credits
+            .is_none()
+    );
 }
 
 #[tokio::test]

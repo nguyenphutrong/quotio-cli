@@ -73,12 +73,7 @@ pub async fn fetch(
     context: &ProviderContext,
     credential: &Credential,
 ) -> Result<ProviderUsage, ProviderError> {
-    fetch_at(
-        context,
-        credential,
-        "https://chatgpt.com/backend-api/wham/usage",
-    )
-    .await
+    fetch_at(context, credential, "https://chatgpt.com/backend-api/wham").await
 }
 async fn fetch_at(
     context: &ProviderContext,
@@ -94,29 +89,128 @@ async fn fetch_at(
     else {
         return Err(ProviderError::Authentication);
     };
-    let value = http::json(
-        context
+    let request = |path: &str| -> Result<reqwest::RequestBuilder, ProviderError> {
+        Ok(context
             .http
-            .get(endpoint)
+            .get(format!("{endpoint}/{path}"))
             .header(
                 "Authorization",
                 http::sensitive(&format!("Bearer {access_token}"))?,
             )
             .header("ChatGPT-Account-Id", http::sensitive(account_id)?)
-            .header("Accept", "application/json"),
-        context.clock.now(),
-    )
-    .await?;
+            .header("Accept", "application/json"))
+    };
+    let value = http::json(request("usage")?, context.clock.now()).await?;
     let mut usage = parse(value, email, context.clock.now())?;
     usage.account.id = account_id.clone();
+    // Keep time to return successful quota even if this optional endpoint hangs
+    // or supplies a long Retry-After. Dropping this future cancels the request.
+    let budget = super::remaining_fetch_time().unwrap_or(std::time::Duration::from_secs(10)) / 2;
+    let credits = tokio::time::timeout(budget.min(std::time::Duration::from_secs(5)), async {
+        let value = http::json(request("rate-limit-reset-credits")?, context.clock.now()).await?;
+        super::codex_reset_credits::parse(value, false, context.clock.now())
+    })
+    .await
+    .unwrap_or(Err(ProviderError::Timeout));
+    super::codex_reset_credits::attach(&mut usage, credits);
     Ok(usage)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn optional_credit_errors_preserve_quota_and_account_isolation() {
+        for (status, body, code) in [
+            (
+                401,
+                json!({"error":"secret-sentinel"}),
+                ProviderError::Authentication,
+            ),
+            (404, json!({}), ProviderError::Unavailable),
+            (503, json!({}), ProviderError::Transient),
+            (429, json!({}), ProviderError::RateLimited),
+            (200, json!({}), ProviderError::InvalidData),
+        ] {
+            for account in ["workspace-a", "workspace-b"] {
+                let (url, task) = http::fixture::server_status(vec![
+                    (
+                        200,
+                        json!({"rate_limit":{"primary_window":{"used_percent":20}}}),
+                    ),
+                    (status, body.clone()),
+                ])
+                .await;
+                let credential = Credential::CodexOAuth {
+                    access_token: format!("synthetic-{account}"),
+                    refresh_token: "refresh".into(),
+                    id_token: "id".into(),
+                    account_id: account.into(),
+                    email: "same@example.com".into(),
+                    expires_at: 0,
+                };
+                let usage = fetch_at(&http::fixture::context(), &credential, &url)
+                    .await
+                    .unwrap();
+                assert_eq!(usage.account.id, account);
+                assert_eq!(usage.windows[0].quota, Quota::from_used(Some(20.0)));
+                assert!(usage.reset_credits.is_none());
+                assert_eq!(usage.diagnostics[0].code, code);
+                assert_eq!(usage.diagnostics[0].source, "codex_reset_credits");
+                let serialized = serde_json::to_string(&usage).unwrap();
+                assert!(!serialized.contains("synthetic-"));
+                assert!(!serialized.contains("secret-sentinel"));
+                for request in task.await.unwrap() {
+                    assert!(request.contains(&format!("Bearer synthetic-{account}")));
+                    assert!(
+                        request
+                            .to_lowercase()
+                            .contains(&format!("chatgpt-account-id: {account}"))
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn credit_timeout_leaves_time_to_return_quota() {
+        let (url, task) = http::fixture::server_status_with_async_action(
+            vec![
+                (
+                    200,
+                    json!({"rate_limit":{"primary_window":{"used_percent":20}}}),
+                ),
+                (200, json!({"available_count":0,"credits":[]})),
+            ],
+            |index| async move {
+                if index == 1 {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
+            },
+        )
+        .await;
+        let credential = Credential::CodexOAuth {
+            access_token: "synthetic".into(),
+            refresh_token: "r".into(),
+            id_token: "i".into(),
+            account_id: "a".into(),
+            email: "a@example.com".into(),
+            expires_at: 0,
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        let usage = super::super::FETCH_DEADLINE
+            .scope(
+                deadline,
+                fetch_at(&http::fixture::context(), &credential, &url),
+            )
+            .await
+            .unwrap();
+        assert!(!usage.windows.is_empty());
+        assert_eq!(usage.diagnostics[0].code, ProviderError::Timeout);
+        task.await.unwrap();
+    }
+    #[tokio::test]
     async fn direct_quota_preserves_identity_headers_and_sparse_windows() {
-        let (url,task)=http::fixture::server(vec![json!({"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":604800}},"additional_rate_limits":[{"limit_name":"GPT Spark","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000}}}]})]).await;
+        let (url,task)=http::fixture::server(vec![json!({"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":604800}},"additional_rate_limits":[{"limit_name":"GPT Spark","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000}}}]}), json!({"credits":[],"available_count":0})]).await;
         let credential = Credential::CodexOAuth {
             access_token: "synthetic-token".into(),
             refresh_token: "refresh".into(),
@@ -133,7 +227,16 @@ mod tests {
         assert_eq!(usage.windows[1].label, "Codex Spark Session");
         assert_eq!(usage.account.id, "workspace-a");
         assert_eq!(usage.account.plan.as_deref(), Some("pro"));
+        assert_eq!(usage.reset_credits.as_ref().unwrap().available_count, 0);
         let req = task.await.unwrap();
+        assert!(req[0].starts_with("GET /usage "));
+        assert!(req[1].starts_with("GET /rate-limit-reset-credits "));
+        assert!(req[1].contains("Bearer synthetic-token"));
+        assert!(
+            req[1]
+                .to_lowercase()
+                .contains("chatgpt-account-id: workspace-a")
+        );
         assert!(
             req[0]
                 .to_lowercase()

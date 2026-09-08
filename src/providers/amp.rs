@@ -341,6 +341,7 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
         }
     }
     Ok(ProviderUsage {
+        reset_credits: None,
         diagnostics: vec![],
         account_ref: None,
         provider: ProviderId("amp".into()),

@@ -238,6 +238,7 @@ async fn probe(
         return Err(ProviderError::Authentication);
     }
     Ok(ProviderUsage {
+        reset_credits: None,
         diagnostics: vec![],
         account_ref: None,
         provider: ProviderId("antigravity".into()),

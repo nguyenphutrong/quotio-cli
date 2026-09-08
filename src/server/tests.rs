@@ -91,6 +91,68 @@ pub(super) async fn done(state: &ApiState, id: &str) -> Operation {
     panic!("operation timeout")
 }
 #[tokio::test]
+async fn read_only_reset_credit_snapshots_expire_without_changing_quota() {
+    use crate::providers::{Clock, ProviderAdapter};
+    struct FixedClock(time::OffsetDateTime);
+    impl Clock for FixedClock {
+        fn now(&self) -> time::OffsetDateTime {
+            self.0
+        }
+    }
+    let (mut state, dir, _) = fixture().await;
+    let now = time::OffsetDateTime::UNIX_EPOCH;
+    let inner = Arc::get_mut(&mut state).unwrap();
+    inner.manage = false;
+    inner.context.clock = Arc::new(FixedClock(now));
+    let mut usage = crate::providers::mock::MockProvider
+        .fetch(&state.context)
+        .await
+        .unwrap();
+    usage.provider = ProviderId("codex".into());
+    usage.reset_credits = Some(crate::domain::ResetCredits {
+        available_count: 2,
+        earliest_expires_at: Some(now + time::Duration::seconds(1)),
+        fetched_at: now,
+        source: "codex_app_server".into(),
+    });
+    *state.snapshot.write().await = Some((
+        0,
+        UsageReport {
+            schema_version: 1,
+            generated_at: now,
+            providers: vec![usage],
+            failures: vec![],
+        },
+    ));
+    for (seconds, present) in [(0, true), (1, false)] {
+        Arc::get_mut(&mut state).unwrap().context.clock =
+            Arc::new(FixedClock(now + time::Duration::seconds(seconds)));
+        let response = usage_response(&state, Some("codex"), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["providers"][0].get("reset_credits").is_some(),
+            present
+        );
+        assert_eq!(
+            value["providers"][0]["windows"].as_array().unwrap().len(),
+            3
+        );
+        assert_eq!(value["generated_at"], "1970-01-01T00:00:00Z");
+    }
+    // Read serialization does not mutate the underlying observation.
+    assert!(
+        state.snapshot.read().await.as_ref().unwrap().1.providers[0]
+            .reset_credits
+            .is_some()
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn account_http_services_are_secret_free_idempotent_and_fenced() {
     let (state, dir, id) = fixture().await;
     let Json(accounts) = management::list(State(state.clone()))

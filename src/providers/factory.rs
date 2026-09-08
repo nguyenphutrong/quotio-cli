@@ -130,6 +130,7 @@ fn parse(
         });
     }
     Ok(ProviderUsage {
+        reset_credits: None,
         diagnostics: vec![],
         account_ref: None,
         provider: ProviderId("factory".into()),

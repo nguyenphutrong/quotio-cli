@@ -279,6 +279,7 @@ fn cursor_summary(
         windows.push(window);
     }
     Ok(ProviderUsage {
+        reset_credits: None,
         provider: crate::domain::ProviderId("cursor".into()),
         account,
         account_ref: None,
@@ -346,6 +347,7 @@ async fn fetch_grok_complete_at(
         }),
     }
     Ok(ProviderUsage {
+        reset_credits: None,
         provider: crate::domain::ProviderId("grok".into()),
         account,
         account_ref: None,

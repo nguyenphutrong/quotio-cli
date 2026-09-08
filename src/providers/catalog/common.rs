@@ -97,6 +97,7 @@ pub fn usage(
         return Err(ProviderError::InvalidData);
     }
     Ok(ProviderUsage {
+        reset_credits: None,
         diagnostics: vec![],
         account_ref: None,
         provider: ProviderId(id.into()),

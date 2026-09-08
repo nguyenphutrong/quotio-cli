@@ -142,6 +142,15 @@ impl UsageCache {
             report.providers.extend(next.providers);
             report.failures.extend(next.failures);
         }
+        for usage in &mut report.providers {
+            if usage
+                .reset_credits
+                .as_ref()
+                .is_some_and(|c| !c.valid_at(report.generated_at))
+            {
+                usage.reset_credits = None;
+            }
+        }
         reconcile_accounts(&mut report.providers);
         report.include_diagnostics();
         report
@@ -266,6 +275,8 @@ impl UsageCache {
                 }
             } else if let Some(mut usage) = snapshot {
                 usage.account_ref = adapter.account_ref();
+                // Stale quota remains useful, but do not advertise an old banked balance.
+                usage.reset_credits = None;
                 report.providers.push(usage);
             }
         }
@@ -273,6 +284,10 @@ impl UsageCache {
     }
     fn fresh(&self, usage: &ProviderUsage, now: time::OffsetDateTime) -> bool {
         !usage.windows.is_empty()
+            && usage
+                .reset_credits
+                .as_ref()
+                .is_none_or(|c| c.valid_at(now) && now - c.fetched_at < self.ttl)
             && usage.windows.iter().all(|w| {
                 let age = now - w.fetched_at;
                 !age.is_negative() && age < self.ttl
