@@ -254,6 +254,10 @@ pub(crate) async fn fetch_oauth_at(
     }
     let response: Response = http::json_response(response, context.clock.now()).await?;
     let id = token_org.unwrap_or_else(|| "Factory Droid".into());
+    let windows = parse_windows(response, context.clock.now())?;
+    let label = profile_email(context, endpoint, access_token)
+        .await
+        .unwrap_or_else(|| id.clone());
     Ok(ProviderUsage {
         codex_profile: None,
         codex_reset_credits: None,
@@ -262,12 +266,54 @@ pub(crate) async fn fetch_oauth_at(
         provider: ProviderId("factory".into()),
         account: AccountIdentity {
             id: id.clone(),
-            label: id,
+            label,
             plan: None,
             subscription_status: None,
         },
-        windows: parse_windows(response, context.clock.now())?,
+        windows,
     })
+}
+
+async fn profile_email(context: &ProviderContext, endpoint: &str, token: &str) -> Option<String> {
+    let endpoint = reqwest::Url::parse(endpoint)
+        .ok()?
+        .join("/api/app/auth/me")
+        .ok()?;
+    // Leave time for account-result validation and the collector to retain valid quota.
+    let cap = std::time::Duration::from_secs(2);
+    let budget =
+        super::remaining_fetch_time().map_or(cap, |remaining| remaining.mul_f64(0.5).min(cap));
+    let profile: serde_json::Value = tokio::time::timeout(
+        budget,
+        http::json(
+            context
+                .http
+                .get(endpoint)
+                .header(
+                    "Authorization",
+                    http::sensitive(&format!("Bearer {token}")).ok()?,
+                )
+                .header("Accept", "application/json"),
+            context.clock.now(),
+        ),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let email = profile.pointer("/userProfile/email")?.as_str()?;
+    if email.len() > 254 || email.chars().any(char::is_control) || email.contains(token) {
+        return None;
+    }
+    let email = email.trim();
+    let (local, domain) = email.split_once('@')?;
+    if local.is_empty()
+        || domain.is_empty()
+        || domain.contains('@')
+        || email.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(email.to_owned())
 }
 
 #[derive(Deserialize, PartialEq)]
@@ -509,7 +555,11 @@ impl FactoryProvider {
         if before != after {
             return Err(ProviderError::InvalidData);
         }
-        parse(after, response, context.clock.now())
+        let mut usage = parse(after, response, context.clock.now())?;
+        if let Some(email) = profile_email(context, base, &key.0).await {
+            usage.account.label = email;
+        }
+        Ok(usage)
     }
 }
 impl ProviderAdapter for FactoryProvider {
@@ -663,6 +713,92 @@ mod tests {
             );
             assert_eq!(server.await.unwrap().len(), 1);
         }
+    }
+    #[tokio::test]
+    async fn optional_profile_is_bounded_and_never_replaces_organization_identity() {
+        use crate::accounts::Credential;
+        for (status, email, expected) in [
+            (
+                200,
+                serde_json::json!(" demo@example.invalid "),
+                Some("demo@example.invalid"),
+            ),
+            (200, serde_json::json!("bad\n@example.invalid"), None),
+            (200, serde_json::json!("x".repeat(255)), None),
+            (200, serde_json::json!(42), None),
+            (401, serde_json::json!("demo@example.invalid"), None),
+            (500, serde_json::Value::Null, None),
+        ] {
+            let credential = Credential::FactoryOAuth {
+                access_token: jwt(serde_json::json!({"org_id":"A"})),
+                refresh_token: "refresh-sentinel".into(),
+                organization_id: Some("A".into()),
+                expires_at: 0,
+                refresh_pending: false,
+            };
+            let (base, server) = http::fixture::server_status(vec![
+                (
+                    200,
+                    serde_json::json!({"limits":{"standard":{"fiveHour":{"usedPercent":25}}}}),
+                ),
+                (
+                    status,
+                    serde_json::json!({"userProfile":{"email":email},"secret":"refresh-sentinel"}),
+                ),
+            ])
+            .await;
+            let usage = fetch_oauth_at(&http::fixture::context(), &credential, &base)
+                .await
+                .unwrap();
+            assert_eq!(usage.account.id, "A");
+            assert_eq!(usage.account.label, expected.unwrap_or("A"));
+            assert_eq!(usage.windows[0].quota, Quota::from_used(Some(25.0)));
+            assert!(
+                !serde_json::to_string(&usage)
+                    .unwrap()
+                    .contains("refresh-sentinel")
+            );
+            let requests = server.await.unwrap();
+            assert!(requests[1].starts_with("GET /api/app/auth/me "));
+            assert!(!requests[1].to_lowercase().contains("x-factory-org-id"));
+        }
+    }
+    #[tokio::test]
+    async fn slow_profile_preserves_quota_inside_collector_deadline() {
+        let (base, server) = http::fixture::server_status_with_async_action(
+            vec![
+                (200, serde_json::json!({"userId":"u","orgId":"o"})),
+                (200, serde_json::json!({"usesTokenRateLimitsBilling":false})),
+                (200, serde_json::json!({"userId":"u","orgId":"o"})),
+                (
+                    200,
+                    serde_json::json!({"userProfile":{"email":"late@example.invalid"}}),
+                ),
+            ],
+            |index| async move {
+                if index == 3 {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+            },
+        )
+        .await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(400);
+        let context = http::fixture::context();
+        let usage = super::super::FETCH_DEADLINE
+            .scope(
+                deadline,
+                tokio::time::timeout_at(
+                    deadline,
+                    FactoryProvider.fetch_api(&context, &base, &base),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(usage.account.id, "u:o");
+        assert_eq!(usage.account.label, "u / o");
+        assert_eq!(usage.windows[0].note.as_deref(), Some("legacy-billing"));
+        server.await.unwrap();
     }
     fn identity() -> Identity {
         Identity {
