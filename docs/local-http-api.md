@@ -10,22 +10,22 @@ For a fixture-only run with no account discovery or provider requests:
 
 ```sh
 cargo run -- serve --provider mock --no-saved-accounts
-curl http://127.0.0.1:8317/health
-curl http://127.0.0.1:8317/v1/providers
-curl http://127.0.0.1:8317/v1/usage
-curl http://127.0.0.1:8317/v1/usage/mock
+curl http://127.0.0.1:6767/health
+curl http://127.0.0.1:6767/v1/providers
+curl http://127.0.0.1:6767/v1/usage
+curl http://127.0.0.1:6767/v1/usage/mock
 ```
 
 The listening address is printed to stderr. The process stays in the foreground;
 Ctrl-C or SIGTERM on Unix stops it. An occupied port is a startup error, rather
 than silently disabling the API. Use `--listen 127.0.0.1:0` to choose an available
-port, or `--listen '[::1]:8317'` for IPv6 loopback.
+port, or `--listen '[::1]:6767'` for IPv6 loopback.
 
 ## Configuration
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--listen` | `127.0.0.1:8317` | Loopback IP address and port; non-loopback addresses are rejected |
+| `--listen` | `127.0.0.1:6767` | Loopback IP address and port; non-loopback addresses are rejected |
 | `--provider` | Config selection | Repeat to enable multiple providers; duplicates are removed |
 | `--config` | Platform config path | Read `enabled_providers` and `cache_ttl_seconds` from this TOML file |
 | `--refresh-interval` | Config, then `60` | Seconds to wait after each completed refresh, from 1 to 86400 |
@@ -77,11 +77,11 @@ accepted in HTTP paths. Query parameters are not supported.
 Create an API-key account with a synthetic credential and poll the returned operation:
 
 ```sh
-curl -X POST http://127.0.0.1:8317/v1/accounts \
+curl -X POST http://127.0.0.1:6767/v1/accounts \
   -H "Authorization: Bearer $QUOTIO_SERVER_TOKEN" \
   -H "Idempotency-Key: demo-account-1" -H 'Content-Type: application/json' \
   -d '{"provider":"synthetic","api_key":"synthetic-example-key","settings":{},"region":null,"organization":null}'
-curl -H "Authorization: Bearer $QUOTIO_SERVER_TOKEN" http://127.0.0.1:8317/v1/operations/OPERATION_ID
+curl -H "Authorization: Bearer $QUOTIO_SERVER_TOKEN" http://127.0.0.1:6767/v1/operations/OPERATION_ID
 ```
 
 Settings patches include the current `revision`; a stale revision returns 409

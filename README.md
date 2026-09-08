@@ -25,7 +25,7 @@ Antigravity can use the running app's local service when direct API quota is una
 
 ```sh
 cargo run -- serve --provider codex --provider amp
-curl http://127.0.0.1:8317/v1/usage
+curl http://127.0.0.1:6767/v1/usage
 ```
 
 `serve` refreshes usage in the background and exposes read-only snapshots on

@@ -266,7 +266,7 @@ pub struct ServeArgs {
     #[arg(long, requires = "manage")]
     pub parent_pipe: bool,
     /// Listen on a loopback address; port 0 selects an available port
-    #[arg(long, default_value = "127.0.0.1:8317")]
+    #[arg(long, default_value = "127.0.0.1:6767")]
     pub listen: std::net::SocketAddr,
     /// Enable a provider; repeat to enable more than one
     #[arg(long, value_enum)]

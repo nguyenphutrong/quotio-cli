@@ -24,13 +24,13 @@ fn server_argument_contract() {
     let Command::Serve(args) = Cli::try_parse_from(["quotio", "serve"]).unwrap().command else {
         panic!()
     };
-    assert_eq!(args.listen.to_string(), "127.0.0.1:8317");
+    assert_eq!(args.listen.to_string(), "127.0.0.1:6767");
     assert_eq!(args.refresh_interval, None);
     for args in [
         vec!["--refresh-interval", "0"],
         vec!["--refresh-interval", "86401"],
         vec!["--timeout", "0"],
-        vec!["--listen", "example.com:8317"],
+        vec!["--listen", "example.com:6767"],
         vec!["--token", "must-not-be-in-argv"],
     ] {
         assert!(Cli::try_parse_from(["quotio", "serve"].into_iter().chain(args)).is_err());
@@ -54,7 +54,7 @@ async fn startup_rejects_remote_bind_empty_selection_and_occupied_port() {
     };
 
     let mut remote = args();
-    remote.listen = "0.0.0.0:8317".parse().unwrap();
+    remote.listen = "0.0.0.0:6767".parse().unwrap();
     assert!(matches!(
         quotio::server::run(remote).await,
         Err(quotio::server::ServerError::Listen)
