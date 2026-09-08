@@ -487,7 +487,8 @@
                   },
                   {
                     "$ref": "#/components/schemas/FactoryOwnedInput"
-                  }
+                  },
+                  {"$ref": "#/components/schemas/KiroOwnedInput"}
                 ]
               }
             }
@@ -2898,6 +2899,24 @@
           "location": {"enum": ["v2_file", "v2_login_keychain", "v2_keyring", "legacy"]}
         },
         "description": "Explicit read-only binding to one file under this node's standard ~/.factory directory. v2_file uses auth.v2.file and auth.v2.key. v2_login_keychain and v2_keyring use their matching files and the macOS Factory CLI Keychain service. legacy uses auth.encrypted (plaintext on macOS/Linux; encrypted requires macOS Keychain). No newest-file selection, fallback file, caller path or credential copy. Owner rotation invalidates cache; only Factory may refresh or write native credentials."
+      },
+      "KiroOwnedInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "label", "access_token", "refresh_token", "expires_at", "authMethod", "region"],
+        "properties": {
+          "kind": {"const": "kiro_owned"},
+          "label": {"type": "string", "minLength": 1, "maxLength": 80},
+          "access_token": {"type": "string", "minLength": 1, "maxLength": 16384, "writeOnly": true},
+          "refresh_token": {"type": "string", "minLength": 1, "maxLength": 16384, "writeOnly": true},
+          "expires_at": {"type": "integer", "minimum": 0},
+          "authMethod": {"enum": ["Social", "IdC"]},
+          "region": {"type": "string", "maxLength": 64},
+          "profileArn": {"type": ["string", "null"], "maxLength": 2048},
+          "clientId": {"type": ["string", "null"], "minLength": 1, "maxLength": 16384},
+          "clientSecret": {"type": ["string", "null"], "minLength": 1, "maxLength": 16384, "writeOnly": true}
+        },
+        "description": "Separately owned Kiro tokens, not a native import or browser login. IdC requires clientId and clientSecret. Social uses https://prod.{region}.auth.desktop.kiro.dev/refreshToken; IdC uses https://oidc.{region}.amazonaws.com/token. No caller endpoint. profileArn, if present, must match region. Tokens are saved before refresh and rotation is saved before quota. A stable machine identifier is retained across rotation. Interrupted or uncertain refresh cannot replay; supply fresh credentials. Refresh-token reservations survive rotation and account deletion across methods, regions and profiles. Vault format 7 prevents older readers from dropping reservations."
       },
       "FactoryOwnedInput": {
         "type": "object",

@@ -157,7 +157,12 @@ impl Vault {
                 }
                 let doc: Document =
                     serde_json::from_slice(&bytes).map_err(|_| AccountError::Corrupt)?;
-                if !matches!(doc.version, 1..=6)
+                if !matches!(doc.version, 1..=7)
+                    || (doc.version < 7
+                        && (!doc.kiro_refresh_owners.is_empty()
+                            || doc.accounts.iter().any(|a| {
+                                matches!(a.credential, super::Credential::KiroOAuth { .. })
+                            })))
                     || (doc.version < 6
                         && (!doc.claude_refresh_owners.is_empty()
                             || doc.accounts.iter().any(|a| {
@@ -240,6 +245,9 @@ impl Transaction {
         if !self.document.factory_refresh_owners.is_empty() {
             self.document.version = self.document.version.max(5);
         }
+        if !self.document.kiro_refresh_owners.is_empty() {
+            self.document.version = self.document.version.max(7);
+        }
         if !self.document.claude_refresh_owners.is_empty() {
             self.document.version = self.document.version.max(6);
         }
@@ -253,6 +261,9 @@ impl Transaction {
 #[cfg(test)]
 #[path = "fixtures/pre_claude_reservations.rs"]
 mod pre_claude_reservations;
+#[cfg(test)]
+#[path = "fixtures/pre_kiro_reservations.rs"]
+mod pre_kiro_reservations;
 
 #[cfg(test)]
 #[path = "fixtures/pre_factory_reservations.rs"]
@@ -355,6 +366,61 @@ pub(crate) mod tests {
             expires_at: 0,
             refresh_pending: true,
         }
+    }
+
+    #[test]
+    fn kiro_reservations_reject_old_readers_after_deletion() {
+        let memory = Arc::new(Memory::default());
+        let dir = std::env::temp_dir().join(random_string().unwrap());
+        let vault = Vault::new(memory.clone(), dir.join("lock"));
+        let credential = crate::providers::catalog::oauth_cloud::kiro_owned_credential(serde_json::from_value(serde_json::json!({
+            "kind":"kiro_owned", "label":"Kiro", "access_token":"fixture-access", "refresh_token":"fixture-refresh", "expires_at":0,
+            "authMethod":"Social", "region":"us-east-1"
+        })).unwrap()).unwrap();
+        let mut tx = vault.begin().unwrap();
+        let id = tx
+            .document
+            .add(
+                Provider::Catalog("kiro"),
+                "Kiro",
+                "id".into(),
+                credential.clone(),
+            )
+            .unwrap();
+        tx.commit().unwrap();
+        let mut tx = vault.begin().unwrap();
+        tx.document.remove(&id).unwrap();
+        tx.commit().unwrap();
+        let bytes = memory.read().unwrap().unwrap();
+        assert!(matches!(
+            pre_kiro_reservations::read(&bytes),
+            Err(AccountError::Corrupt)
+        ));
+        let mut tx = vault.begin().unwrap();
+        assert_eq!(tx.document.version, 7);
+        assert!(matches!(
+            tx.document.add(
+                Provider::Catalog("kiro"),
+                "Again",
+                "other".into(),
+                credential
+            ),
+            Err(AccountError::Duplicate)
+        ));
+        drop(tx);
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["version"] = 6.into();
+        let downgraded = serde_json::to_vec(&value).unwrap();
+        let old = pre_kiro_reservations::read(&downgraded).unwrap();
+        assert!(
+            serde_json::to_value(old)
+                .unwrap()
+                .get("kiro_refresh_owners")
+                .is_none()
+        );
+        memory.write(&downgraded).unwrap();
+        assert!(matches!(vault.begin(), Err(AccountError::Corrupt)));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

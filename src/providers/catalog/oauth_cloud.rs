@@ -300,7 +300,15 @@ pub(crate) async fn kiro_reference_token(
     let credential = parse_kiro_native(&source)?;
     Ok(crate::accounts::Credential::KiroToken {
         access_token: credential.access_token,
-        region: credential.region.unwrap_or_else(|| "us-east-1".into()),
+        region: credential
+            .region
+            .or(credential
+                .profile_arn
+                .as_deref()
+                .map(profile_region)
+                .transpose()?
+                .flatten())
+            .unwrap_or_else(|| "us-east-1".into()),
         profile_arn: credential.profile_arn,
         machine: kiro_machine_identifier(
             credential.client_id.as_deref(),
@@ -316,19 +324,31 @@ pub(crate) async fn fetch_kiro_credential(
     credential: &crate::accounts::Credential,
     endpoint: Option<&str>,
 ) -> Result<crate::domain::ProviderUsage, ProviderError> {
-    let crate::accounts::Credential::KiroToken {
-        access_token,
-        region,
-        profile_arn,
-        machine,
-        expires_at,
-    } = credential
-    else {
-        return Err(ProviderError::Authentication);
+    use crate::accounts::Credential;
+    let (access_token, region, profile_arn, machine, borrowed) = match credential {
+        Credential::KiroToken {
+            access_token,
+            region,
+            profile_arn,
+            machine,
+            expires_at,
+        } => {
+            if expires_at.is_some_and(|expiry| expiry <= context.clock.now().unix_timestamp() + 300)
+            {
+                return Err(ProviderError::OwnerRefreshRequired);
+            }
+            (access_token, region, profile_arn, machine, true)
+        }
+        Credential::KiroOAuth {
+            access_token,
+            region,
+            profile_arn,
+            machine,
+            refresh_pending: false,
+            ..
+        } => (access_token, region, profile_arn, machine, false),
+        _ => return Err(ProviderError::Authentication),
     };
-    if expires_at.is_some_and(|expiry| expiry <= context.clock.now().unix_timestamp() + 300) {
-        return Err(ProviderError::OwnerRefreshRequired);
-    }
     let (region, profile) = kiro_metadata(context, Some(region), profile_arn.as_deref())?;
     let url = format!("https://q.{region}.amazonaws.com/getUsageLimits");
     fetch_kiro_at(
@@ -337,10 +357,138 @@ pub(crate) async fn fetch_kiro_credential(
         &Secret(access_token.clone()),
         &region,
         profile.as_deref(),
-        true,
+        borrowed,
         machine,
     )
     .await
+}
+
+pub(crate) fn kiro_owned_credential(
+    input: crate::accounts::api::KiroOwnedInput,
+) -> Result<crate::accounts::Credential, crate::accounts::AccountError> {
+    use crate::accounts::{AccountError, Credential, KiroAuthMethod};
+    let valid = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 16_384
+            && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+    };
+    if !valid(&input.access_token)
+        || !valid(&input.refresh_token)
+        || input.expires_at < 0
+        || input.region.len() > 64
+        || !valid_kiro_region(&input.region)
+        || input.client_id.as_deref().is_some_and(|s| !valid(s))
+        || input.client_secret.as_deref().is_some_and(|s| !valid(s))
+        || (input.auth_method == KiroAuthMethod::IdC
+            && (input.client_id.is_none() || input.client_secret.is_none()))
+        || input.profile_arn.as_deref().is_some_and(|p| {
+            p.len() > 2048
+                || !valid(p)
+                || profile_region(p).ok().flatten().as_deref() != Some(input.region.as_str())
+        })
+    {
+        return Err(AccountError::Input);
+    }
+    let machine = kiro_machine_identifier(
+        input.client_id.as_deref(),
+        Some(&input.refresh_token),
+        platform_machine_seed,
+    )?;
+    Ok(Credential::KiroOAuth {
+        access_token: input.access_token,
+        refresh_token: input.refresh_token,
+        expires_at: input.expires_at,
+        auth_method: input.auth_method,
+        region: input.region,
+        profile_arn: input.profile_arn,
+        client_id: input.client_id,
+        client_secret: input.client_secret,
+        machine,
+        refresh_pending: false,
+    })
+}
+
+pub(crate) async fn refresh_kiro(
+    context: &ProviderContext,
+    credential: &crate::accounts::Credential,
+) -> Result<crate::accounts::Credential, crate::accounts::AccountError> {
+    refresh_kiro_at(context, credential, None).await
+}
+async fn refresh_kiro_at(
+    context: &ProviderContext,
+    credential: &crate::accounts::Credential,
+    endpoint_override: Option<&str>,
+) -> Result<crate::accounts::Credential, crate::accounts::AccountError> {
+    use crate::accounts::{AccountError, Credential, KiroAuthMethod};
+    let Credential::KiroOAuth {
+        refresh_token,
+        auth_method,
+        region,
+        client_id,
+        client_secret,
+        ..
+    } = credential
+    else {
+        return Err(AccountError::Unsupported);
+    };
+    if !valid_kiro_region(region) || region.len() > 64 {
+        return Err(AccountError::Input);
+    }
+    let social = *auth_method == KiroAuthMethod::Social;
+    let endpoint = if social {
+        format!("https://prod.{region}.auth.desktop.kiro.dev/refreshToken")
+    } else {
+        format!("https://oidc.{region}.amazonaws.com/token")
+    };
+    let mut body = serde_json::json!({"refreshToken": refresh_token});
+    if !social {
+        body["clientId"] = client_id
+            .as_ref()
+            .ok_or(AccountError::Input)?
+            .clone()
+            .into();
+        body["clientSecret"] = client_secret
+            .as_ref()
+            .ok_or(AccountError::Input)?
+            .clone()
+            .into();
+        body["grantType"] = "refresh_token".into();
+    }
+    let mut request = context
+        .http
+        .post(endpoint_override.unwrap_or(&endpoint))
+        .json(&body);
+    if !social {
+        request = request.header("x-amz-user-agent", "aws-sdk-js/3.980.0 ua/2.1 os/other lang/js md/browser#unknown_unknown api/sso-oidc#3.980.0 m/E KiroIDE")
+            .header("Accept", "*/*").header("Accept-Language", "*")
+            .header("sec-fetch-mode", "cors").header("User-Agent", "node");
+    }
+    let value = oauth_response(request, context.clock.now()).await?;
+    let object = value.as_object().ok_or(AccountError::OAuth)?;
+    let token = first_secret(object, &["accessToken"])?.ok_or(AccountError::OAuth)?;
+    let rotated = first_secret(object, &["refreshToken"])?;
+    let seconds = object
+        .get("expiresIn")
+        .and_then(Value::as_f64)
+        .ok_or(AccountError::OAuth)?;
+    let expiry = refreshed_expiry(context.clock.now(), seconds)?;
+    let mut updated = credential.clone();
+    if let Credential::KiroOAuth {
+        access_token,
+        refresh_token,
+        expires_at,
+        refresh_pending,
+        ..
+    } = &mut updated
+    {
+        *access_token = token;
+        if let Some(rotated) = rotated {
+            *refresh_token = rotated;
+        }
+        *expires_at = expiry.unix_timestamp();
+        *refresh_pending = false;
+    }
+    Ok(updated)
 }
 
 fn kiro_auth_path() -> Result<PathBuf, ProviderError> {
@@ -1484,6 +1632,121 @@ mod tests {
         assert!(requests[0].contains("amz-sdk-request: attempt=1; max=1"));
         assert!(requests[0].contains("KiroIDE-quotio-"));
         assert!(!requests[0].to_ascii_lowercase().contains("cookie:"));
+    }
+
+    fn kiro_owned_fixture(method: &str) -> crate::accounts::Credential {
+        kiro_owned_credential(serde_json::from_value(json!({
+            "kind":"kiro_owned", "label":"Kiro", "access_token":"fixture-access", "refresh_token":"fixture-refresh", "expires_at":0,
+            "authMethod":method, "region":"eu-west-1", "clientId":"fixture-client", "clientSecret":"fixture-secret"
+        })).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn kiro_owned_social_and_idc_refresh_preserve_machine_and_metadata() {
+        use crate::{accounts::Credential, providers::http};
+        for method in ["Social", "IdC"] {
+            for rotated in [false, true] {
+                let original = kiro_owned_fixture(method);
+                let mut response = json!({"accessToken":"new-access", "expiresIn":3600});
+                if rotated {
+                    response["refreshToken"] = "new-refresh".into();
+                }
+                let (endpoint, server) = http::fixture::server(vec![response]).await;
+                let updated =
+                    refresh_kiro_at(&http::fixture::context(), &original, Some(&endpoint))
+                        .await
+                        .unwrap();
+                let (
+                    Credential::KiroOAuth {
+                        machine: before, ..
+                    },
+                    Credential::KiroOAuth {
+                        machine: after,
+                        access_token,
+                        refresh_token,
+                        region,
+                        client_secret,
+                        refresh_pending,
+                        expires_at,
+                        ..
+                    },
+                ) = (&original, &updated)
+                else {
+                    panic!()
+                };
+                assert_eq!(before, after);
+                assert_eq!(access_token, "new-access");
+                assert_eq!(
+                    refresh_token,
+                    if rotated {
+                        "new-refresh"
+                    } else {
+                        "fixture-refresh"
+                    }
+                );
+                assert_eq!(region, "eu-west-1");
+                assert_eq!(client_secret.as_deref(), Some("fixture-secret"));
+                assert!(!refresh_pending);
+                assert_eq!(
+                    *expires_at,
+                    http::fixture::context().clock.now().unix_timestamp() + 3600
+                );
+                let requests = server.await.unwrap();
+                assert_eq!(requests.len(), 1);
+                assert!(requests[0].starts_with("POST "));
+                let body: Value =
+                    serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                let expected = if method == "Social" {
+                    json!({"refreshToken":"fixture-refresh"})
+                } else {
+                    json!({"refreshToken":"fixture-refresh", "clientId":"fixture-client", "clientSecret":"fixture-secret", "grantType":"refresh_token"})
+                };
+                assert_eq!(body, expected);
+                assert!(!requests[0].to_lowercase().contains("cookie:"));
+            }
+        }
+        for value in [
+            json!({"accessToken":"new","expiresIn":0}),
+            json!({"expiresIn":3600}),
+            json!({"accessToken":"new","refreshToken":"","expiresIn":3600}),
+        ] {
+            let (endpoint, server) = http::fixture::server(vec![value]).await;
+            assert!(
+                refresh_kiro_at(
+                    &http::fixture::context(),
+                    &kiro_owned_fixture("Social"),
+                    Some(&endpoint)
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(server.await.unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn kiro_owned_intake_rejects_destinations_and_incomplete_idc() {
+        let body = json!({"kind":"kiro_owned", "label":"Kiro", "access_token":"access", "refresh_token":"refresh", "expires_at":0, "authMethod":"Social", "region":"us-east-1"});
+        for (field, invalid) in [
+            ("region", "us-east-1.attacker"),
+            ("authMethod", "unknown"),
+            ("authMethod", "IdC"),
+            (
+                "profileArn",
+                "arn:aws:codewhisperer:eu-west-1:123:profile/test",
+            ),
+            ("clientSecret", ""),
+            ("endpoint", "https://attacker"),
+        ] {
+            let mut value = body.clone();
+            value[field] = invalid.into();
+            if let Ok(input) = serde_json::from_value(value) {
+                assert!(kiro_owned_credential(input).is_err(), "accepted {field}");
+            }
+        }
+        assert!(
+            crate::accounts::api::prepare_kiro_owned(serde_json::from_value(body).unwrap()).is_ok()
+        );
     }
 
     #[test]

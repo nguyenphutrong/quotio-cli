@@ -58,6 +58,12 @@ pub enum AccountError {
     OAuth,
 }
 
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KiroAuthMethod {
+    Social,
+    IdC,
+}
+
 // These values are serialized only inside the OS-protected vault, never reports.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -78,6 +84,18 @@ pub enum Credential {
     },
     DevinDesktopNative {
         source: sources::DevinDesktopNativeReference,
+    },
+    KiroOAuth {
+        access_token: String,
+        refresh_token: String,
+        expires_at: i64,
+        auth_method: KiroAuthMethod,
+        region: String,
+        profile_arn: Option<String>,
+        client_id: Option<String>,
+        client_secret: Option<String>,
+        machine: String,
+        refresh_pending: bool,
     },
     KiroNative {
         source: sources::KiroNativeReference,
@@ -220,6 +238,8 @@ pub struct Document {
     pub factory_refresh_owners: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub claude_refresh_owners: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub kiro_refresh_owners: std::collections::BTreeMap<String, String>,
 }
 impl Document {
     pub fn empty() -> Self {
@@ -229,6 +249,7 @@ impl Document {
             mutation_receipts: Default::default(),
             factory_refresh_owners: Default::default(),
             claude_refresh_owners: Default::default(),
+            kiro_refresh_owners: Default::default(),
         }
     }
     // Retain token lineage after rotation/removal so registration cannot bypass a fence.
@@ -237,6 +258,20 @@ impl Document {
         id: &str,
         credential: &Credential,
     ) -> Result<(), AccountError> {
+        if let Credential::KiroOAuth { refresh_token, .. } = credential {
+            let fingerprint = crate::cache::fingerprint(&["kiro_owned", refresh_token]);
+            if self.kiro_refresh_owners.get(&fingerprint).is_some_and(|owner| owner != id)
+                || self.accounts.iter().any(|account| {
+                    account.id != id && matches!(&account.credential,
+                        Credential::KiroOAuth { refresh_token: existing, .. } if existing == refresh_token)
+                })
+            {
+                return Err(AccountError::Duplicate);
+            }
+            self.kiro_refresh_owners.insert(fingerprint, id.to_owned());
+            self.version = self.version.max(7);
+            return Ok(());
+        }
         if let Credential::ClaudeOAuth { refresh_token, .. } = credential {
             let fingerprint = crate::cache::fingerprint(&["claude_owned", refresh_token]);
             if self.claude_refresh_owners.get(&fingerprint).is_some_and(|owner| owner != id)

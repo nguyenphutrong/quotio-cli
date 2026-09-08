@@ -32,6 +32,10 @@ fn scoped(
     | Credential::ClaudeOAuth {
         refresh_pending: true,
         ..
+    }
+    | Credential::KiroOAuth {
+        refresh_pending: true,
+        ..
     } = credential
     {
         return Err(AccountError::CommitUncertain);
@@ -549,7 +553,7 @@ pub fn default_label(
         | Credential::CursorNative { .. } => Err(AccountError::Input),
         Credential::CopilotOAuth { login, .. } => super::validate_label(login),
         Credential::GrokOAuth { .. } => Ok("Grok owned account".into()),
-        Credential::KiroToken { .. } => Ok("Kiro account".into()),
+        Credential::KiroToken { .. } | Credential::KiroOAuth { .. } => Ok("Kiro account".into()),
         Credential::FactoryOAuth { .. } => Ok("Factory owned account".into()),
         Credential::CodexOAuth { email, .. } | Credential::ClaudeOAuth { email, .. } => {
             super::validate_label(email)
@@ -597,7 +601,9 @@ impl Operations for Network {
         k: &'a Credential,
     ) -> OperationFuture<'a, Credential> {
         Box::pin(async move {
-            if matches!(k, Credential::FactoryOAuth { .. }) {
+            if matches!(k, Credential::KiroOAuth { .. }) {
+                crate::providers::catalog::oauth_cloud::refresh_kiro(c, k).await
+            } else if matches!(k, Credential::FactoryOAuth { .. }) {
                 crate::providers::factory::refresh(c, k).await
             } else if matches!(k, Credential::ClaudeOAuth { .. }) {
                 super::oauth::claude::refresh(c, k).await
@@ -645,6 +651,9 @@ impl ManagedProvider {
             } | Credential::ClaudeOAuth {
                 refresh_pending: true,
                 ..
+            } | Credential::KiroOAuth {
+                refresh_pending: true,
+                ..
             }
         ) {
             return Err(AccountError::CommitUncertain);
@@ -655,6 +664,7 @@ impl ManagedProvider {
                 | Credential::ClaudeOAuth { .. }
                 | Credential::GrokOAuth { .. }
                 | Credential::FactoryOAuth { .. }
+                | Credential::KiroOAuth { .. }
         ) {
             let usage = self
                 .operations
@@ -667,7 +677,7 @@ impl ManagedProvider {
         } else {
             60
         };
-        let needs_refresh = matches!(&credential,Credential::CodexOAuth{expires_at,..} | Credential::GrokOAuth{expires_at,..} | Credential::FactoryOAuth{expires_at,..} | Credential::ClaudeOAuth{expires_at,..} if *expires_at<=context.clock.now().unix_timestamp()+refresh_margin);
+        let needs_refresh = matches!(&credential,Credential::CodexOAuth{expires_at,..} | Credential::GrokOAuth{expires_at,..} | Credential::FactoryOAuth{expires_at,..} | Credential::ClaudeOAuth{expires_at,..} | Credential::KiroOAuth{expires_at,..} if *expires_at<=context.clock.now().unix_timestamp()+refresh_margin);
         if !needs_refresh {
             match self
                 .operations
@@ -710,6 +720,9 @@ impl ManagedProvider {
             refresh_pending, ..
         }
         | Credential::ClaudeOAuth {
+            refresh_pending, ..
+        }
+        | Credential::KiroOAuth {
             refresh_pending, ..
         } = &mut latest
         {
@@ -801,6 +814,10 @@ impl ProviderAdapter for ManagedProvider {
                 | Credential::ClaudeOAuth {
                     refresh_pending: true,
                     ..
+                }
+                | Credential::KiroOAuth {
+                    refresh_pending: true,
+                    ..
                 } => return None,
                 Credential::QuotioCustomProvider { .. }
                 | Credential::AmpNative { .. }
@@ -843,7 +860,7 @@ impl ProviderAdapter for ManagedProvider {
     fn idempotent(&self) -> bool {
         self.provider != Provider::Codex
             && !self.factory_oauth
-            && !(matches!(self.provider, Provider::Catalog("grok" | "claude"))
+            && !(matches!(self.provider, Provider::Catalog("grok" | "claude" | "kiro"))
                 && self.origin == super::AccountOrigin::Owned)
     }
     fn fetch<'a>(&'a self, context: &'a ProviderContext) -> FetchFuture<'a> {
@@ -1243,7 +1260,8 @@ mod tests {
                 }
                 if let Credential::GrokOAuth { access_token, .. }
                 | Credential::FactoryOAuth { access_token, .. }
-                | Credential::ClaudeOAuth { access_token, .. } = k
+                | Credential::ClaudeOAuth { access_token, .. }
+                | Credential::KiroOAuth { access_token, .. } = k
                 {
                     assert_eq!(access_token, "new");
                     let doc: super::super::Document =
@@ -1301,6 +1319,13 @@ mod tests {
                     expires_at,
                     refresh_pending,
                     ..
+                }
+                | Credential::KiroOAuth {
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    refresh_pending,
+                    ..
                 } = &mut k
                 {
                     assert!(*refresh_pending);
@@ -1315,6 +1340,9 @@ mod tests {
                             refresh_pending: true,
                             ..
                         } | Credential::ClaudeOAuth {
+                            refresh_pending: true,
+                            ..
+                        } | Credential::KiroOAuth {
                             refresh_pending: true,
                             ..
                         }
@@ -2606,6 +2634,56 @@ mod tests {
         assert!(vault.begin().unwrap().document.accounts[0].credential == credential);
         cleanup(path);
     }
+    fn kiro_fixture(refresh: &str) -> Credential {
+        Credential::KiroOAuth {
+            access_token: "old".into(),
+            refresh_token: refresh.into(),
+            expires_at: 0,
+            auth_method: super::super::KiroAuthMethod::Social,
+            region: "us-east-1".into(),
+            profile_arn: None,
+            client_id: None,
+            client_secret: None,
+            machine: "stable-machine".into(),
+            refresh_pending: false,
+        }
+    }
+    #[tokio::test]
+    async fn kiro_lineage_survives_rotation_restart_and_removal() {
+        let (vault, fake, id, _, path) = setup(0, false, false, false);
+        let original = kiro_fixture("refresh");
+        let mut tx = vault.begin().unwrap();
+        tx.document.accounts[0].provider = Provider::Catalog("kiro");
+        tx.document.accounts[0].credential = original.clone();
+        tx.document.reserve_factory_refresh(&id, &original).unwrap();
+        tx.commit().unwrap();
+        let adapter = managed(
+            vault.clone(),
+            fake.clone(),
+            id.clone(),
+            Provider::Catalog("kiro"),
+        );
+        assert!(adapter.read(&http::fixture::context()).await.is_ok());
+        assert_eq!(fake.refreshes.load(Ordering::SeqCst), 1);
+        let mut tx = vault.begin().unwrap();
+        tx.document.remove(&id).unwrap();
+        tx.commit().unwrap();
+        let mut tx = vault.begin().unwrap();
+        for token in ["refresh", "rotated"] {
+            assert!(matches!(
+                tx.document.add(
+                    Provider::Catalog("kiro"),
+                    "again",
+                    "different".into(),
+                    kiro_fixture(token)
+                ),
+                Err(AccountError::Duplicate)
+            ));
+        }
+        assert_eq!(tx.document.version, 7);
+        drop(tx);
+        cleanup(path);
+    }
     #[tokio::test]
     async fn claude_refresh_fence_survives_failure_restart_and_removal() {
         for failure in [false, true] {
@@ -2690,25 +2768,36 @@ mod tests {
         cleanup(path);
     }
     #[tokio::test]
-    async fn factory_inflight_refresh_cancellation_and_disable_are_fenced() {
-        for cancel in [false, true] {
+    async fn factory_and_kiro_inflight_refresh_cancellation_and_disable_are_fenced() {
+        for (provider, cancel) in [Provider::Factory, Provider::Catalog("kiro")]
+            .into_iter()
+            .flat_map(|p| [false, true].map(|cancel| (p, cancel)))
+        {
             let (vault, fake, id, _, path) = setup(0, false, false, false);
             let mut tx = vault.begin().unwrap();
-            tx.document.accounts[0].provider = Provider::Factory;
-            tx.document.accounts[0].credential = Credential::FactoryOAuth {
-                access_token: "old".into(),
-                refresh_token: "refresh".into(),
-                organization_id: None,
-                expires_at: 0,
-                refresh_pending: false,
+            tx.document.accounts[0].provider = provider;
+            tx.document.accounts[0].credential = if provider == Provider::Factory {
+                Credential::FactoryOAuth {
+                    access_token: "old".into(),
+                    refresh_token: "refresh".into(),
+                    organization_id: None,
+                    expires_at: 0,
+                    refresh_pending: false,
+                }
+            } else {
+                kiro_fixture("refresh")
             };
+            let credential = tx.document.accounts[0].credential.clone();
+            tx.document
+                .reserve_factory_refresh(&id, &credential)
+                .unwrap();
             tx.commit().unwrap();
             fake.wait_for_refresh.store(true, Ordering::SeqCst);
-            let adapter = managed(vault.clone(), fake.clone(), id.clone(), Provider::Factory);
+            let adapter = managed(vault.clone(), fake.clone(), id.clone(), provider);
             let running =
                 tokio::spawn(async move { adapter.read(&http::fixture::context()).await });
             fake.started.notified().await;
-            let concurrent = managed(vault.clone(), fake.clone(), id.clone(), Provider::Factory);
+            let concurrent = managed(vault.clone(), fake.clone(), id.clone(), provider);
             assert!(matches!(
                 concurrent.read(&http::fixture::context()).await,
                 Err(AccountError::CommitUncertain)
@@ -2730,7 +2819,7 @@ mod tests {
             assert_eq!(fake.quota_calls.load(Ordering::SeqCst), 0);
             let tx = vault.begin().unwrap();
             assert!(
-                matches!(&tx.document.accounts[0].credential, Credential::FactoryOAuth { refresh_pending, refresh_token, .. } if *refresh_pending == cancel && refresh_token == if cancel {"refresh"} else {"rotated"})
+                matches!(&tx.document.accounts[0].credential, Credential::FactoryOAuth { refresh_pending, refresh_token, .. } | Credential::KiroOAuth { refresh_pending, refresh_token, .. } if *refresh_pending == cancel && refresh_token == if cancel {"refresh"} else {"rotated"})
             );
             drop(tx);
             assert!(
@@ -2763,9 +2852,13 @@ mod tests {
                 self.memory.write(bytes)
             }
         }
-        for (provider, mode) in [Provider::Factory, Provider::Catalog("claude")]
-            .into_iter()
-            .flat_map(|p| (0..=4).map(move |mode| (p, mode)))
+        for (provider, mode) in [
+            Provider::Factory,
+            Provider::Catalog("claude"),
+            Provider::Catalog("kiro"),
+        ]
+        .into_iter()
+        .flat_map(|p| (0..=4).map(move |mode| (p, mode)))
         {
             let (vault, fake, id, _, path) = setup(0, false, mode == 4, true);
             let mut tx = vault.begin().unwrap();
@@ -2778,6 +2871,8 @@ mod tests {
                     expires_at: 0,
                     refresh_pending: false,
                 }
+            } else if provider == Provider::Catalog("kiro") {
+                kiro_fixture("refresh")
             } else {
                 Credential::ClaudeOAuth {
                     access_token: "old".into(),

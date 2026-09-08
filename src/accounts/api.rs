@@ -109,6 +109,7 @@ pub enum AccountCreateInput {
     ApiKey(ApiKeyInput),
     GrokOwned(GrokOwnedInput),
     FactoryOwned(FactoryOwnedInput),
+    KiroOwned(KiroOwnedInput),
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -185,6 +186,41 @@ pub fn prepare_factory_owned(input: FactoryOwnedInput) -> Result<PreparedAccount
             organization_id: input.organization_id,
             refresh_pending: false,
         },
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KiroOwnedKind {
+    KiroOwned,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KiroOwnedInput {
+    pub kind: KiroOwnedKind,
+    pub label: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: i64,
+    #[serde(rename = "authMethod")]
+    pub auth_method: super::KiroAuthMethod,
+    pub region: String,
+    #[serde(rename = "profileArn")]
+    pub profile_arn: Option<String>,
+    #[serde(rename = "clientId")]
+    pub client_id: Option<String>,
+    #[serde(rename = "clientSecret")]
+    pub client_secret: Option<String>,
+}
+pub fn prepare_kiro_owned(input: KiroOwnedInput) -> Result<PreparedAccount, AccountError> {
+    let identity = crate::cache::fingerprint(&["kiro_owned", &input.refresh_token]);
+    let label = super::validate_label(&input.label)?;
+    let credential = crate::providers::catalog::oauth_cloud::kiro_owned_credential(input)?;
+    Ok(PreparedAccount {
+        provider: Provider::Catalog("kiro"),
+        label,
+        credential,
+        identity,
     })
 }
 
@@ -496,6 +532,69 @@ mod tests {
         assert_eq!(account.provider, Provider::Amp);
         assert_eq!(account.label, "saved");
         assert!(account.active);
+    }
+
+    #[test]
+    fn kiro_source_registration_isolated() {
+        let dir = std::env::temp_dir().join(crate::accounts::random_string().unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "accounts::api::tests::kiro_source_registration_child",
+                "--nocapture",
+            ])
+            .env("HOME", &dir)
+            .env("QUOTIO_KIRO_SOURCE_FIXTURE", &dir)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[tokio::test]
+    async fn kiro_source_registration_child() {
+        let Some(dir) = std::env::var_os("QUOTIO_KIRO_SOURCE_FIXTURE") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let source = super::super::sources::KiroNativeReference::system().unwrap();
+        assert_eq!(source.path, dir.join(".aws/sso/cache/kiro-auth-token.json"));
+        std::fs::create_dir_all(source.path.parent().unwrap()).unwrap();
+        let bytes = br#"{"accessToken":"fixture-access","refreshToken":"owner-only","clientId":"fixture-client","profileArn":"arn:aws:codewhisperer:eu-west-1:123:profile/test"}"#;
+        std::fs::write(&source.path, bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&source.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let vault = Vault::new(
+            std::sync::Arc::new(super::super::vault::tests::Memory::default()),
+            dir.join("lock"),
+        );
+        let prepared = prepare_source(
+            serde_json::from_value(serde_json::json!({"kind":"kiro_native"})).unwrap(),
+        )
+        .await
+        .unwrap();
+        let account = save(vault.clone(), prepared).await.unwrap();
+        assert_eq!(account.source_kind, Some("kiro_native"));
+        let serialized = serde_json::to_string(&account).unwrap();
+        assert!(!serialized.contains("fixture-access"));
+        assert!(!serialized.contains(source.path.to_str().unwrap()));
+        let stored = serde_json::to_string(&vault.begin().unwrap().document).unwrap();
+        assert!(!stored.contains("owner-only"));
+        assert!(!stored.contains("fixture-access"));
+        assert_eq!(std::fs::read(&source.path).unwrap(), bytes);
+        for field in ["path", "source", "refresh_token", "endpoint", "owned"] {
+            let mut bad = serde_json::json!({"kind":"kiro_native"});
+            bad[field] = "untrusted".into();
+            assert!(serde_json::from_value::<SourceInput>(bad).is_err());
+        }
     }
 
     #[test]

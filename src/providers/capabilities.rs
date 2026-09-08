@@ -123,6 +123,9 @@ pub fn capability(provider: Provider) -> ProviderCapability {
                 }
                 "cursor" => Some("Sign in with Cursor to make its local login available."),
                 "grok" => Some("Sign in with the supported Grok editor integration."),
+                "kiro" => Some(
+                    "Register the fixed Kiro native file as read-only, or supply separately owned Social or IdC tokens. Native refresh stays with Kiro.",
+                ),
                 _ => Some("Sign in with the provider's supported local CLI or application."),
             }
         }
@@ -138,7 +141,7 @@ pub fn capability(provider: Provider) -> ProviderCapability {
             AuthMethod::OwnedToken,
             AuthMethod::Native,
         ],
-        Provider::Catalog("grok") => vec![AuthMethod::Native, AuthMethod::OwnedToken],
+        Provider::Catalog("grok" | "kiro") => vec![AuthMethod::Native, AuthMethod::OwnedToken],
         Provider::Antigravity => vec![AuthMethod::Native],
         Provider::Catalog(_) if native.is_some() => vec![AuthMethod::Native],
         _ if provider.api_key_name().is_some() => vec![AuthMethod::ApiKey],
