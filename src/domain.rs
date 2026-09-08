@@ -152,6 +152,8 @@ pub struct UsageDiagnostic {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_profile: Option<CodexProfileAnalytics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_reset_credits: Option<CodexResetCreditInventory>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<UsageDiagnostic>,
@@ -160,6 +162,24 @@ pub struct ProviderUsage {
     pub provider: ProviderId,
     pub account: AccountIdentity,
     pub windows: Vec<QuotaWindow>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CodexProfileAnalytics {
+    pub daily_usage: Vec<CodexDailyUsage>,
+    /// Sum of the latest 30 supplied buckets, not a 30-calendar-day interval.
+    pub latest_30_buckets_tokens: u64,
+    pub lifetime_tokens: Option<u64>,
+    pub peak_daily_tokens: Option<u64>,
+    pub longest_running_turn_seconds: Option<u64>,
+    pub current_streak_days: Option<u64>,
+    pub longest_streak_days: Option<u64>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub fetched_at: OffsetDateTime,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CodexDailyUsage {
+    pub date: String,
+    pub tokens: u64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CodexResetCreditInventory {

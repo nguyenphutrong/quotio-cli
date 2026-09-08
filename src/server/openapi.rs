@@ -278,7 +278,27 @@ mod tests {
             schema_version: 1,
             generated_at: now,
             providers: vec![crate::domain::ProviderUsage {
-                codex_reset_credits: None,
+                codex_profile: Some(crate::domain::CodexProfileAnalytics {
+                    daily_usage: vec![crate::domain::CodexDailyUsage {
+                        date: "1970-01-01".into(),
+                        tokens: 0,
+                    }],
+                    latest_30_buckets_tokens: 0,
+                    lifetime_tokens: Some(42),
+                    peak_daily_tokens: None,
+                    longest_running_turn_seconds: Some(60),
+                    current_streak_days: Some(0),
+                    longest_streak_days: None,
+                    fetched_at: now,
+                }),
+                codex_reset_credits: Some(crate::domain::CodexResetCreditInventory {
+                    available_count: 2,
+                    credits: vec![crate::domain::CodexResetCredit {
+                        id: "a".repeat(64),
+                        expires_at: None,
+                    }],
+                    fetched_at: now,
+                }),
                 diagnostics: vec![crate::domain::UsageDiagnostic {
                     source: "fixture".into(),
                     code: crate::error::ProviderError::Transient,

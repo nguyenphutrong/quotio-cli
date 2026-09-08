@@ -97,6 +97,7 @@ pub fn usage(
         return Err(ProviderError::InvalidData);
     }
     Ok(ProviderUsage {
+        codex_profile: None,
         codex_reset_credits: None,
         diagnostics: vec![],
         account_ref: None,

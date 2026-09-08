@@ -1946,6 +1946,9 @@
           },
           "codex_reset_credits": {
             "$ref": "#/components/schemas/CodexResetCreditInventory"
+          },
+          "codex_profile": {
+            "$ref": "#/components/schemas/CodexProfileAnalytics"
           }
         },
         "additionalProperties": false,
@@ -2885,6 +2888,92 @@
               "null"
             ],
             "format": "date-time"
+          }
+        }
+      },
+      "CodexProfileAnalytics": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "daily_usage",
+          "latest_30_buckets_tokens",
+          "fetched_at",
+          "lifetime_tokens",
+          "peak_daily_tokens",
+          "longest_running_turn_seconds",
+          "current_streak_days",
+          "longest_streak_days"
+        ],
+        "properties": {
+          "daily_usage": {
+            "type": "array",
+            "maxItems": 371,
+            "description": "Latest 371 supplied daily buckets, sorted ascending. Calendar-date keys are retained for native Today/Yesterday lookup in the presentation timezone. Zero remains known zero.",
+            "items": {
+              "$ref": "#/components/schemas/CodexDailyUsage"
+            }
+          },
+          "latest_30_buckets_tokens": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Sum of the latest 30 supplied buckets, not the last 30 calendar days. Zero is rendered as No data by the existing Swift analytics view."
+          },
+          "fetched_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "lifetime_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "peak_daily_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "longest_running_turn_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "current_streak_days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "longest_streak_days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          }
+        }
+      },
+      "CodexDailyUsage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "date",
+          "tokens"
+        ],
+        "properties": {
+          "date": {
+            "type": "string",
+            "format": "date"
+          },
+          "tokens": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       }

@@ -78,6 +78,7 @@ pub async fn fetch(
         credential,
         "https://chatgpt.com/backend-api/wham/usage",
         "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+        "https://chatgpt.com/backend-api/wham/profiles/me",
     )
     .await
 }
@@ -86,6 +87,7 @@ async fn fetch_at(
     credential: &Credential,
     endpoint: &str,
     inventory_endpoint: &str,
+    profile_endpoint: &str,
 ) -> Result<ProviderUsage, ProviderError> {
     let Credential::CodexOAuth {
         access_token,
@@ -111,13 +113,21 @@ async fn fetch_at(
     .await?;
     let mut usage = parse(value, email, context.clock.now())?;
     usage.account.id = account_id.clone();
-    match supplemental(context, access_token, account_id, inventory_endpoint, true)
-        .await
-        .and_then(|value| parse_inventory(value, context.clock.now()))
-    {
+    let (inventory, profile) = tokio::join!(
+        supplemental(context, access_token, account_id, inventory_endpoint, true),
+        supplemental(context, access_token, account_id, profile_endpoint, false),
+    );
+    match inventory.and_then(|value| parse_inventory(value, context.clock.now())) {
         Ok(inventory) => usage.codex_reset_credits = Some(inventory),
         Err(code) => usage.diagnostics.push(UsageDiagnostic {
             source: "codex_reset_credits".into(),
+            code,
+        }),
+    }
+    match profile.and_then(|value| super::codex_profile::parse(value, context.clock.now())) {
+        Ok(profile) => usage.codex_profile = Some(profile),
+        Err(code) => usage.diagnostics.push(UsageDiagnostic {
+            source: "codex_profile".into(),
             code,
         }),
     }
@@ -144,7 +154,12 @@ async fn supplemental(
     if inventory {
         request = request.header("OpenAI-Beta", "codex-1");
     }
-    http::json(request, context.clock.now()).await
+    tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        http::json(request, context.clock.now()),
+    )
+    .await
+    .map_err(|_| ProviderError::Timeout)?
 }
 
 fn parse_inventory(
@@ -251,11 +266,24 @@ mod tests {
             email: "demo@example.com".into(),
             expires_at: 0,
         };
-        let mut usage = fetch_at(&http::fixture::context(), &credential, &url, &url)
-            .await
-            .unwrap();
+        let (profile_url, profile_task) =
+            http::fixture::server(vec![json!({"stats":{"lifetime_tokens":42}})]).await;
+        let mut usage = fetch_at(
+            &http::fixture::context(),
+            &credential,
+            &url,
+            &url,
+            &profile_url,
+        )
+        .await
+        .unwrap();
         assert_eq!(usage.windows.len(), 1);
         assert!(usage.codex_reset_credits.is_none());
+        assert_eq!(
+            usage.codex_profile.as_ref().unwrap().lifetime_tokens,
+            Some(42)
+        );
+        profile_task.await.unwrap();
         assert_eq!(usage.diagnostics[0].source, "codex_reset_credits");
         usage.account_ref = Some(AccountRef {
             id: "saved-a".into(),
@@ -284,6 +312,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profile_failures_preserve_inventory_and_quota() {
+        for (status, body, expected) in [
+            (
+                401,
+                json!({"error":"synthetic-private-error"}),
+                ProviderError::Authentication,
+            ),
+            (
+                200,
+                json!({"unexpected":"synthetic-private-error"}),
+                ProviderError::InvalidData,
+            ),
+        ] {
+            let (url, task) = http::fixture::server(vec![
+                json!({"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000}}}),
+                json!({"available_count":3,"credits":[]}),
+            ]).await;
+            let (profile_url, profile_task) =
+                http::fixture::server_status(vec![(status, body)]).await;
+            let credential = Credential::CodexOAuth {
+                access_token: "synthetic-token".into(),
+                refresh_token: "refresh".into(),
+                id_token: "id".into(),
+                account_id: "workspace-a".into(),
+                email: "demo@example.com".into(),
+                expires_at: 0,
+            };
+            let usage = fetch_at(
+                &http::fixture::context(),
+                &credential,
+                &url,
+                &url,
+                &profile_url,
+            )
+            .await
+            .unwrap();
+            assert_eq!(usage.windows.len(), 1);
+            assert_eq!(
+                usage.codex_reset_credits.as_ref().unwrap().available_count,
+                3
+            );
+            assert!(usage.codex_profile.is_none());
+            assert_eq!(usage.diagnostics.len(), 1);
+            assert_eq!(usage.diagnostics[0].source, "codex_profile");
+            assert_eq!(usage.diagnostics[0].code, expected);
+            assert!(
+                !serde_json::to_string(&usage)
+                    .unwrap()
+                    .contains("synthetic-private-error")
+            );
+            task.await.unwrap();
+            profile_task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn supplemental_timeout_does_not_discard_quota() {
+        let (url, task) = http::fixture::server(vec![
+            json!({"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000}}}),
+            json!({"available_count":0,"credits":[]}),
+        ]).await;
+        let (profile_url, profile_task) = http::fixture::server_status_with_async_action(
+            vec![(200, json!({"stats":{}}))],
+            |_| async { tokio::time::sleep(std::time::Duration::from_secs(30)).await },
+        )
+        .await;
+        let credential = Credential::CodexOAuth {
+            access_token: "synthetic-token".into(),
+            refresh_token: "refresh".into(),
+            id_token: "id".into(),
+            account_id: "workspace-a".into(),
+            email: "demo@example.com".into(),
+            expires_at: 0,
+        };
+        let usage = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            fetch_at(
+                &http::fixture::context(),
+                &credential,
+                &url,
+                &url,
+                &profile_url,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(usage.windows.len(), 1);
+        assert!(usage.codex_reset_credits.is_some());
+        assert_eq!(usage.diagnostics[0].code, ProviderError::Timeout);
+        profile_task.abort();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn direct_quota_preserves_identity_headers_and_sparse_windows() {
         let (url,task)=http::fixture::server(vec![json!({"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":604800}},"additional_rate_limits":[{"limit_name":"GPT Spark","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000}}}]}), json!({"available_count":0,"credits":[]})]).await;
         let credential = Credential::CodexOAuth {
@@ -294,9 +417,19 @@ mod tests {
             email: "demo@example.com".into(),
             expires_at: 0,
         };
-        let usage = fetch_at(&http::fixture::context(), &credential, &url, &url)
-            .await
-            .unwrap();
+        let (profile_url, profile_task) = http::fixture::server(vec![
+            json!({"stats":{"daily_usage_buckets":{"2026-09-07":0}}}),
+        ])
+        .await;
+        let usage = fetch_at(
+            &http::fixture::context(),
+            &credential,
+            &url,
+            &url,
+            &profile_url,
+        )
+        .await
+        .unwrap();
         assert_eq!(usage.windows.len(), 2);
         assert_eq!(usage.windows[0].label, "Weekly");
         assert_eq!(usage.windows[1].label, "Codex Spark Session");
@@ -313,6 +446,29 @@ mod tests {
         assert!(req.iter().all(|request| request.starts_with("GET ")));
         assert!(req[1].to_lowercase().contains("openai-beta: codex-1"));
         assert!(req[1].to_lowercase().contains("originator: codex desktop"));
-        assert_eq!(usage.codex_reset_credits.unwrap().available_count, 0);
+        assert_eq!(
+            usage.codex_reset_credits.as_ref().unwrap().available_count,
+            0
+        );
+        assert_eq!(
+            usage.codex_profile.as_ref().unwrap().daily_usage[0].tokens,
+            0
+        );
+        let serialized = serde_json::to_value(&usage).unwrap();
+        let restored: ProviderUsage = serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), serialized);
+        let profile_requests = profile_task.await.unwrap();
+        assert!(profile_requests[0].starts_with("GET "));
+        assert!(
+            profile_requests[0]
+                .to_lowercase()
+                .contains("chatgpt-account-id: workspace-a")
+        );
+        assert!(
+            profile_requests[0]
+                .to_lowercase()
+                .contains("originator: codex desktop")
+        );
+        assert!(!profile_requests[0].to_lowercase().contains("openai-beta:"));
     }
 }
