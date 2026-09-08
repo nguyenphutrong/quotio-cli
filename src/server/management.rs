@@ -36,7 +36,10 @@ pub(super) fn account_code(error: &AccountError) -> &'static str {
 fn account_error(error: AccountError) -> ApiError {
     let status = match error {
         AccountError::NotFound => StatusCode::NOT_FOUND,
-        AccountError::Busy | AccountError::Duplicate | AccountError::CallbackPort | AccountError::IdempotencyConflict => {
+        AccountError::Busy
+        | AccountError::Duplicate
+        | AccountError::CallbackPort
+        | AccountError::IdempotencyConflict => {
             StatusCode::CONFLICT
         }
         AccountError::Storage | AccountError::Corrupt | AccountError::CommitUncertain => {
@@ -85,7 +88,6 @@ pub(super) async fn usage(State(state): State<Arc<ApiState>>, Path(id): Path<Str
 enum Mutation {
     Create(api::AccountCreateInput),
     Reference(api::SourceInput),
-    Discovered(crate::accounts::discovery::Reference),
     Update(String, api::AccountPatch),
     Remove(String),
 }
@@ -148,24 +150,13 @@ pub(super) async fn reference(
 ) -> Result<(StatusCode, Json<Operation>), ApiError> {
     let input = serde_json::from_value(body.clone())
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
-    let mutation = match input {
-        api::SourceInput::Discovered { discovery_ref } => Mutation::Discovered(
-            state
-                .discovery
-                .try_lock()
-                .map_err(|_| account_error(AccountError::Busy))?
-                .get(&discovery_ref)
-                .map_err(account_error)?,
-        ),
-        input => Mutation::Reference(input),
-    };
     mutate(
         state,
         headers,
         "account_source_register",
         "",
         body,
-        mutation,
+        Mutation::Reference(input),
     )
     .await
 }
@@ -228,6 +219,11 @@ async fn mutate(
     drop(body);
     let intent = crate::accounts::service::MutationIntent::new(key, fingerprint.clone())
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_idempotency_key"))?;
+    // Durable receipts survive both discovery expiry and server restart. Validate
+    // the body fingerprint before attempting to read a live native source.
+    let receipt = crate::accounts::service::mutation_receipt(vault.clone(), &intent)
+        .await
+        .map_err(account_error)?;
     let (operation, new) = state
         .operations
         .lock()
@@ -239,10 +235,7 @@ async fn mutate(
         let id = operation.id.clone();
         let spawn_result = state.spawn(async move {
             let result = async {
-                if let Some(id) = crate::accounts::service::mutation_receipt(vault.clone(), &intent)
-                    .await
-                    .map_err(|e| account_code(&e))?
-                {
+                if let Some(id) = receipt {
                     return Ok(json!({"account_id":id}));
                 }
                 match mutation {
@@ -274,11 +267,18 @@ async fn mutate(
                         work.invalidate().await;
                         Ok(json!({"account_id":account_id}))
                     }
-                    mutation @ (Mutation::Reference(_) | Mutation::Discovered(_)) => {
-                        let prepared = match mutation {
-                            Mutation::Reference(input) => api::prepare_source(input).await,
-                            Mutation::Discovered(reference) => reference.resolve().await,
-                            _ => unreachable!(),
+                    Mutation::Reference(input) => {
+                        let prepared = match input {
+                            api::SourceInput::Discovered { discovery_ref } => {
+                                let reference = work
+                                    .discovery
+                                    .try_lock()
+                                    .map_err(|_| account_code(&AccountError::Busy))?
+                                    .get(&discovery_ref)
+                                    .map_err(|e| account_code(&e))?;
+                                reference.resolve().await
+                            }
+                            input => api::prepare_source(input).await,
                         }
                         .map_err(|e| account_code(&e))?;
                         let _guard = crate::accounts::service::mutation_guard(&work.commit_guard)

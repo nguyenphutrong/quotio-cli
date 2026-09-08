@@ -85,6 +85,12 @@ impl Default for Registry {
     }
 }
 impl Registry {
+    #[cfg(test)]
+    pub(crate) fn expire_all(&mut self) {
+        for (created, _) in self.entries.values_mut() {
+            *created = Instant::now() - TTL;
+        }
+    }
     pub fn get(&mut self, id: &str) -> Result<Reference, AccountError> {
         self.prune();
         self.entries
@@ -401,7 +407,9 @@ mod tests {
     #[tokio::test]
     async fn custom_reference_rejects_provider_rotation_after_inspection() {
         let mut registry = Registry {
-            preferences: |_| Ok(br#"[{"id":"11111111-1111-1111-1111-111111111111","type":"clinepass","name":"Fixture","api-keys":[{"api-key":"fixture"}]}]"#.to_vec()),
+            preferences: |_| {
+                Ok(br#"[{"id":"11111111-1111-1111-1111-111111111111","type":"clinepass","name":"Fixture","api-keys":[{"api-key":"fixture"}]}]"#.to_vec())
+            },
             ..Default::default()
         };
         // The reader returns a valid Z.ai record when registration re-reads it.
@@ -410,10 +418,27 @@ mod tests {
         }
         let request = serde_json::from_value(json!({"provider":"clinepass","kind":"quotio_custom_provider","domain":"production","inspect":true})).unwrap();
         let discovered = registry.inspect(request).unwrap();
-        let reference = registry.get(discovered["candidates"][0]["source"]["discovery_ref"].as_str().unwrap()).unwrap();
-        let Reference::Custom(source, _, provider) = reference else { panic!("custom reference expected") };
-        assert_eq!(source.parse(&rotated(source.domain).unwrap()).unwrap().provider, Provider::Zai);
-        assert!(matches!(Reference::Custom(source, rotated, provider).resolve().await, Err(AccountError::Input)));
+        let reference = registry
+            .get(
+                discovered["candidates"][0]["source"]["discovery_ref"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+        let Reference::Custom(source, _, provider) = reference else {
+            panic!("custom reference expected")
+        };
+        assert_eq!(
+            source
+                .parse(&rotated(source.domain).unwrap())
+                .unwrap()
+                .provider,
+            Provider::Zai
+        );
+        assert!(matches!(
+            Reference::Custom(source, rotated, provider).resolve().await,
+            Err(AccountError::Input)
+        ));
     }
     #[test]
     fn discovery_references_expire_and_are_bounded() {

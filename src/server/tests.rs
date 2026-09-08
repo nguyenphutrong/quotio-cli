@@ -817,17 +817,16 @@ async fn account_retry_survives_loss_of_in_memory_operations() {
         .unwrap_or_else(|_| panic!());
     assert_eq!(account.label, "later change");
     *state.operations.lock().await = Operations::default();
-    let (_, Json(conflict)) = management::patch(
+    let conflict = management::patch(
         State(state.clone()),
         Path(id),
         key("durable-key"),
         ApiJson(json!({"label":"different intent"})),
     )
     .await
-    .unwrap_or_else(|_| panic!());
-    assert_eq!(
-        done(&state, &conflict.id).await.error,
-        Some("idempotency_conflict")
-    );
+    .err()
+    .unwrap();
+    assert_eq!(conflict.0, StatusCode::CONFLICT);
+    assert_eq!(conflict.1, "idempotency_conflict");
     std::fs::remove_dir_all(dir).unwrap();
 }
