@@ -268,6 +268,9 @@ impl Transaction {
     }
 }
 #[cfg(test)]
+#[path = "fixtures/pre_antigravity_reservations.rs"]
+mod pre_antigravity_reservations;
+#[cfg(test)]
 #[path = "fixtures/pre_claude_reservations.rs"]
 mod pre_claude_reservations;
 #[cfg(test)]
@@ -417,9 +420,14 @@ pub(crate) mod tests {
         );
         drop(tx);
         let bytes = memory.read().unwrap().unwrap();
-        assert!(pre_kiro_reservations::read(&bytes).is_err());
+        assert!(pre_antigravity_reservations::read(&bytes).is_err());
         let mut downgraded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         downgraded["version"] = 7.into();
+        // The real previous reader accepts format 7 and ignores the new owners.
+        // Merely writing 7 would therefore allow refresh lineage to be lost.
+        assert!(
+            pre_antigravity_reservations::read(&serde_json::to_vec(&downgraded).unwrap()).is_ok()
+        );
         memory
             .write(&serde_json::to_vec(&downgraded).unwrap())
             .unwrap();
