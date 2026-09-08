@@ -127,6 +127,24 @@ pub(crate) fn token_expiry(token: &str) -> i64 {
         .filter(|expiry| *expiry >= 0)
         .unwrap_or(0)
 }
+// WorkOS's organization claim is `org_id` (FactoryLocalStorageImporter in Swift).
+// This is a binding check, not signature verification; Factory must accept the bearer
+// before any decoded identity is returned to the caller.
+fn token_organization(token: &str) -> Option<String> {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let parts: Vec<_> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims
+        .get("org_id")?
+        .as_str()
+        .filter(|id| valid_token(id) && id.len() <= 256)
+        .map(str::to_owned)
+}
+
 pub(crate) async fn refresh(
     context: &ProviderContext,
     previous: &crate::accounts::Credential,
@@ -206,6 +224,13 @@ pub(crate) async fn fetch_oauth_at(
     if *refresh_pending {
         return Err(AccountError::CommitUncertain);
     }
+    let token_org = token_organization(access_token);
+    if organization_id
+        .as_ref()
+        .is_some_and(|requested| token_org.as_ref() != Some(requested))
+    {
+        return Err(AccountError::OAuth);
+    }
     let response = context
         .http
         .get(endpoint)
@@ -228,9 +253,7 @@ pub(crate) async fn fetch_oauth_at(
         return Err(AccountError::QuotaForbidden);
     }
     let response: Response = http::json_response(response, context.clock.now()).await?;
-    let id = organization_id
-        .clone()
-        .unwrap_or_else(|| "Factory Droid".into());
+    let id = token_org.unwrap_or_else(|| "Factory Droid".into());
     Ok(ProviderUsage {
         codex_profile: None,
         codex_reset_credits: None,
@@ -514,6 +537,70 @@ impl ProviderAdapter for FactoryProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn jwt(claims: serde_json::Value) -> String {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        format!("e30.{}.fixture", URL_SAFE_NO_PAD.encode(claims.to_string()))
+    }
+    #[tokio::test]
+    async fn oauth_organization_disagreement_fails_before_http() {
+        use crate::accounts::{AccountError, Credential};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        for token in [
+            jwt(serde_json::json!({"org_id":"A", "exp":4102444800_i64})),
+            jwt(serde_json::json!({"organization_id":"B", "exp":4102444800_i64})),
+            "opaque".into(),
+        ] {
+            let owned = Credential::FactoryOAuth {
+                access_token: token.clone(),
+                refresh_token: "fixture-refresh".into(),
+                organization_id: Some("B".into()),
+                expires_at: 4102444800,
+                refresh_pending: false,
+            };
+            let native = parse_native(
+                &serde_json::to_vec(&serde_json::json!({
+                    "access_token":token, "active_organization_id":"B"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            for credential in [owned, native] {
+                assert!(matches!(
+                    fetch_oauth_at(&http::fixture::context(), &credential, &endpoint).await,
+                    Err(AccountError::OAuth)
+                ));
+            }
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn oauth_reports_only_token_organization_after_provider_acceptance() {
+        use crate::accounts::Credential;
+        for binding in [None, Some("A".into())] {
+            let token = jwt(serde_json::json!({"org_id":"A", "exp":4102444800_i64}));
+            let credential = Credential::FactoryOAuth {
+                access_token: token,
+                refresh_token: "fixture-refresh".into(),
+                organization_id: binding,
+                expires_at: 4102444800,
+                refresh_pending: false,
+            };
+            let (endpoint, server) = http::fixture::server(vec![
+                serde_json::json!({"usesTokenRateLimitsBilling":false}),
+            ])
+            .await;
+            let usage = fetch_oauth_at(&http::fixture::context(), &credential, &endpoint)
+                .await
+                .unwrap();
+            assert_eq!(usage.account.id, "A");
+            assert_eq!(server.await.unwrap().len(), 1);
+        }
+    }
     #[tokio::test]
     async fn workos_contract_rotation_and_quota_are_separate() {
         use crate::accounts::Credential;
@@ -525,8 +612,9 @@ mod tests {
             refresh_pending: true,
         };
         for rotated in [None, Some("rotated")] {
+            let token = jwt(serde_json::json!({"org_id":"org+&"}));
             let (endpoint, server) = http::fixture::server(vec![
-                serde_json::json!({"access_token":"new", "refresh_token":rotated}),
+                serde_json::json!({"access_token":token, "refresh_token":rotated}),
             ])
             .await;
             let updated = refresh_at(&http::fixture::context(), &credential, &endpoint)
@@ -557,7 +645,9 @@ mod tests {
             assert_eq!(usage.windows[0].note.as_deref(), Some("legacy-billing"));
             let requests = server.await.unwrap();
             assert_eq!(requests.len(), 1);
-            assert!(requests[0].starts_with("GET ") && requests[0].contains("Bearer new"));
+            assert!(
+                requests[0].starts_with("GET ") && requests[0].contains(&format!("Bearer {token}"))
+            );
             assert!(!requests[0].to_lowercase().contains("x-factory-org-id"));
         }
         for body in [
