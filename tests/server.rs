@@ -26,12 +26,38 @@ fn server_argument_contract() {
     };
     assert_eq!(args.listen.to_string(), "127.0.0.1:6767");
     assert_eq!(args.refresh_interval, None);
+    assert!(args.account_vault_namespace.is_none());
+    let Command::Serve(isolated) = Cli::try_parse_from([
+        "quotio",
+        "serve",
+        "--manage",
+        "--parent-pipe",
+        "--account-vault-namespace",
+        "manual-test",
+    ])
+    .unwrap()
+    .command
+    else {
+        panic!()
+    };
+    assert_eq!(
+        isolated.account_vault_namespace,
+        Some("manual-test".parse().unwrap())
+    );
     for args in [
         vec!["--refresh-interval", "0"],
         vec!["--refresh-interval", "86401"],
         vec!["--timeout", "0"],
         vec!["--listen", "example.com:6767"],
         vec!["--token", "must-not-be-in-argv"],
+        vec!["--account-vault-namespace", "manual-test"],
+        vec!["--manage", "--account-vault-namespace", "../production"],
+        vec![
+            "--manage",
+            "--no-saved-accounts",
+            "--account-vault-namespace",
+            "manual-test",
+        ],
     ] {
         assert!(Cli::try_parse_from(["quotio", "serve"].into_iter().chain(args)).is_err());
     }
@@ -48,6 +74,7 @@ async fn startup_rejects_remote_bind_empty_selection_and_occupied_port() {
         refresh_interval: None,
         timeout: Some(1),
         no_saved_accounts: true,
+        account_vault_namespace: None,
         manage: false,
         public_url: None,
         allow_origin: vec![],

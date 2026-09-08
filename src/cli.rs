@@ -305,6 +305,9 @@ pub struct ServeArgs {
     /// Use environment/local sources without reading saved accounts
     #[arg(long)]
     pub no_saved_accounts: bool,
+    /// Store managed accounts in a separate application-owned vault namespace
+    #[arg(long, requires_all = ["manage", "parent_pipe"], conflicts_with = "no_saved_accounts")]
+    pub account_vault_namespace: Option<crate::accounts::vault::VaultNamespace>,
     /// Enable account/auth/settings/refresh writes; requires QUOTIO_SERVER_TOKEN
     #[arg(long)]
     pub manage: bool,

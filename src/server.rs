@@ -598,6 +598,11 @@ pub async fn run(args: ServeArgs) -> Result<(), ServerError> {
     let commit_guard = Arc::new(Mutex::new(()));
     let vault = if args.no_saved_accounts {
         None
+    } else if let Some(namespace) = &args.account_vault_namespace {
+        Some(
+            crate::accounts::vault::Vault::isolated_for_management(namespace)
+                .map_err(|_| ServerError::Config)?,
+        )
     } else {
         crate::accounts::vault::Vault::for_usage().ok()
     };

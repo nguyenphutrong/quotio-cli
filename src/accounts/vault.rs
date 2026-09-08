@@ -2,8 +2,56 @@ use super::{AccountError, Document};
 use std::{
     fs::{File, OpenOptions},
     path::PathBuf,
+    str::FromStr,
     sync::Arc,
 };
+
+#[cfg(target_os = "macos")]
+const PRODUCTION_KEYCHAIN_SERVICE: &str = "app.quotio.cli.accounts.v1";
+#[cfg(target_os = "macos")]
+const PRODUCTION_KEYCHAIN_ACCOUNT: &str = "vault";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VaultNamespace(String);
+
+impl VaultNamespace {
+    #[cfg(target_os = "macos")]
+    fn keychain_service(&self) -> String {
+        format!("app.quotio.cli.accounts.{}.v1", self.0)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn keychain_account(&self) -> String {
+        format!("vault.{}", self.0)
+    }
+
+    fn lock_name(&self) -> String {
+        format!("accounts-{}.lock", self.0)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn vault_name(&self) -> String {
+        format!("vault-{}", self.0)
+    }
+}
+
+impl FromStr for VaultNamespace {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let bytes = value.as_bytes();
+        if !(1..=32).contains(&bytes.len())
+            || !bytes[0].is_ascii_lowercase()
+            || !bytes[bytes.len() - 1].is_ascii_alphanumeric()
+            || !bytes
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        {
+            return Err("namespace must be 1-32 lowercase letters, digits or hyphens");
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
 
 pub trait Backend: Send + Sync {
     fn read(&self) -> Result<Option<Vec<u8>>, AccountError>;
@@ -26,13 +74,33 @@ impl Backend for Locked {
 pub struct Keychain {
     #[cfg(target_os = "macos")]
     interactive: bool,
+    #[cfg(target_os = "macos")]
+    service: String,
+    #[cfg(target_os = "macos")]
+    account: String,
 }
 #[cfg(target_os = "macos")]
 impl Keychain {
+    fn production(interactive: bool) -> Self {
+        Self {
+            interactive,
+            service: PRODUCTION_KEYCHAIN_SERVICE.into(),
+            account: PRODUCTION_KEYCHAIN_ACCOUNT.into(),
+        }
+    }
+
+    fn isolated(interactive: bool, namespace: &VaultNamespace) -> Self {
+        Self {
+            interactive,
+            service: namespace.keychain_service(),
+            account: namespace.keychain_account(),
+        }
+    }
+
     fn options(&self) -> security_framework::passwords::PasswordOptions {
         let mut options = security_framework::passwords::PasswordOptions::new_generic_password(
-            "app.quotio.cli.accounts.v1",
-            "vault",
+            &self.service,
+            &self.account,
         );
         if !self.interactive {
             use core_foundation::{base::TCFType, string::CFString};
@@ -51,6 +119,16 @@ impl Keychain {
             }
         }
         options
+    }
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl Keychain {
+    fn production(_interactive: bool) -> Self {
+        Self {}
+    }
+
+    fn isolated(_interactive: bool, _namespace: &VaultNamespace) -> Self {
+        Self {}
     }
 }
 impl Backend for Keychain {
@@ -109,29 +187,39 @@ pub struct Transaction {
 }
 impl Vault {
     pub fn system() -> Result<Self, AccountError> {
-        Self::system_with_interaction(true)
+        Self::system_with_interaction(true, None)
     }
     pub fn for_usage() -> Result<Self, AccountError> {
-        Self::system_with_interaction(false)
+        Self::system_with_interaction(false, None)
     }
-    fn system_with_interaction(_interactive: bool) -> Result<Self, AccountError> {
+    pub fn isolated_for_management(namespace: &VaultNamespace) -> Result<Self, AccountError> {
+        Self::system_with_interaction(true, Some(namespace))
+    }
+    fn system_with_interaction(
+        _interactive: bool,
+        namespace: Option<&VaultNamespace>,
+    ) -> Result<Self, AccountError> {
         let dirs = directories::ProjectDirs::from("", "", "quotio").ok_or(AccountError::Storage)?;
         #[cfg(target_os = "linux")]
         let backend: Arc<dyn Backend> = match super::encrypted_file::EncryptedFile::from_environment(
-            &dirs.data_local_dir().join("vault"),
+            &dirs.data_local_dir().join(
+                namespace
+                    .map(VaultNamespace::vault_name)
+                    .unwrap_or_else(|| "vault".into()),
+            ),
         ) {
             Ok(backend) => Arc::new(backend),
             Err(_) => Arc::new(Locked),
         };
         #[cfg(not(target_os = "linux"))]
-        let backend: Arc<dyn Backend> = Arc::new(Keychain {
-            #[cfg(target_os = "macos")]
-            interactive: _interactive,
+        let backend: Arc<dyn Backend> = Arc::new(match namespace {
+            Some(namespace) => Keychain::isolated(_interactive, namespace),
+            None => Keychain::production(_interactive),
         });
-        Ok(Self::new(
-            backend,
-            dirs.data_local_dir().join("accounts.lock"),
-        ))
+        let lock_name = namespace
+            .map(VaultNamespace::lock_name)
+            .unwrap_or_else(|| "accounts.lock".into());
+        Ok(Self::new(backend, dirs.data_local_dir().join(lock_name)))
     }
     pub fn new(backend: Arc<dyn Backend>, lock_path: PathBuf) -> Self {
         Self { backend, lock_path }
@@ -691,11 +779,26 @@ pub(crate) mod tests {
         let fail =
             unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationUIFail).into_CFType() };
         #[allow(deprecated)]
-        let noninteractive = Keychain { interactive: false }.options().query;
+        let noninteractive = Keychain::production(false).options().query;
         #[allow(deprecated)]
-        let interactive = Keychain { interactive: true }.options().query;
+        let interactive = Keychain::production(true).options().query;
         assert!(noninteractive.iter().any(|(k, v)| k == &key && v == &fail));
         assert!(!interactive.iter().any(|(k, _)| k == &key));
+    }
+    #[test]
+    fn isolated_namespace_changes_keychain_tuple_and_lock() {
+        let namespace: VaultNamespace = "manual-test".parse().unwrap();
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            namespace.keychain_service(),
+            "app.quotio.cli.accounts.manual-test.v1"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(namespace.keychain_account(), "vault.manual-test");
+        assert_eq!(namespace.lock_name(), "accounts-manual-test.lock");
+        for invalid in ["", "Manual", "-manual", "manual-", "manual_test", "a/../b"] {
+            assert!(invalid.parse::<VaultNamespace>().is_err());
+        }
     }
     #[cfg(target_os = "macos")]
     #[test]
