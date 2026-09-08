@@ -1,5 +1,7 @@
 //! HTTP management and snapshot transport; provider work uses the shared usage cache.
 mod bootstrap;
+#[cfg(test)]
+mod discovery_tests;
 mod management;
 mod openapi;
 mod operations;
@@ -110,6 +112,7 @@ struct ApiState {
     wake: Notify,
     operations: Mutex<Operations>,
     jobs: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+    discovery: std::sync::Mutex<crate::accounts::discovery::Registry>,
     status: Mutex<RefreshStatus>,
     context: ProviderContext,
     no_saved_accounts: bool,
@@ -156,6 +159,7 @@ fn router(state: Arc<ApiState>, policy: Arc<security::Policy>) -> Router {
                 .delete(management::remove),
         )
         .route("/v1/account-sources", post(management::reference))
+        .route("/v1/account-sources/discover", post(management::discover))
         .route("/v1/accounts/{id}/usage", get(management::usage))
         .route("/v1/auth/sessions", post(management::begin))
         .route(
@@ -606,6 +610,7 @@ pub async fn run(args: ServeArgs) -> Result<(), ServerError> {
         )
     });
     let state = Arc::new(ApiState {
+        discovery: Default::default(),
         settings: RwLock::new(view),
         store,
         snapshot: RwLock::new(None),

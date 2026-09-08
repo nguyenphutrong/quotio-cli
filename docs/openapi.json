@@ -1332,6 +1332,23 @@
         }
       }
     },
+    "/v1/account-sources/discover": {
+      "post": {
+        "summary": "Inspect one explicitly selected native source kind",
+        "description": "Requires bearer authentication and management mode. With inspect false (default), returns fixed registration choices marked not_checked; no native reads. With inspect true, reads only Grok auth metadata, a selected Copilot apps/hosts file, or a selected Quotio preferences domain for the selected provider. Keychain enumeration and fixed-location inspection are unsupported. Available means an entry reference exists, not that credentials are valid, unlocked or unexpired. No network, login, refresh or native writes. At most 64 entries and 1 MiB per source; unreadable includes unsafe files and over-limit data. Opaque references expire after 600 seconds or server restart. Labels are generic; keys, paths and credentials are never returned. No Idempotency-Key is needed for inspection.",
+        "security": [{"bearerAuth": []}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SourceDiscoveryInput"}}}},
+        "responses": {
+          "200": {"description": "Inspection result", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SourceDiscoveryResult"}}}},
+          "409": {"$ref": "#/components/responses/Conflict"},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "403": {"$ref": "#/components/responses/Forbidden"},
+          "405": {"$ref": "#/components/responses/MethodNotAllowed"},
+          "503": {"$ref": "#/components/responses/Unavailable"}
+        }
+      }
+    },
     "/v1/account-sources": {
       "post": {
         "summary": "Register a read-only quota source",
@@ -1413,7 +1430,7 @@
             }
           }
         ],
-        "description": "Register an existing ClinePass custom-provider reference on macOS, or the node standard Amp native source on macOS/Linux. Stores references only; never refreshes or writes source credentials. Requires management mode and Idempotency-Key."
+        "description": "Register an explicit native source or an opaque candidate from /v1/account-sources/discover. Stores references only; never refreshes or writes source credentials. Requires management mode and Idempotency-Key. Existing per-kind inputs remain supported. Discovery references expire after 600 seconds or server restart; inspect again if expired."
       }
     }
   },
@@ -2161,6 +2178,7 @@
               ]
             }
           },
+          "source_discovery_endpoint": {"type": "string", "const": "/v1/account-sources/discover", "description": "Use only kinds listed in source_references. Management-only explicit inspection."},
           "source_references": {
             "type": "array",
             "items": {
@@ -2743,8 +2761,35 @@
           }
         }
       },
+      "SourceDiscoveryInput": {
+        "type": "object", "additionalProperties": false, "required": ["provider", "kind"],
+        "properties": {
+          "provider": {"$ref": "#/components/schemas/ProviderId"},
+          "kind": {"type": "string", "enum": ["grok_native", "copilot_native", "quotio_custom_provider", "codex_native", "claude_native", "kiro_native", "factory_native", "devin_desktop_native", "antigravity_native", "amp_native", "cursor_native"]},
+          "location": {"type": ["string", "null"], "description": "One location supported by this kind's registration input. Required for Copilot inspection. Omit for kinds without locations."},
+          "domain": {"type": ["string", "null"], "enum": ["production", "development", null], "description": "Required only for quotio_custom_provider; selected provider must be clinepass or zai."},
+          "inspect": {"type": "boolean", "default": false}
+        }
+      },
+      "DiscoveredSourceInput": {
+        "type": "object", "additionalProperties": false, "required": ["kind", "discovery_ref"],
+        "properties": {"kind": {"const": "discovered"}, "discovery_ref": {"type": "string", "description": "Opaque server-local reference from explicit discovery. Expires after 600 seconds or restart; inspect again if expired."}}
+      },
+      "SourceDiscoveryResult": {
+        "type": "object", "additionalProperties": false, "required": ["schema_version", "status", "candidates"],
+        "properties": {
+          "schema_version": {"const": 1},
+          "status": {"enum": ["not_checked", "checked", "unavailable", "unsupported", "unreadable"]},
+          "expires_in_seconds": {"const": 600},
+          "candidates": {"type": "array", "maxItems": 64, "items": {
+            "type": "object", "additionalProperties": false, "required": ["label", "status", "source"],
+            "properties": {"label": {"type": "string"}, "status": {"enum": ["not_checked", "available"]}, "source": {"$ref": "#/components/schemas/AccountSourceInput"}}
+          }}
+        }
+      },
       "AccountSourceInput": {
         "oneOf": [
+          {"$ref": "#/components/schemas/DiscoveredSourceInput"},
           {"$ref": "#/components/schemas/DevinDesktopNativeInput"},
           {"$ref": "#/components/schemas/FactoryNativeInput"},
           {"$ref": "#/components/schemas/KiroNativeInput"},

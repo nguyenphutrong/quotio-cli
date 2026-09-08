@@ -1,5 +1,6 @@
 pub mod api;
 pub mod command;
+pub mod discovery;
 #[cfg(any(target_os = "linux", all(test, unix)))]
 mod encrypted_file;
 mod input;

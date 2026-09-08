@@ -256,6 +256,20 @@ pub fn prepare_antigravity_owned(
     })
 }
 
+impl PreparedAccount {
+    pub(super) fn discovered(
+        provider: Provider,
+        identity: String,
+        credential: Credential,
+    ) -> Result<Self, AccountError> {
+        Ok(Self {
+            provider,
+            identity,
+            credential,
+            label: format!("{} native {}", provider.id(), &super::random_string()?[..8]),
+        })
+    }
+}
 pub struct PreparedAccount {
     provider: Provider,
     label: String,
@@ -265,6 +279,9 @@ pub struct PreparedAccount {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceInput {
+    Discovered {
+        discovery_ref: String,
+    },
     KiroNative {},
     AntigravityNative {
         location: super::sources::AntigravityLocation,
@@ -297,6 +314,7 @@ pub enum SourceInput {
 }
 pub async fn prepare_source(input: SourceInput) -> Result<PreparedAccount, AccountError> {
     let (identity, credential, resolved) = match input {
+        SourceInput::Discovered { .. } => return Err(AccountError::Input),
         SourceInput::AntigravityNative { location } => {
             let source = super::sources::AntigravityNativeReference::system(location)?;
             let resolved = source.resolve().await?;

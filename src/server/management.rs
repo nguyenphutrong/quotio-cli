@@ -85,6 +85,7 @@ pub(super) async fn usage(State(state): State<Arc<ApiState>>, Path(id): Path<Str
 enum Mutation {
     Create(api::AccountCreateInput),
     Reference(api::SourceInput),
+    Discovered(crate::accounts::discovery::Reference),
     Update(String, api::AccountPatch),
     Remove(String),
 }
@@ -105,6 +106,41 @@ pub(super) async fn create(
     )
     .await
 }
+pub(super) async fn discover(
+    State(state): State<Arc<ApiState>>,
+    ApiJson(body): ApiJson<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let input = serde_json::from_value(body)
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    if !state.manage {
+        return Err(ApiError(StatusCode::FORBIDDEN, "management_required"));
+    }
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || {
+            state
+                .discovery
+                .try_lock()
+                .map_err(|_| AccountError::Busy)?
+                .inspect(input)
+        }),
+    )
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "source_inspection_unavailable",
+        )
+    })?
+    .map_err(|_| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "source_inspection_unavailable",
+        )
+    })?
+    .map_err(account_error)?;
+    Ok(Json(result))
+}
 pub(super) async fn reference(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
@@ -112,13 +148,24 @@ pub(super) async fn reference(
 ) -> Result<(StatusCode, Json<Operation>), ApiError> {
     let input = serde_json::from_value(body.clone())
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    let mutation = match input {
+        api::SourceInput::Discovered { discovery_ref } => Mutation::Discovered(
+            state
+                .discovery
+                .try_lock()
+                .map_err(|_| account_error(AccountError::Busy))?
+                .get(&discovery_ref)
+                .map_err(account_error)?,
+        ),
+        input => Mutation::Reference(input),
+    };
     mutate(
         state,
         headers,
         "account_source_register",
         "",
         body,
-        Mutation::Reference(input),
+        mutation,
     )
     .await
 }
@@ -227,10 +274,13 @@ async fn mutate(
                         work.invalidate().await;
                         Ok(json!({"account_id":account_id}))
                     }
-                    Mutation::Reference(input) => {
-                        let prepared = api::prepare_source(input)
-                            .await
-                            .map_err(|e| account_code(&e))?;
+                    mutation @ (Mutation::Reference(_) | Mutation::Discovered(_)) => {
+                        let prepared = match mutation {
+                            Mutation::Reference(input) => api::prepare_source(input).await,
+                            Mutation::Discovered(reference) => reference.resolve().await,
+                            _ => unreachable!(),
+                        }
+                        .map_err(|e| account_code(&e))?;
                         let _guard = crate::accounts::service::mutation_guard(&work.commit_guard)
                             .await
                             .map_err(|e| account_code(&e))?;

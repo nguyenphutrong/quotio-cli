@@ -783,7 +783,7 @@ impl CustomProviderReference {
             &id.to_ascii_lowercase(),
         ]))
     }
-    fn parse(&self, bytes: &[u8]) -> Result<Resolved, AccountError> {
+    pub(super) fn parse(&self, bytes: &[u8]) -> Result<Resolved, AccountError> {
         self.identity()?;
         if bytes.len() > 1024 * 1024 {
             return Err(AccountError::Corrupt);
@@ -872,7 +872,7 @@ impl CustomProviderReference {
     }
 }
 #[cfg(target_os = "macos")]
-fn read_preferences(domain: QuotioDomain) -> Result<Vec<u8>, AccountError> {
+pub(super) fn read_preferences(domain: QuotioDomain) -> Result<Vec<u8>, AccountError> {
     read_preferences_domain(domain.identifier())
 }
 #[cfg(target_os = "macos")]
@@ -901,7 +901,7 @@ fn read_preferences_domain(identifier: &str) -> Result<Vec<u8>, AccountError> {
     Ok(data.bytes().to_vec())
 }
 #[cfg(not(target_os = "macos"))]
-fn read_preferences(_: QuotioDomain) -> Result<Vec<u8>, AccountError> {
+pub(super) fn read_preferences(_: QuotioDomain) -> Result<Vec<u8>, AccountError> {
     Err(AccountError::Unsupported)
 }
 

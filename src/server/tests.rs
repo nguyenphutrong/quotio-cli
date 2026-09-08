@@ -54,6 +54,7 @@ pub(super) async fn fixture() -> (Arc<ApiState>, std::path::PathBuf, String) {
     );
     (
         Arc::new(ApiState {
+            discovery: Default::default(),
             settings: RwLock::new(view),
             store,
             snapshot: RwLock::new(None),

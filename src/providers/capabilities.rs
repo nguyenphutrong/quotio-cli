@@ -53,6 +53,8 @@ pub struct ProviderCapability {
     pub native_instructions: Option<&'static str>,
     pub operations: Vec<Operation>,
     pub source_references: Vec<SourceCapability>,
+    /// Explicit opt-in metadata inspection, never an automatic credential scan.
+    pub source_discovery_endpoint: &'static str,
 }
 const FACTORY_REGIONS: &[&str] = &["global", "eu"];
 const ASIA_REGIONS: &[&str] = &["global", "cn"];
@@ -177,6 +179,7 @@ pub fn capability(provider: Provider) -> ProviderCapability {
         } else {
             vec![]
         },
+        source_discovery_endpoint: "/v1/account-sources/discover",
         source_references: if matches!(provider, Provider::Catalog("clinepass") | Provider::Zai) {
             vec![SourceCapability {
                 kind: "quotio_custom_provider",
