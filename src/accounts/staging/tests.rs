@@ -199,6 +199,147 @@ fn interrupted_and_uncertain_receipts_recover_without_overwrite() {
     );
 }
 
+fn mapping() -> Mapping<'static> {
+    Mapping {
+        account_id: "fixture-account",
+        provider: "amp",
+        source: "quotioKeychain",
+        credential_reference: Some("keychain"),
+        service: "fixture-service",
+    }
+}
+
+fn mapping_files(f: &Fixture) -> (PathBuf, PathBuf) {
+    let metadata = f.0.join("accounts-v1.json");
+    fs::write(&metadata, br#"{"accounts":[{"id":"fixture-account","provider":"amp","accountKey":"fixture-label","displayName":"fixture-name","source":"quotioKeychain","credentialReference":"keychain","canDelete":true,"isDisabled":false}],"disabledAccountIDs":["fixture-account"]}"#).unwrap();
+    let envelope = f.0.join(format!(
+        "{}.qsv",
+        digest(b"fixture-service\0fixture-account")
+    ));
+    fs::rename(f.envelope(), &envelope).unwrap();
+    (metadata, envelope)
+}
+
+#[test]
+fn mapping_stages_exact_encrypted_bytes_with_private_restart_and_concurrent_receipts() {
+    let f = Fixture::new();
+    let dest = Fixture::new();
+    let (metadata, envelope) = mapping_files(&f);
+    let original_metadata = fs::read(&metadata).unwrap();
+    let original_envelope = fs::read(&envelope).unwrap();
+    let assess = || assess_mapping(&metadata, &envelope, &"a".repeat(64), &mapping()).unwrap();
+    let snapshot = assess();
+    let json = serde_json::to_string(snapshot.plan()).unwrap();
+    assert!(json.contains("candidate_unverified"));
+    assert!(json.contains("\"repository_disabled\":true"));
+    assert!(json.contains("\"record_disabled\":false"));
+    for sensitive in [
+        "fixture-account",
+        "fixture-name",
+        "fixture-label",
+        "fixture-service",
+        "wrappedKey",
+        f.0.to_str().unwrap(),
+    ] {
+        assert!(!json.contains(sensitive));
+    }
+    // Simulate interruption after the first artifact, then restart from source.
+    unix::save(
+        &dest.0,
+        &format!("{}.metadata.json", digest(&original_metadata)),
+        &original_metadata,
+    )
+    .unwrap();
+    let id = stage_mapping(&assess(), &dest.0).unwrap();
+    let receipt = dest.0.join(format!("{id}.json"));
+    let inode = fs::metadata(&receipt).unwrap().ino();
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..6)
+            .map(|_| scope.spawn(|| stage_mapping(&assess(), &dest.0).unwrap()))
+            .collect();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), id);
+        }
+    });
+    assert_eq!(fs::metadata(&receipt).unwrap().ino(), inode);
+    assert_eq!(fs::read(&metadata).unwrap(), original_metadata);
+    assert_eq!(fs::read(&envelope).unwrap(), original_envelope);
+    let staged = dest.0.join(format!("{}.qsv", digest(&original_envelope)));
+    assert_eq!(fs::read(&staged).unwrap(), original_envelope);
+    assert_eq!(fs::metadata(&staged).unwrap().mode() & 0o777, 0o600);
+    let mut changed = original_metadata;
+    changed.push(b' ');
+    fs::write(&metadata, changed).unwrap();
+    let metadata_changed_id = stage_mapping(&assess(), &dest.0).unwrap();
+    assert_ne!(metadata_changed_id, id);
+    let mut changed_envelope = original_envelope.clone();
+    changed_envelope.push(b' ');
+    fs::write(&envelope, changed_envelope).unwrap();
+    assert_ne!(
+        stage_mapping(&assess(), &dest.0).unwrap(),
+        metadata_changed_id
+    );
+    // Previously assessed snapshots never reopen changed source paths.
+    assert_eq!(stage_mapping(&snapshot, &dest.0).unwrap(), id);
+    fs::write(&staged, b"tampered").unwrap();
+    assert!(matches!(
+        stage_mapping(&snapshot, &dest.0),
+        Err(StagingError::Conflict)
+    ));
+    assert_eq!(fs::read(staged).unwrap(), b"tampered");
+}
+
+#[test]
+fn mapping_rejects_ambiguity_unknown_dates_mismatch_and_unsafe_sources() {
+    let f = Fixture::new();
+    let (metadata, envelope) = mapping_files(&f);
+    let original = fs::read(&metadata).unwrap();
+    let valid: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let check = || assess_mapping(&metadata, &envelope, &"a".repeat(64), &mapping());
+    for field in ["provider", "source", "credentialReference", "id"] {
+        let mut value = valid.clone();
+        value["accounts"][0][field] = "wrong".into();
+        fs::write(&metadata, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(check().is_err());
+    }
+    for mutate in 0..4 {
+        let mut value = valid.clone();
+        match mutate {
+            0 => {
+                let account = value["accounts"][0].clone();
+                value["accounts"].as_array_mut().unwrap().push(account);
+            }
+            1 => value["disabledAccountIDs"] = serde_json::json!(["unknown"]),
+            2 => value["accounts"][0]["expiresAt"] = 0.into(),
+            _ => value["accounts"][0]["source"] = "path/with\ncontrol".into(),
+        }
+        fs::write(&metadata, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(check().is_err());
+    }
+    fs::write(&metadata, &original).unwrap();
+    assert!(assess_mapping(&metadata, &f.envelope(), &"a".repeat(64), &mapping()).is_err());
+    let alias = f.0.join("metadata-alias");
+    std::os::unix::fs::symlink(&metadata, &alias).unwrap();
+    assert!(assess_mapping(&alias, &envelope, &"a".repeat(64), &mapping()).is_err());
+    fs::write(&metadata, vec![0; 1024 * 1024 + 1]).unwrap();
+    assert!(check().is_err());
+}
+
+#[test]
+fn mapping_destination_descriptor_stays_pinned_when_directory_is_renamed() {
+    let f = Fixture::new();
+    let target = f.0.join("stage");
+    fs::create_dir(&target).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+    let pinned = unix::stage_directory(&target).unwrap();
+    let moved = f.0.join("moved");
+    fs::rename(&target, &moved).unwrap();
+    fs::create_dir(&target).unwrap();
+    unix::save_to(&pinned, "fixture.json", b"fixture").unwrap();
+    assert!(!target.join("fixture.json").exists());
+    assert_eq!(fs::read(moved.join("fixture.json")).unwrap(), b"fixture");
+}
+
 #[test]
 fn invalid_fingerprint_paths_and_large_inputs_are_safe() {
     let f = Fixture::new();
