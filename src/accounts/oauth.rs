@@ -1605,9 +1605,20 @@ mod session_tests {
     #[tokio::test(start_paused = true)]
     async fn claude_late_claim_survives_delayed_http_and_persistence() {
         // Keep virtual time under test control while real loopback I/O runs.
-        let awake = tokio::spawn(async { loop { tokio::task::yield_now().await; } });
+        let awake = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
         let manager = manager();
-        let session = manager.begin_for(crate::cli::Provider::Catalog("claude"), None, OAuthMode::Relay).await.unwrap();
+        let session = manager
+            .begin_for(
+                crate::cli::Provider::Catalog("claude"),
+                None,
+                OAuthMode::Relay,
+            )
+            .await
+            .unwrap();
         tokio::time::advance(Duration::from_secs(179)).await;
         let (authorization, label) = manager.claim(&session.id).await.unwrap();
         let code = format!("private-code#{}", authorization.state);
@@ -1616,19 +1627,31 @@ mod session_tests {
         let id = session.id.clone();
         let guard = manager.commit_guard.clone().lock_owned().await;
         let completion = tokio::spawn(async move {
-            let credential = tokio::time::timeout(Duration::from_secs(30), claude::exchange_at(&worker.context, authorization, &code, &url)).await.unwrap();
+            let credential = tokio::time::timeout(
+                Duration::from_secs(30),
+                claude::exchange_at(&worker.context, authorization, &code, &url),
+            )
+            .await
+            .unwrap();
             worker.finish(&id, credential, label).await
         });
         let (_, response) = requests.recv().await.unwrap();
         tokio::time::advance(Duration::from_secs(20)).await;
         response.send(serde_json::json!({"access_token":"private-access", "refresh_token":"private-refresh", "expires_in":3600, "account":{"uuid":"fixture-id", "email_address":"demo@example.com"}}).to_string()).unwrap();
-        assert_eq!(manager.get(&session.id).await.unwrap().status, SessionStatus::Processing);
+        assert_eq!(
+            manager.get(&session.id).await.unwrap().status,
+            SessionStatus::Processing
+        );
         tokio::time::advance(Duration::from_secs(5)).await;
         assert!(!completion.is_finished());
         drop(guard);
         let completed = completion.await.unwrap().unwrap();
         assert_eq!(completed.status, SessionStatus::Completed);
-        assert!(!serde_json::to_string(&completed).unwrap().contains("private-"));
+        assert!(
+            !serde_json::to_string(&completed)
+                .unwrap()
+                .contains("private-")
+        );
         assert_eq!(manager.vault.begin().unwrap().document.accounts.len(), 1);
         server.abort();
         awake.abort();
@@ -1653,17 +1676,26 @@ mod session_tests {
                     loop {
                         let mut line = String::new();
                         reader.read_line(&mut line).await.unwrap();
-                        if line == "\r\n" { break; }
-                        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
                             length = value.trim().parse::<usize>().unwrap();
                         }
                     }
                     let mut body = vec![0; length];
                     reader.read_exact(&mut body).await.unwrap();
                     let (respond, response) = tokio::sync::oneshot::channel::<String>();
-                    if tx.send((Instant::now(), respond)).is_err() { return; }
+                    if tx.send((Instant::now(), respond)).is_err() {
+                        return;
+                    }
                     if let Ok(body) = response.await {
-                        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
                         let _ = reader.get_mut().write_all(response.as_bytes()).await;
                     }
                 });

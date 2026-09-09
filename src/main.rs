@@ -361,7 +361,11 @@ mod tests {
     use super::*;
     #[test]
     fn copilot_terminal_deadline_does_not_truncate_device_expiry() {
-        for (provider, expected) in [("copilot", Some(3720)), ("codex", Some(180)), ("claude", None)] {
+        for (provider, expected) in [
+            ("copilot", Some(3720)),
+            ("codex", Some(180)),
+            ("claude", None),
+        ] {
             let cli =
                 Cli::try_parse_from(["quotio", "accounts", "add", "--provider", provider]).unwrap();
             let Command::Accounts(args) = cli.command else {
@@ -376,21 +380,27 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn late_claude_input_keeps_exchange_and_commit_alive() {
-        let cli = Cli::try_parse_from([
-            "quotio", "accounts", "add", "--provider", "claude",
-        ]).unwrap();
-        let Command::Accounts(args) = cli.command else { panic!("account command") };
+        let cli =
+            Cli::try_parse_from(["quotio", "accounts", "add", "--provider", "claude"]).unwrap();
+        let Command::Accounts(args) = cli.command else {
+            panic!("account command")
+        };
         let start = tokio::time::Instant::now();
         let result = within_account_deadline(account_timeout(&args.command), async {
             tokio::time::timeout(Duration::from_secs(180), async {
                 tokio::time::sleep(Duration::from_secs(179)).await;
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             tokio::time::timeout(Duration::from_secs(30), async {
                 tokio::time::sleep(Duration::from_secs(20)).await;
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             tokio::time::sleep(Duration::from_secs(5)).await;
             Ok("persisted")
-        }).await;
+        })
+        .await;
         assert_eq!(result.unwrap(), "persisted");
         assert_eq!(start.elapsed(), Duration::from_secs(204));
     }

@@ -39,9 +39,7 @@ fn account_error(error: AccountError) -> ApiError {
         AccountError::Busy
         | AccountError::Duplicate
         | AccountError::CallbackPort
-        | AccountError::IdempotencyConflict => {
-            StatusCode::CONFLICT
-        }
+        | AccountError::IdempotencyConflict => StatusCode::CONFLICT,
         AccountError::Storage | AccountError::Corrupt | AccountError::CommitUncertain => {
             StatusCode::SERVICE_UNAVAILABLE
         }

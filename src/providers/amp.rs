@@ -221,8 +221,15 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
                 .and_then(|(amounts, _)| amounts.split_once('/'))
             {
                 let amounts = QuotaAmounts {
-                    remaining: number(remaining.trim().strip_prefix('$').unwrap_or(remaining.trim()))?,
-                    limit: Some(number(limit.trim().strip_prefix('$').unwrap_or(limit.trim()))?),
+                    remaining: number(
+                        remaining
+                            .trim()
+                            .strip_prefix('$')
+                            .unwrap_or(remaining.trim()),
+                    )?,
+                    limit: Some(number(
+                        limit.trim().strip_prefix('$').unwrap_or(limit.trim()),
+                    )?),
                     unit: "USD".into(),
                 };
                 if amounts
@@ -589,7 +596,10 @@ mod tests {
                 let usage = parse(&text, OffsetDateTime::UNIX_EPOCH).unwrap();
                 assert_eq!(usage.windows.len(), 3);
                 assert_eq!(usage.windows[0].quota, Quota::from_remaining(Some(25.0)));
-                assert_eq!(usage.windows[0].reset_description.as_deref(), Some("replenishes +$0.5/hour"));
+                assert_eq!(
+                    usage.windows[0].reset_description.as_deref(),
+                    Some("replenishes +$0.5/hour")
+                );
                 assert_eq!(usage.windows[1].amounts.as_ref().unwrap().remaining, 1234.5);
                 assert_eq!(usage.windows[2].amounts.as_ref().unwrap().remaining, 12.5);
                 for window in &usage.windows[1..] {
@@ -597,7 +607,12 @@ mod tests {
                     assert!(window.amounts.as_ref().unwrap().limit.is_none());
                     assert!(window.reset_description.is_none());
                 }
-                assert!(usage.windows.iter().all(|window| window.resets_at.is_none()));
+                assert!(
+                    usage
+                        .windows
+                        .iter()
+                        .all(|window| window.resets_at.is_none())
+                );
             }
         }
     }
@@ -610,10 +625,14 @@ mod tests {
                 format!("Amp Free: {value}/$10 remaining"),
                 format!("Amp Free: $1/{value} remaining"),
             ] {
-                assert!(parse(
-                    &format!("Signed in as demo@example.com\n{line}"),
-                    OffsetDateTime::UNIX_EPOCH,
-                ).is_err(), "accepted {line}");
+                assert!(
+                    parse(
+                        &format!("Signed in as demo@example.com\n{line}"),
+                        OffsetDateTime::UNIX_EPOCH,
+                    )
+                    .is_err(),
+                    "accepted {line}"
+                );
             }
         }
     }
