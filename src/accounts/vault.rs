@@ -1,9 +1,13 @@
 use super::{AccountError, Document};
 use std::{
+    collections::HashMap,
     fs::{File, OpenOptions},
     path::PathBuf,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 #[cfg(target_os = "macos")]
@@ -161,6 +165,15 @@ impl Backend for Keychain {
 }
 pub struct VaultLock {
     file: File,
+    _process_lock: ProcessLock,
+}
+struct ProcessLock {
+    held: Arc<AtomicBool>,
+}
+impl Drop for ProcessLock {
+    fn drop(&mut self) {
+        self.held.store(false, Ordering::Release);
+    }
 }
 impl Drop for VaultLock {
     fn drop(&mut self) {
@@ -174,6 +187,27 @@ impl Drop for VaultLock {
             }
         }
     }
+}
+fn acquire_process_lock(path: &std::path::Path) -> Result<ProcessLock, AccountError> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<AtomicBool>>>> = OnceLock::new();
+    let held = {
+        let mut locks = LOCKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|_| AccountError::Storage)?;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(path).and_then(Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(AtomicBool::new(false));
+                locks.insert(path.to_owned(), Arc::downgrade(&lock));
+                lock
+            }
+        }
+    };
+    held.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .map_err(|_| AccountError::Busy)?;
+    Ok(ProcessLock { held })
 }
 #[derive(Clone)]
 pub struct Vault {
@@ -312,6 +346,9 @@ impl Vault {
     }
 }
 fn acquire(path: &std::path::Path) -> Result<VaultLock, AccountError> {
+    // `flock` behavior for separate descriptors in one process varies by platform.
+    // Pair it with a process-local guard so tasks cannot enter the same lock scope.
+    let process_lock = acquire_process_lock(path)?;
     let parent = path.parent().ok_or(AccountError::Storage)?;
     std::fs::create_dir_all(parent).map_err(|_| AccountError::Storage)?;
     let mut options = OpenOptions::new();
@@ -343,7 +380,10 @@ fn acquire(path: &std::path::Path) -> Result<VaultLock, AccountError> {
     {
         return Err(AccountError::Unsupported);
     }
-    Ok(VaultLock { file: lock })
+    Ok(VaultLock {
+        file: lock,
+        _process_lock: process_lock,
+    })
 }
 impl Transaction {
     pub fn commit(mut self) -> Result<(), AccountError> {
@@ -416,6 +456,16 @@ pub(crate) mod tests {
             region: None,
             organization: None,
         }
+    }
+    #[test]
+    fn lock_excludes_other_descriptors_in_the_same_process() {
+        let dir = std::env::temp_dir().join(random_string().unwrap());
+        let path = dir.join("lock");
+        let guard = acquire(&path).unwrap();
+        assert!(matches!(acquire(&path), Err(AccountError::Busy)));
+        drop(guard);
+        assert!(acquire(&path).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn lock_scope_ends_even_when_a_descriptor_is_duplicated() {
