@@ -1953,6 +1953,9 @@
       "ProviderUsage": {
         "type": "object",
         "properties": {
+          "reset_credits": {
+            "$ref": "#/components/schemas/ResetCredits"
+          },
           "account_ref": {
             "oneOf": [
               {
@@ -1997,6 +2000,43 @@
           "account",
           "windows"
         ]
+      },
+      "ResetCredits": {
+        "type": "object",
+        "description": "Observed banked Codex quota resets, not money. Omitted when unsupported, lookup failed, stale quota fallback is served, or earliest known expiry has passed. Missing never means zero. Counts refer to fetched_at, not generated_at; redemption elsewhere can change them. Native count-only summaries have unknown expiry.",
+        "additionalProperties": false,
+        "required": [
+          "available_count",
+          "earliest_expires_at",
+          "fetched_at",
+          "source"
+        ],
+        "properties": {
+          "available_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Authoritative upstream total, not the length of the potentially capped detail list."
+          },
+          "earliest_expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Earliest known expiry of an available Codex reset; null means none known, not a guarantee of no expiry."
+          },
+          "fetched_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "codex_api",
+              "codex_app_server"
+            ]
+          }
+        }
       },
       "AntigravitySubscriptionInfo": {
         "type": "object",

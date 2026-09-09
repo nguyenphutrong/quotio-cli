@@ -279,6 +279,7 @@ fn cursor_summary(
         windows.push(window);
     }
     Ok(ProviderUsage {
+        reset_credits: None,
         antigravity_subscription: None,
         codex_profile: None,
         codex_reset_credits: None,
@@ -349,6 +350,7 @@ pub(crate) async fn fetch_grok_complete_at(
         }),
     }
     Ok(ProviderUsage {
+        reset_credits: None,
         antigravity_subscription: None,
         codex_profile: None,
         codex_reset_credits: None,

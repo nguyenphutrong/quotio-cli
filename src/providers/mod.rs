@@ -8,6 +8,7 @@ pub mod codex;
 pub mod codex_api;
 pub(crate) mod codex_native;
 mod codex_profile;
+mod codex_reset_credits;
 pub mod factory;
 pub(crate) mod http;
 pub mod key_api;

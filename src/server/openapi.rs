@@ -278,6 +278,12 @@ mod tests {
             schema_version: 1,
             generated_at: now,
             providers: vec![crate::domain::ProviderUsage {
+                reset_credits: Some(crate::domain::ResetCredits {
+                    available_count: 2,
+                    earliest_expires_at: Some(now + time::Duration::days(1)),
+                    fetched_at: now,
+                    source: "codex_api".into(),
+                }),
                 antigravity_subscription: Some(
                     serde_json::from_str(include_str!(
                         "../providers/fixtures/antigravity-subscription-expected.json"

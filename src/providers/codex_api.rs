@@ -127,7 +127,19 @@ pub(crate) async fn fetch_at(
         supplemental(context, access_token, account_id, profile_endpoint, false),
     );
     match inventory.and_then(|value| parse_inventory(value, context.clock.now())) {
-        Ok(inventory) => usage.codex_reset_credits = Some(inventory),
+        Ok(inventory) => {
+            usage.reset_credits = Some(ResetCredits {
+                available_count: inventory.available_count,
+                earliest_expires_at: inventory
+                    .credits
+                    .iter()
+                    .filter_map(|credit| credit.expires_at)
+                    .min(),
+                fetched_at: inventory.fetched_at,
+                source: "codex_api".into(),
+            });
+            usage.codex_reset_credits = Some(inventory);
+        }
         Err(code) => usage.diagnostics.push(UsageDiagnostic {
             source: "codex_reset_credits".into(),
             code,
@@ -542,6 +554,7 @@ mod tests {
             usage.codex_reset_credits.as_ref().unwrap().available_count,
             0
         );
+        assert_eq!(usage.reset_credits.as_ref().unwrap().available_count, 0);
         assert_eq!(
             usage.codex_profile.as_ref().unwrap().daily_usage[0].tokens,
             0

@@ -238,6 +238,7 @@ async fn probe(
         return Err(ProviderError::Authentication);
     }
     Ok(ProviderUsage {
+        reset_credits: None,
         antigravity_subscription: None,
         codex_profile: None,
         codex_reset_credits: None,

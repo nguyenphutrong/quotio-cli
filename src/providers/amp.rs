@@ -345,6 +345,7 @@ pub(crate) fn parse(input: &str, now: OffsetDateTime) -> Result<ProviderUsage, P
         }
     }
     Ok(ProviderUsage {
+        reset_credits: None,
         antigravity_subscription: None,
         codex_profile: None,
         codex_reset_credits: None,

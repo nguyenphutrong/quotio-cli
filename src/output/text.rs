@@ -30,6 +30,16 @@ pub fn render(report: &UsageReport) -> String {
                 safe(&account.id)
             );
         }
+        if let Some(credits) = &usage.reset_credits {
+            let _ = writeln!(
+                text,
+                "  Banked reset credits: {} available as of {}; earliest expiry {}; source {}",
+                credits.available_count,
+                timestamp(Some(credits.fetched_at)),
+                timestamp(credits.earliest_expires_at),
+                safe(&credits.source)
+            );
+        }
         for window in &usage.windows {
             let balance_only = window.quota == Quota::Unknown
                 && window.amounts.as_ref().is_some_and(|a| a.limit.is_none());
@@ -129,4 +139,45 @@ pub fn failure(failure: &ProviderFailure) -> String {
         .map(|a| format!(" [{}: {}]", safe(&a.id), safe(&a.label)))
         .unwrap_or_default();
     format!("{}{account}: {}", safe(&failure.provider.0), failure.code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reset_credits_render_zero_positive_and_unknown_without_money_or_tokens() {
+        for count in [None, Some(0), Some(2)] {
+            let usage = crate::providers::codex::parse_direct("demo@example.com", json!({
+                "rateLimits":{"primary":{"usedPercent":20}},
+                "rateLimitResetCredits":count.map(|available| json!({"availableCount":available}))
+            }), OffsetDateTime::UNIX_EPOCH).unwrap();
+            let report = UsageReport {
+                schema_version: 1,
+                generated_at: OffsetDateTime::UNIX_EPOCH,
+                providers: vec![usage],
+                failures: vec![],
+            };
+            let text = render(&report);
+            let value: serde_json::Value =
+                serde_json::from_str(&crate::output::json::render(&report).unwrap()).unwrap();
+            match count {
+                Some(count) => {
+                    assert!(text.contains(&format!("Banked reset credits: {count} available as of 1970-01-01T00:00:00Z; earliest expiry unknown; source codex_app_server")));
+                    assert_eq!(
+                        value["providers"][0]["reset_credits"]["available_count"],
+                        count
+                    );
+                }
+                None => {
+                    assert!(!text.contains("Banked reset credits"));
+                    assert!(value["providers"][0].get("reset_credits").is_none());
+                }
+            }
+            assert!(!text.contains("USD"));
+            assert!(text.contains("remaining 80.0%"));
+            println!("{text}");
+        }
+    }
 }

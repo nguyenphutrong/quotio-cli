@@ -259,6 +259,7 @@ pub(crate) async fn fetch_oauth_at(
         .await
         .unwrap_or_else(|| id.clone());
     Ok(ProviderUsage {
+        reset_credits: None,
         antigravity_subscription: None,
         codex_profile: None,
         codex_reset_credits: None,
@@ -365,6 +366,7 @@ fn parse(
     }
     let windows = parse_windows(response, now)?;
     Ok(ProviderUsage {
+        reset_credits: None,
         antigravity_subscription: None,
         codex_profile: None,
         codex_reset_credits: None,

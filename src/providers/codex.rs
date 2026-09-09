@@ -71,6 +71,10 @@ fn parse(
     value: Value,
     now: OffsetDateTime,
 ) -> Result<ProviderUsage, ProviderError> {
+    let credits = value
+        .get("rateLimitResetCredits")
+        .filter(|v| !v.is_null())
+        .cloned();
     let limits: Limits = serde_json::from_value(value).map_err(|_| ProviderError::InvalidData)?;
     let buckets = match limits.rate_limits_by_limit_id {
         Some(map) if !map.is_empty() => map,
@@ -155,7 +159,8 @@ fn parse(
         windows.extend(bucket_windows.into_iter().map(|(_, window)| window));
     }
     let email = account.email.ok_or(ProviderError::InvalidData)?;
-    Ok(ProviderUsage {
+    let mut usage = ProviderUsage {
+        reset_credits: None,
         antigravity_subscription: None,
         codex_profile: None,
         codex_reset_credits: None,
@@ -169,7 +174,14 @@ fn parse(
             label: email,
         },
         windows,
-    })
+    };
+    if let Some(credits) = credits {
+        super::codex_reset_credits::attach(
+            &mut usage,
+            super::codex_reset_credits::parse(credits, true, now),
+        );
+    }
+    Ok(usage)
 }
 pub(crate) fn parse_direct(
     email: &str,
