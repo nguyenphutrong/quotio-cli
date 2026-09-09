@@ -1013,7 +1013,7 @@ fn cursor_validate_wal(bytes: &[u8], page_size: usize) -> Result<usize, Provider
     }
     let little = be(bytes) == 0x377f0682;
     let checksum = |bytes: &[u8], mut sum: [u32; 2]| {
-        for pair in bytes.chunks_exact(8) {
+        for pair in bytes.as_chunks::<8>().0 {
             let word = |v: &[u8]| {
                 if little {
                     u32::from_le_bytes(v[..4].try_into().unwrap())
