@@ -1,7 +1,10 @@
 use super::*;
 use std::{
     io::{BufRead, BufReader, Write},
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     process::{Child, Command as StdCommand},
 };
 
@@ -191,6 +194,73 @@ async fn cursor_wal_snapshot_is_private_and_cleaned_up() {
     assert!(cursor_database_remains_safe(&snapshot).unwrap());
     drop(snapshot);
     assert!(!directory.exists());
+}
+
+#[test]
+fn cursor_wal_recovers_only_unlocked_owned_snapshots() {
+    let fixture = Fixture::new();
+    let root = fixture.directory.join("snapshots");
+    prepare_cursor_snapshot_root(&root).unwrap();
+
+    let orphan = root.join(format!(
+        "{CURSOR_SNAPSHOT_PREFIX}{}-{}",
+        i32::MAX,
+        "a".repeat(43)
+    ));
+    std::fs::create_dir(&orphan).unwrap();
+    std::fs::set_permissions(&orphan, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(orphan.join(CURSOR_SNAPSHOT_LOCK))
+        .unwrap();
+    std::fs::write(orphan.join("state.vscdb"), b"orphaned private bytes").unwrap();
+
+    let locked = root.join(format!(
+        "{CURSOR_SNAPSHOT_PREFIX}{}-{}",
+        i32::MAX - 1,
+        "c".repeat(43)
+    ));
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(locked.join(CURSOR_SNAPSHOT_LOCK))
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+    let unrelated = root.join("keep-me");
+    std::fs::create_dir(&unrelated).unwrap();
+    let symlink_target = root.join("symlink-target");
+    std::fs::create_dir(&symlink_target).unwrap();
+    let symlink = root.join(format!(
+        "{CURSOR_SNAPSHOT_PREFIX}{}-{}",
+        i32::MAX,
+        "b".repeat(43)
+    ));
+    std::os::unix::fs::symlink(&symlink_target, &symlink).unwrap();
+
+    let active = open_cursor_database_in(&fixture.path(""), &root)
+        .unwrap()
+        .unwrap();
+    let active_directory = active.directory.clone();
+    recover_cursor_snapshots(&root).unwrap();
+
+    assert!(!orphan.exists());
+    assert!(locked.exists());
+    assert!(active_directory.exists());
+    assert!(unrelated.exists());
+    assert!(symlink.symlink_metadata().unwrap().file_type().is_symlink());
+    assert!(symlink_target.exists());
+    drop(lock);
+    recover_cursor_snapshots(&root).unwrap();
+    assert!(!locked.exists());
+    drop(active);
+    assert!(!active_directory.exists());
 }
 
 #[tokio::test]

@@ -38,6 +38,10 @@ const MAX_CURSOR_DATABASE_BYTES: u64 = 64 * 1024 * 1024;
 const NATIVE_READ_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(unix)]
 const CURSOR_SQLITE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const CURSOR_SNAPSHOT_PREFIX: &str = "quotio-cursor-";
+#[cfg(unix)]
+const CURSOR_SNAPSHOT_LOCK: &str = ".lock";
 
 pub const DEFINITIONS: &[Definition] = &[
     Definition {
@@ -666,6 +670,7 @@ async fn cursor_token(context: &ProviderContext) -> Result<Secret, ProviderError
 #[cfg(unix)]
 struct CursorDatabase {
     directory: PathBuf,
+    _lock: std::fs::File,
     sources: Vec<(PathBuf, Option<std::fs::Metadata>)>,
 }
 
@@ -853,18 +858,44 @@ fn cursor_login_from_output(bytes: &[u8]) -> Result<CursorLogin, ProviderError> 
 
 #[cfg(unix)]
 fn open_cursor_database(path: &Path) -> Result<Option<CursorDatabase>, ProviderError> {
-    open_cursor_database_with_hooks(path, || {}, || {})
+    open_cursor_database_in(path, &cursor_snapshot_root()?)
 }
 
 #[cfg(unix)]
+fn open_cursor_database_in(
+    path: &Path,
+    root: &Path,
+) -> Result<Option<CursorDatabase>, ProviderError> {
+    open_cursor_database_at_with_hooks(path, root, || {}, || {})
+}
+
+#[cfg(all(test, unix))]
 fn open_cursor_database_with_hooks(
     path: &Path,
     after_capture: impl FnOnce(),
     after_database_read: impl FnOnce(),
 ) -> Result<Option<CursorDatabase>, ProviderError> {
+    open_cursor_database_at_with_hooks(
+        path,
+        &cursor_snapshot_root()?,
+        after_capture,
+        after_database_read,
+    )
+}
+
+#[cfg(unix)]
+fn open_cursor_database_at_with_hooks(
+    path: &Path,
+    root: &Path,
+    after_capture: impl FnOnce(),
+    after_database_read: impl FnOnce(),
+) -> Result<Option<CursorDatabase>, ProviderError> {
     use std::{
         io::Write,
-        os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+        os::{
+            fd::AsRawFd,
+            unix::fs::{DirBuilderExt, OpenOptionsExt},
+        },
     };
 
     // Capture all identities before reading any bytes. Never give SQLite a source path:
@@ -885,15 +916,32 @@ fn open_cursor_database_with_hooks(
     }
     after_capture();
     let mut after_database_read = Some(after_database_read);
-    let directory = std::env::temp_dir().join(format!(
-        "quotio-cursor-{}",
+    prepare_cursor_snapshot_root(root)?;
+    recover_cursor_snapshots(root)?;
+    let directory = root.join(format!(
+        "{CURSOR_SNAPSHOT_PREFIX}{}-{}",
+        std::process::id(),
         crate::accounts::random_string().map_err(|_| ProviderError::CredentialStorage)?
     ));
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&directory)
         .map_err(|_| ProviderError::CredentialStorage)?;
-    let snapshot = CursorDatabase { directory, sources };
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(directory.join(CURSOR_SNAPSHOT_LOCK))
+        .map_err(|_| ProviderError::CredentialStorage)?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(ProviderError::CredentialStorage);
+    }
+    let snapshot = CursorDatabase {
+        directory,
+        _lock: lock,
+        sources,
+    };
     let mut page_size = 0;
     let mut wal_mode = false;
     for (index, (source, metadata)) in snapshot.sources.iter().take(2).enumerate() {
@@ -972,6 +1020,149 @@ fn open_cursor_database_with_hooks(
         return Err(ProviderError::CredentialStorage);
     }
     Ok(Some(snapshot))
+}
+
+#[cfg(unix)]
+fn cursor_snapshot_root() -> Result<PathBuf, ProviderError> {
+    #[cfg(test)]
+    if std::env::var_os("QUOTIO_CACHE_DIR").is_none() {
+        return Ok(std::env::temp_dir().join(format!(
+            "quotio-cursor-tests-{}-{}",
+            unsafe { libc::geteuid() },
+            std::process::id()
+        )));
+    }
+    let base = std::env::var_os("QUOTIO_CACHE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            directories::ProjectDirs::from("", "", "quotio")
+                .map(|directories| directories.cache_dir().to_owned())
+        })
+        .ok_or(ProviderError::CredentialStorage)?;
+    if !base.is_absolute() {
+        return Err(ProviderError::CredentialStorage);
+    }
+    Ok(base.join("cursor-snapshots-v1"))
+}
+
+#[cfg(unix)]
+fn prepare_cursor_snapshot_root(root: &Path) -> Result<(), ProviderError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(root)
+        .map_err(|_| ProviderError::CredentialStorage)?;
+    let metadata = std::fs::symlink_metadata(root).map_err(|_| ProviderError::CredentialStorage)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o700
+    {
+        return Err(ProviderError::CredentialStorage);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn recover_cursor_snapshots(root: &Path) -> Result<(), ProviderError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt},
+    };
+    for entry in std::fs::read_dir(root).map_err(|_| ProviderError::CredentialStorage)? {
+        let entry = entry.map_err(|_| ProviderError::CredentialStorage)?;
+        let name = entry.file_name();
+        let bytes = name.as_bytes();
+        let Some(pid) = cursor_snapshot_pid(bytes) else {
+            continue;
+        };
+        if cursor_process_is_alive(pid) {
+            continue;
+        }
+        let directory = entry.path();
+        let metadata = match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(ProviderError::CredentialStorage),
+        };
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o777 != 0o700
+        {
+            continue;
+        }
+        let lock = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(directory.join(CURSOR_SNAPSHOT_LOCK))
+        {
+            Ok(lock) => lock,
+            Err(_) => continue,
+        };
+        let lock_metadata = lock
+            .metadata()
+            .map_err(|_| ProviderError::CredentialStorage)?;
+        if !lock_metadata.is_file()
+            || lock_metadata.uid() != unsafe { libc::geteuid() }
+            || lock_metadata.nlink() != 1
+            || lock_metadata.mode() & 0o777 != 0o600
+            || unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
+            || !cursor_snapshot_contents_are_owned(&directory)?
+        {
+            continue;
+        }
+        std::fs::remove_dir_all(directory).map_err(|_| ProviderError::CredentialStorage)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn cursor_snapshot_pid(name: &[u8]) -> Option<libc::pid_t> {
+    let value = name.strip_prefix(CURSOR_SNAPSHOT_PREFIX.as_bytes())?;
+    let separator = value.iter().position(|byte| *byte == b'-')?;
+    let (pid, random) = (&value[..separator], &value[separator + 1..]);
+    if pid.is_empty()
+        || random.len() != 43
+        || !pid.iter().all(u8::is_ascii_digit)
+        || !random
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    std::str::from_utf8(pid)
+        .ok()?
+        .parse()
+        .ok()
+        .filter(|pid| *pid > 0)
+}
+
+#[cfg(unix)]
+fn cursor_process_is_alive(pid: libc::pid_t) -> bool {
+    (unsafe { libc::kill(pid, 0) }) == 0
+        || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(unix)]
+fn cursor_snapshot_contents_are_owned(directory: &Path) -> Result<bool, ProviderError> {
+    use std::os::unix::fs::MetadataExt;
+    for entry in std::fs::read_dir(directory).map_err(|_| ProviderError::CredentialStorage)? {
+        let entry = entry.map_err(|_| ProviderError::CredentialStorage)?;
+        let metadata = std::fs::symlink_metadata(entry.path())
+            .map_err(|_| ProviderError::CredentialStorage)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(unix)]
