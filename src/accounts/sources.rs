@@ -66,6 +66,7 @@ impl AntigravityNativeReference {
 pub enum CopilotLocation {
     Apps,
     Hosts,
+    GhHosts,
     GhKeychain,
 }
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -86,6 +87,12 @@ impl CopilotNativeReference {
                         CopilotLocation::Apps => ".config/github-copilot/apps.json",
                         _ => ".config/github-copilot/hosts.json",
                     }),
+            ),
+            CopilotLocation::GhHosts => Some(
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .ok_or(AccountError::NotFound)?
+                    .join(".config/gh/hosts.yml"),
             ),
             CopilotLocation::GhKeychain => {
                 if !cfg!(target_os = "macos") {
@@ -126,6 +133,15 @@ impl CopilotNativeReference {
                 }
                 path.to_str().ok_or(AccountError::Input)?
             }
+            (CopilotLocation::GhHosts, Some(path))
+                if key == "github.com"
+                    && path.is_absolute()
+                    && !path
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir)) =>
+            {
+                path.to_str().ok_or(AccountError::Input)?
+            }
             (CopilotLocation::GhKeychain, None) => "gh:github.com",
             _ => return Err(AccountError::Input),
         };
@@ -137,11 +153,22 @@ impl CopilotNativeReference {
     }
     pub async fn resolve(&self) -> Result<Resolved, AccountError> {
         self.identity()?;
-        let token = crate::providers::catalog::oauth_primary::copilot_reference_token(
-            self.path.clone(),
-            &self.entry_key,
-        )
-        .await?;
+        let token = match self.location {
+            CopilotLocation::GhHosts => {
+                crate::providers::catalog::oauth_primary::copilot_gh_hosts_reference_token(
+                    self.path.clone().ok_or(AccountError::Input)?,
+                    &self.entry_key,
+                )
+                .await?
+            }
+            _ => {
+                crate::providers::catalog::oauth_primary::copilot_reference_token(
+                    self.path.clone(),
+                    &self.entry_key,
+                )
+                .await?
+            }
+        };
         Ok(Resolved {
             label: format!("Copilot {}", &self.identity()?[..8]),
             provider: crate::cli::Provider::Catalog("copilot"),
@@ -1056,6 +1083,39 @@ mod tests {
         ));
         std::fs::remove_dir_all(dir).unwrap();
     }
+    #[tokio::test]
+    async fn copilot_gh_hosts_pins_github_and_observes_rotation() {
+        let dir = std::env::temp_dir().join(super::super::random_string().unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("hosts.yml");
+        let mut source = CopilotNativeReference {
+            location: CopilotLocation::GhHosts,
+            path: Some(path.clone()),
+            entry_key: "enterprise.example".into(),
+        };
+        assert!(source.identity().is_err());
+        source.entry_key = "github.com".into();
+        std::fs::write(
+            &path,
+            b"enterprise.example:\n  oauth_token: wrong\ngithub.com:\n  oauth_token: first\n",
+        )
+        .unwrap();
+        let first = source.resolve().await.unwrap();
+        assert!(
+            matches!(&first.credentials[0], Credential::CatalogKey { token, .. } if token == "first")
+        );
+        let identity = source.identity().unwrap();
+        std::fs::write(&path, b"github.com:\n  oauth_token: second\n").unwrap();
+        let second = source.resolve().await.unwrap();
+        assert!(
+            matches!(&second.credentials[0], Credential::CatalogKey { token, .. } if token == "second")
+        );
+        assert_eq!(source.identity().unwrap(), identity);
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", &path).unwrap();
+        assert!(source.resolve().await.is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn copilot_native_registration_rejects_paths_and_credentials() {
         use crate::accounts::api::SourceInput;
@@ -1073,6 +1133,10 @@ mod tests {
             value[field] = "fixture".into();
             assert!(serde_json::from_value::<SourceInput>(value).is_err());
         }
+        let mut gh_hosts = base.clone();
+        gh_hosts["location"] = "gh_hosts".into();
+        gh_hosts["entry_key"] = "github.com".into();
+        assert!(serde_json::from_value::<SourceInput>(gh_hosts).is_ok());
         for location in ["proxy", "gh_file", "default"] {
             let mut value = base.clone();
             value["location"] = location.into();

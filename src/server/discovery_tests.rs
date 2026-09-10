@@ -17,6 +17,10 @@ async fn discovery_rest_registers_opaque_exact_entries_without_credentials() {
             ".config/github-copilot/apps.json",
             r#"{"github.com:planted-secret":{"oauth_token":"planted-secret"}}"#,
         ),
+        (
+            ".config/gh/hosts.yml",
+            "github.com:\n  oauth_token: planted-secret\n",
+        ),
     ] {
         let path = home.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -55,6 +59,7 @@ async fn discovery_rest_registers_opaque_exact_entries_without_credentials() {
     for (index, request) in [
         json!({"provider":"grok","kind":"grok_native","inspect":true}),
         json!({"provider":"copilot","kind":"copilot_native","location":"apps","inspect":true}),
+        json!({"provider":"copilot","kind":"copilot_native","location":"gh_hosts","inspect":true}),
         json!({"provider":"clinepass","kind":"quotio_custom_provider","domain":"production","inspect":true}),
     ].into_iter().enumerate() {
         let response = client.post(&endpoint).bearer_auth(token).json(&request).send().await.unwrap();

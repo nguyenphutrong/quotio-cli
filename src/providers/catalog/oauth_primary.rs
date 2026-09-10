@@ -651,6 +651,14 @@ fn copilot_editor_token(bytes: &[u8]) -> Result<Option<Secret>, ProviderError> {
     Ok(None)
 }
 
+pub(crate) fn copilot_gh_host_present(bytes: &[u8]) -> Result<bool, ProviderError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| ProviderError::Authentication)?;
+    Ok(text.lines().any(|line| {
+        !line.as_bytes().first().is_some_and(u8::is_ascii_whitespace)
+            && line.trim() == "github.com:"
+    }))
+}
+
 fn copilot_gh_token(bytes: &[u8]) -> Result<Option<Secret>, ProviderError> {
     let text = std::str::from_utf8(bytes).map_err(|_| ProviderError::Authentication)?;
     let mut in_github = false;
@@ -715,6 +723,19 @@ pub(crate) async fn copilot_reference_token(
             copilot_keychain_token(&bytes)?.ok_or(ProviderError::Authentication)
         }
     }
+}
+
+pub(crate) async fn copilot_gh_hosts_reference_token(
+    path: PathBuf,
+    entry: &str,
+) -> Result<Secret, ProviderError> {
+    if entry != "github.com" {
+        return Err(ProviderError::Authentication);
+    }
+    let bytes = native_file(path)
+        .await?
+        .ok_or(ProviderError::Authentication)?;
+    copilot_gh_token(&bytes)?.ok_or(ProviderError::Authentication)
 }
 
 async fn native_copilot_token() -> Result<Secret, ProviderError> {

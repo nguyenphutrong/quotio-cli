@@ -120,7 +120,7 @@ impl Registry {
         let locations: &[&str] = match kind.as_str() {
             "codex_native" => &["default", "config", "codex_home"],
             "claude_native" => &["code_file", "code_keychain"],
-            "copilot_native" => &["apps", "hosts", "gh_keychain"],
+            "copilot_native" => &["apps", "hosts", "gh_hosts", "gh_keychain"],
             "factory_native" => &["v2_file", "v2_login_keychain", "v2_keyring", "legacy"],
             "devin_desktop_native" => &["credentials_toml", "state_database"],
             "antigravity_native" => &["gemini_keychain", "state_db"],
@@ -210,11 +210,25 @@ impl Registry {
             ("grok_native", _) => ".grok/auth.json",
             ("copilot_native", Some("apps")) => ".config/github-copilot/apps.json",
             ("copilot_native", Some("hosts")) => ".config/github-copilot/hosts.json",
+            ("copilot_native", Some("gh_hosts")) => ".config/gh/hosts.yml",
             _ => return Err(AccountError::Input),
         };
         let path = home.join(relative);
-        let value: Value =
-            serde_json::from_slice(&read_native(&path)?).map_err(|_| AccountError::Corrupt)?;
+        let bytes = read_native(&path)?;
+        if kind == "copilot_native" && location == Some("gh_hosts") {
+            let present = crate::providers::catalog::oauth_primary::copilot_gh_host_present(&bytes)
+                .map_err(|_| AccountError::Corrupt)?;
+            return Ok(if present {
+                vec![Reference::Copilot(CopilotNativeReference {
+                    path: Some(path),
+                    entry_key: "github.com".into(),
+                    location: CopilotLocation::GhHosts,
+                })]
+            } else {
+                Vec::new()
+            });
+        }
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| AccountError::Corrupt)?;
         let entries = value.as_object().ok_or(AccountError::Corrupt)?;
         if entries.len() > LIMIT {
             return Err(AccountError::Corrupt);
@@ -402,6 +416,50 @@ mod tests {
                 "unreadable"
             );
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn copilot_gh_hosts_discovery_is_opaque_and_observes_rotation() {
+        let dir = std::env::temp_dir().join(super::super::random_string().unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let home = dir.canonicalize().unwrap();
+        let path = home.join(".config/gh/hosts.yml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"github.com:\n  oauth_token: first-secret\n").unwrap();
+        let mut registry = Registry {
+            home: Some(home),
+            ..Default::default()
+        };
+        let request = serde_json::from_value(json!({
+            "provider":"copilot",
+            "kind":"copilot_native",
+            "location":"gh_hosts",
+            "inspect":true
+        }))
+        .unwrap();
+        let discovered = registry.inspect(request).unwrap();
+        assert_eq!(discovered["status"], "checked");
+        assert_eq!(discovered["candidates"].as_array().unwrap().len(), 1);
+        assert!(!discovered.to_string().contains("first-secret"));
+        assert!(!discovered.to_string().contains("github.com"));
+        let reference = registry
+            .get(
+                discovered["candidates"][0]["source"]["discovery_ref"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+        let Reference::Copilot(source) = reference else {
+            panic!("Copilot reference expected")
+        };
+        std::fs::write(&path, b"github.com:\n  oauth_token: second-secret\n").unwrap();
+        let resolved = source.resolve().await.unwrap();
+        assert!(
+            matches!(&resolved.credentials[0], crate::accounts::Credential::CatalogKey { token, .. } if token == "second-secret")
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", &path).unwrap();
+        assert!(source.resolve().await.is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]

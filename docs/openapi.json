@@ -2934,14 +2934,14 @@
               "kind": {"const": "copilot_native"},
               "location": {
                 "type": "string",
-                "enum": ["apps", "hosts", "gh_keychain"],
-                "description": "apps and hosts pin ~/.config/github-copilot/apps.json or hosts.json. gh_keychain reads the gh:github.com service on macOS only. Read-only; no refresh, fallback or proxy discovery."
+                "enum": ["apps", "hosts", "gh_hosts", "gh_keychain"],
+                "description": "apps and hosts pin ~/.config/github-copilot/apps.json or hosts.json. gh_hosts pins the github.com entry in ~/.config/gh/hosts.yml. gh_keychain reads the gh:github.com service on macOS only. Read-only; no refresh, fallback or proxy discovery."
               },
               "entry_key": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 256,
-                "description": "Exact JSON entry, github.com or github.com:<app-id>. For gh_keychain, the exact Keychain account."
+                "description": "Exact entry. apps and hosts accept github.com or github.com:<app-id>; gh_hosts requires github.com; gh_keychain uses the exact Keychain account."
               }
             }
           },
