@@ -505,8 +505,7 @@ the current-period and model percentages with separate stable IDs.
 Missing counters and zero limits remain unknown. Unlimited is reported only when
 explicitly supplied by the summary. A malformed metric or failed endpoint adds a
 scoped diagnostic without deleting valid sibling data; endpoint deadlines leave
-time to return partial results within the collector budget. Native-source account
-registration and local email/subscription-status metadata are still pending.
+time to return partial results within the collector budget.
 
 ### Cursor native source
 
@@ -524,11 +523,13 @@ owner to log in; the backend never refreshes or writes Cursor's login. A disable
 reference blocks the equivalent native `local` alias; an explicit environment
 token remains an independent legacy source.
 
-The reader uses bounded, read-only SQLite descriptor queries. Symlinks and unsafe
-database files are rejected. The existing reader currently rejects WAL/SHM
-databases instead of ignoring their pending writes; this remains a native Cursor
-compatibility gap requiring separate validation. Native source registration is
-macOS-only; Linux retains explicit-token usage and encrypted account storage.
+The reader copies the database and its committed WAL frames into a bounded private
+snapshot before opening SQLite. It never copies the owner's SHM file; SQLite may
+rebuild SHM only inside the private directory. Symlinks, unsafe database files,
+malformed WAL data, source changes during capture or refresh, and unsafe schemas
+are rejected. Native source registration is macOS-only; Linux retains
+explicit-token usage and encrypted account storage. Live acceptance with Cursor
+open and an active WAL remains pending.
 
 ### Grok plan and extra usage
 
