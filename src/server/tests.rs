@@ -76,6 +76,69 @@ pub(super) async fn fixture() -> (Arc<ApiState>, std::path::PathBuf, String) {
         id,
     )
 }
+
+#[tokio::test]
+async fn account_scoped_refresh_does_not_require_scheduled_provider() {
+    let (state, dir, id) = fixture().await;
+    assert!(
+        state
+            .settings
+            .read()
+            .await
+            .values
+            .enabled_providers
+            .is_empty()
+    );
+    let refresh_guard = state.refresh_lock.lock().await;
+
+    let result = manual_refresh(
+        State(state.clone()),
+        ApiJson(RefreshRequest {
+            providers: vec![Provider::Amp],
+            account_id: Some(id),
+            force: true,
+        }),
+    )
+    .await;
+
+    assert!(matches!(result, Ok((StatusCode::ACCEPTED, _))));
+    for job in state.jobs.lock().unwrap().drain(..) {
+        job.abort();
+    }
+    drop(refresh_guard);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn unscoped_refresh_still_requires_enabled_provider() {
+    let (state, dir, _) = fixture().await;
+    assert!(
+        state
+            .settings
+            .read()
+            .await
+            .values
+            .enabled_providers
+            .is_empty()
+    );
+
+    let result = manual_refresh(
+        State(state),
+        ApiJson(RefreshRequest {
+            providers: vec![Provider::Amp],
+            account_id: None,
+            force: true,
+        }),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(ApiError(StatusCode::BAD_REQUEST, "invalid_refresh_scope"))
+    ));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn grok_local_alias_runs_with_an_isolated_home() {
     let dir = std::env::temp_dir().join(accounts::random_string().unwrap());

@@ -372,13 +372,13 @@ async fn manual_refresh(
     }
     request.providers.sort_by_key(|p| p.id());
     request.providers.dedup();
-    if request.providers.iter().any(|p| !enabled.contains(p))
-        || (request.account_id.is_some() && request.providers.len() != 1)
-    {
+    if request.account_id.is_some() && request.providers.len() != 1 {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_refresh_scope"));
     }
     if let Some(id) = &request.account_id {
         management::validate_refresh_account(&state, request.providers[0], id).await?;
+    } else if request.providers.iter().any(|p| !enabled.contains(p)) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_refresh_scope"));
     }
     let key = serde_json::to_string(&request)
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
@@ -440,7 +440,7 @@ async fn refresh(state: &ApiState, request: Option<RefreshRequest>) -> Result<Va
         Some(r) => (r.providers, r.account_id, r.force),
         None => (enabled.clone(), None, false),
     };
-    if selected.iter().any(|p| !enabled.contains(p)) {
+    if account.is_none() && selected.iter().any(|p| !enabled.contains(p)) {
         return Err("refresh_scope_changed");
     }
     state.status.lock().await.refreshing = true;

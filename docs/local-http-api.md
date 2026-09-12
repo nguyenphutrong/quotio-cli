@@ -96,7 +96,10 @@ curl -H "Authorization: Bearer $QUOTIO_SERVER_TOKEN" http://127.0.0.1:6767/v1/op
 
 Settings patches include the current `revision`; a stale revision returns 409
 `revision_conflict`, so read `GET /v1/settings` and retry. `POST /v1/refresh` returns
-202 with an operation ID.
+202 with an operation ID. A request with `account_id` may refresh that enabled
+account even when its provider is not enabled for scheduled collection. The
+provider must match the account, and account-scoped requests must name exactly
+one provider. Requests without `account_id` remain limited to enabled providers.
 
 ### Managed OAuth sessions
 

@@ -1181,6 +1181,7 @@
     "/v1/refresh": {
       "post": {
         "summary": "Start refresh",
+        "description": "An account-scoped request may refresh that enabled account even when its provider is not enabled for scheduled collection. The provider must match the account, and the request must name exactly one provider. Requests without account_id remain limited to enabled providers.",
         "responses": {
           "202": {
             "description": "Success",
