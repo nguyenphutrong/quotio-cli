@@ -1188,6 +1188,16 @@ pub async fn adapters(
 ) -> Result<Vec<Arc<dyn ProviderAdapter>>, AccountError> {
     adapters_with_vault(providers, saved, timeout, filter, Vault::for_usage).await
 }
+
+pub(crate) async fn adapters_in_vault(
+    providers: Vec<Provider>,
+    timeout: std::time::Duration,
+    filter: Option<&str>,
+    vault: Vault,
+) -> Result<Vec<Arc<dyn ProviderAdapter>>, AccountError> {
+    adapters_with_vault(providers, true, timeout, filter, move || Ok(vault.clone())).await
+}
+
 async fn adapters_with_vault(
     providers: Vec<Provider>,
     saved: bool,

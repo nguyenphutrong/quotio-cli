@@ -445,13 +445,20 @@ async fn refresh(state: &ApiState, request: Option<RefreshRequest>) -> Result<Va
     }
     state.status.lock().await.refreshing = true;
     let timeout = Duration::from_secs(config.provider_timeout);
-    let adapters = crate::accounts::service::adapters(
-        selected.clone(),
-        !state.no_saved_accounts,
-        timeout,
-        account.as_deref(),
-    )
-    .await;
+    let adapters = if state.no_saved_accounts {
+        crate::accounts::service::adapters(selected.clone(), false, timeout, account.as_deref())
+            .await
+    } else if let Some(vault) = state.vault.clone() {
+        crate::accounts::service::adapters_in_vault(
+            selected.clone(),
+            timeout,
+            account.as_deref(),
+            vault,
+        )
+        .await
+    } else {
+        Err(crate::accounts::AccountError::Storage)
+    };
     let collector = Collector {
         context: state.context.clone(),
     };
@@ -469,6 +476,10 @@ async fn refresh(state: &ApiState, request: Option<RefreshRequest>) -> Result<Va
                     force,
                 )
                 .await
+        }
+        Err(error) if account.is_some() => {
+            state.status.lock().await.refreshing = false;
+            return Err(management::account_code(&error));
         }
         Err(_) => UsageReport {
             schema_version: 1,

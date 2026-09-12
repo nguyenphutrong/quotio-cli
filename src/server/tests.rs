@@ -110,6 +110,37 @@ async fn account_scoped_refresh_does_not_require_scheduled_provider() {
 }
 
 #[tokio::test]
+async fn account_scoped_refresh_reports_account_removed_before_collection() {
+    let (mut state, dir, id) = fixture().await;
+    Arc::get_mut(&mut state).unwrap().no_saved_accounts = false;
+    let refresh_guard = state.refresh_lock.lock().await;
+    let result = manual_refresh(
+        State(state.clone()),
+        ApiJson(RefreshRequest {
+            providers: vec![Provider::Amp],
+            account_id: Some(id.clone()),
+            force: true,
+        }),
+    )
+    .await;
+    let (_, Json(initial)) = match result {
+        Ok(value) => value,
+        Err(_) => panic!("account-scoped refresh was rejected"),
+    };
+
+    accounts::api::remove(state.vault.clone().unwrap(), id)
+        .await
+        .unwrap();
+    drop(refresh_guard);
+
+    let completed = done(&state, &initial.id).await;
+    assert_eq!(completed.status, "failed");
+    assert_eq!(completed.error, Some("account_not_found"));
+    assert!(completed.result.is_none());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn unscoped_refresh_still_requires_enabled_provider() {
     let (state, dir, _) = fixture().await;
     assert!(
