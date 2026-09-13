@@ -14,9 +14,9 @@ package or configure external credentials.
 | macOS Intel | `x86_64-apple-darwin` |
 | Linux x64 | `x86_64-unknown-linux-gnu` |
 
-Linux binaries are built on Ubuntu 24.04 and require glibc 2.39 or newer. They do
-not support the saved-account Keychain vault. Windows and Linux ARM are not
-included in this first release matrix.
+Linux binaries are built on Ubuntu 24.04 and require glibc 2.39 or newer. Saved
+accounts use the encrypted Linux vault rather than macOS Keychain. Windows and
+Linux ARM are not included in this first release matrix.
 
 GitHub releases contain three `.tar.gz` archives, an npm `.tgz`, a Homebrew formula
 and `SHA256SUMS`. Each native archive contains the executable, MIT license and

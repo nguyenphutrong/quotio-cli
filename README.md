@@ -293,8 +293,9 @@ Native Keychain calls cannot be cancelled at the OS boundary; command exit no lo
 waits indefinitely after a timeout. If an account write times out, inspect the saved
 accounts before retrying because the OS write outcome may be uncertain.
 
-Managed storage currently supports macOS only; other platforms retain the previous
-environment/CLI usage routes. There is no plaintext storage fallback.
+Managed storage supports macOS Keychain and the encrypted Linux vault described
+above. Other platforms retain the previous environment/CLI usage routes. There is
+no plaintext storage fallback.
 
 Saved Codex accounts use `source: codex_api`. Refresh occurs near expiry or after
 authentication failure, and all rotated tokens are saved before a quota retry.
@@ -659,8 +660,9 @@ symlinks or submodules. Build and runtime do not need the reference checkout.
   fallback requires the app to be running.
 - Z.ai monitor and other internal endpoints may change. MiniMax uses the documented
   global host; compatibility with actual subscription keys remains unverified.
-- Saved account storage is macOS-only. Factory selects the active saved account;
-  the other managed providers support multiple saved accounts/keys.
+- Saved account storage uses Keychain on macOS and an encrypted file with an
+  externally supplied master key on Linux. Factory selects the active saved
+  account; the other managed providers support multiple saved accounts/keys.
 - Usage cache and REST polling are implemented; no TUI is included. Native Antigravity
   also has an existing, separate access-token cache in Keychain. Usage cache files
   never contain those tokens.

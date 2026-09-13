@@ -37,6 +37,11 @@ class ReleaseTests(unittest.TestCase):
                 names = tar.getnames()
                 for target in release.TARGETS:
                     self.assertIn(f'package/native/{target}/quotio', names)
+                readme = tar.extractfile('package/README.md').read().decode()
+                self.assertIn('encrypted Linux vault', readme)
+                self.assertIn('QUOTIO_VAULT_KEY_FILE', readme)
+                self.assertIn('QUOTIO_VAULT_KEY_FD is native-binary only', readme)
+                self.assertNotIn('Linux has no saved-account vault', readme)
             self.assertEqual(len((out / 'SHA256SUMS').read_text().splitlines()), 5)
             formula = (out / 'quotio.rb').read_text()
             self.assertIn('/releases/download/v0.1.0/', formula)

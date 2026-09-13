@@ -118,7 +118,9 @@ def assemble(args):
 Install with `npm install -g quotio`, then run `quotio --help`.
 This package bundles native binaries; it has no install script or runtime download.
 Supports macOS Apple Silicon/Intel and Linux x64 (glibc 2.39 or newer).
-Saved accounts use macOS Keychain; Linux has no saved-account vault.
+Saved accounts use macOS Keychain or an encrypted Linux vault. Linux requires an
+external master key through QUOTIO_VAULT_KEY_FILE. The npm launcher does not forward
+additional inherited file descriptors, so QUOTIO_VAULT_KEY_FD is native-binary only.
 ''')
     name = 'quotio-beta.rb' if '-' in release else 'quotio.rb'
     (args.output / name).write_text(formula(release, args.repository, hashes))

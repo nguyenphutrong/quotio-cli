@@ -1,15 +1,19 @@
 # Operate a Quotio backend
 
-Run one server as the Mac user who owns the provider accounts. The server must
+Run one server as the OS user who owns the provider accounts. The server must
 stay on loopback. An independently managed HTTPS proxy or tunnel handles remote
-connections. Linux CI checks parsing and transport; Linux has no account vault.
+connections. macOS stores accounts in Keychain. Linux uses its encrypted vault
+and requires `QUOTIO_VAULT_KEY_FILE` or `QUOTIO_VAULT_KEY_FD` at startup.
 
 ## First startup
 
-1. Build with `scripts/build-signed.sh --release --locked`. Keep the same signing
-   identity for upgrades. This is a local build, not a notarized distribution.
-2. Run the signed binary's `accounts list` command in a terminal and grant access
-   to Quotio's vault if macOS asks. Add accounts through the CLI or management API.
+1. On macOS, build with `scripts/build-signed.sh --release --locked` and keep the
+   same signing identity for upgrades. This is a local build, not a notarized
+   distribution. On Linux, use a published release artifact or build with
+   `cargo build --release --locked`; macOS signing scripts do not run on Linux.
+2. Run the binary's `accounts list` command in a terminal. On macOS, grant access
+   to Quotio's vault if prompted. On Linux, first supply one protected master-key
+   source as documented in the README. Add accounts through the CLI or management API.
 3. Put the server token in the launcher's secret storage. Supply it as the
    `QUOTIO_SERVER_TOKEN` environment variable, never a command-line argument or URL.
 4. Start the server with an explicit absolute config path:
@@ -33,16 +37,19 @@ port directly. Quotio does not trust forwarded headers as authority.
 
 ## Run in the background
 
-Use a per-user LaunchAgent or a Swift app-owned child process. Keep the binary at
-an absolute, stable path and run it as the logged-in account owner. Configure
-restart on unexpected exit and a delay between restarts. Do not run a system-wide
-root daemon against a user's login Keychain.
+On macOS, use a per-user LaunchAgent or a Swift app-owned child process. On Linux,
+use a per-user service manager and pass the protected vault key source from its
+secret storage. Keep the binary at an absolute, stable path, run it as the account
+owner, and configure restart on unexpected exit with a delay between restarts. Do
+not run a system-wide root daemon against a user's Keychain or encrypted vault.
 
 The launcher must pass the token without putting it into a checked-in plist.
 Keep any local wrapper or secret file private to its owner (mode 0600), and keep
 logs private because operational metadata still describes the user's activity.
-A LaunchAgent runs only within the user's login session; locking the Keychain,
-logging out, sleeping or restarting the Mac can interrupt provider access.
+On macOS, a LaunchAgent runs only within the user's login session; locking the
+Keychain, logging out, sleeping or restarting the Mac can interrupt provider
+access. On Linux, verify the user service can read its key source after logout or
+restart without copying the key into the unit file or process arguments.
 
 Quotio emits lifecycle, refresh counts and operation outcome events to stderr.
 It does not log request bodies, callbacks, authorization headers, labels or
@@ -65,24 +72,29 @@ provider response bodies. Rotate the stderr file in the supervisor.
   forced refresh bypasses freshness checks; repeated force calls do not fix an
   authentication error and can trigger provider rate limits.
 
-Retain the previous signed binary and a private copy of the config before an
-upgrade. Use the same config and vault identity for rollback. Credentials remain
-in Keychain; never export the vault into diagnostics or Git. The usage cache is
-rebuildable and does not contain provider tokens.
+Retain the previous release binary and a private copy of the config before an
+upgrade. On macOS, keep its signing identity stable. Use the same config and vault
+identity for rollback. Credentials remain
+in Keychain on macOS or in the encrypted vault on Linux. Keep the Linux master key
+separate from the vault, and never export either into diagnostics or Git. The usage
+cache is rebuildable and does not contain provider tokens.
 
 ## Release acceptance
 
 Record the revision, OS, binary checksum, signing verification and result for each
 check below. Use sanitized outcomes, not tokens, email addresses or raw responses.
 
-- Add, relabel, select and remove a disposable account through the actual signed
-  server. Check both granted and denied Keychain access without remote prompts.
+- Add, relabel, select and remove a disposable account through the release server.
+  On macOS, use the actual signed binary and check both granted and denied Keychain
+  access without remote prompts. On Linux, test missing, invalid and correct vault
+  keys plus a restart using the same encrypted vault.
 - Complete Codex OAuth in loopback and relay modes. Check expiry, token rotation,
   duplicate identity and callback replay against the real provider.
 - Verify usage for every provider advertised as live-supported against its own
   dashboard. A parser fixture proves only the fixture contract.
-- Interrupt a write, restart and reconcile the stored account list. Repeat with
-  the Keychain locked, the Mac asleep and the network offline.
+- Interrupt a write, restart and reconcile the stored account list. On macOS,
+  repeat with the Keychain locked and the Mac asleep. On Linux, repeat with the
+  vault key temporarily unavailable. Test network loss on both platforms.
 - Through the actual HTTPS proxy, verify bearer enforcement, allowed and rejected
   origins, Host validation, body limits and recovery after proxy restart.
 - Run the release binary long enough to cover token renewal and multiple refresh
