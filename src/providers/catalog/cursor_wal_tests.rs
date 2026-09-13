@@ -204,7 +204,7 @@ fn cursor_wal_recovers_only_unlocked_owned_snapshots() {
 
     let orphan = root.join(format!(
         "{CURSOR_SNAPSHOT_PREFIX}{}-{}",
-        i32::MAX,
+        std::process::id(),
         "a".repeat(43)
     ));
     std::fs::create_dir(&orphan).unwrap();

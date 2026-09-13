@@ -1075,10 +1075,7 @@ fn recover_cursor_snapshots(root: &Path) -> Result<(), ProviderError> {
         let entry = entry.map_err(|_| ProviderError::CredentialStorage)?;
         let name = entry.file_name();
         let bytes = name.as_bytes();
-        let Some(pid) = cursor_snapshot_pid(bytes) else {
-            continue;
-        };
-        if cursor_process_is_alive(pid) {
+        if cursor_snapshot_pid(bytes).is_none() {
             continue;
         }
         let directory = entry.path();
@@ -1139,12 +1136,6 @@ fn cursor_snapshot_pid(name: &[u8]) -> Option<libc::pid_t> {
         .parse()
         .ok()
         .filter(|pid| *pid > 0)
-}
-
-#[cfg(unix)]
-fn cursor_process_is_alive(pid: libc::pid_t) -> bool {
-    (unsafe { libc::kill(pid, 0) }) == 0
-        || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 #[cfg(unix)]
