@@ -14,7 +14,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  security:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security.yml # zizmor: ignore[self-repository] GitHub and actionlint require ./ here.
   build:
+    name: Build ${{ matrix.target }}
+    needs: security
     strategy:
       fail-fast: false
       matrix:
@@ -75,12 +81,13 @@ jobs:
           if-no-files-found: error
           retention-days: 7
   draft:
+    name: Assemble draft release
     needs: build
     runs-on: ubuntu-24.04
     environment: release
     timeout-minutes: 10
     permissions:
-      contents: write
+      contents: write # Required to create the draft GitHub release.
     env:
       VERSION: ${{ inputs.version }}
       GH_TOKEN: ${{ github.token }}

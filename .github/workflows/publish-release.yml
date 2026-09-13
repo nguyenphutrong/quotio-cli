@@ -11,12 +11,13 @@ concurrency:
 
 jobs:
   npm:
+    name: Publish npm package
     runs-on: ubuntu-24.04
     environment: release
     timeout-minutes: 10
     permissions:
       contents: read
-      id-token: write
+      id-token: write # Required for npm trusted publishing provenance.
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ github.event.release.tag_name }}
@@ -47,6 +48,7 @@ jobs:
             npm publish "quotio-$version.tgz" --access public --tag "$channel" --provenance
           fi
   homebrew:
+    name: Update Homebrew tap
     needs: npm
     runs-on: ubuntu-24.04
     environment: release

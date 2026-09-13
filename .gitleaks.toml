@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic bearer used only by the parent-pipe integration test"
+condition = "AND"
+paths = ['''^tests/server\.rs$''']
+regexTarget = "secret"
+regexes = ['''^synthetic-parent-pipe-bearer-1234567890$''']
