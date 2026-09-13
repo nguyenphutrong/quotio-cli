@@ -110,6 +110,132 @@ async fn account_scoped_refresh_does_not_require_scheduled_provider() {
 }
 
 #[tokio::test]
+async fn account_scoped_refresh_requires_an_explicit_provider() {
+    let (state, dir, id) = fixture().await;
+    state
+        .settings
+        .write()
+        .await
+        .values
+        .enabled_providers
+        .push("amp".into());
+
+    let result = manual_refresh(
+        State(state),
+        ApiJson(RefreshRequest {
+            providers: vec![],
+            account_id: Some(id),
+            force: true,
+        }),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(ApiError(StatusCode::BAD_REQUEST, "invalid_refresh_scope"))
+    ));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn account_scoped_refresh_rejects_duplicate_providers() {
+    let (state, dir, id) = fixture().await;
+
+    let result = manual_refresh(
+        State(state),
+        ApiJson(RefreshRequest {
+            providers: vec![Provider::Amp, Provider::Amp],
+            account_id: Some(id),
+            force: true,
+        }),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(ApiError(StatusCode::BAD_REQUEST, "invalid_refresh_scope"))
+    ));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn disabled_provider_account_refresh_does_not_replace_the_scheduled_snapshot() {
+    let existing = UsageReport {
+        schema_version: 1,
+        generated_at: time::OffsetDateTime::UNIX_EPOCH,
+        providers: vec![],
+        failures: vec![],
+    };
+    let mut snapshot = Some((0, existing));
+    let report = UsageReport {
+        schema_version: 1,
+        generated_at: time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+        providers: vec![],
+        failures: vec![ProviderFailure {
+            provider: ProviderId("amp".into()),
+            account_ref: None,
+            code: ProviderError::Unavailable,
+            message: ProviderError::Unavailable.to_string(),
+        }],
+    };
+
+    assert!(!merge_refresh_report(
+        &mut snapshot,
+        0,
+        &[Provider::Amp],
+        &[],
+        Some("account-id"),
+        report,
+    ));
+    let retained = snapshot.unwrap().1;
+    assert_eq!(retained.generated_at, time::OffsetDateTime::UNIX_EPOCH);
+    assert!(retained.providers.is_empty());
+    assert!(retained.failures.is_empty());
+}
+
+#[test]
+fn account_refresh_cannot_initialize_the_scheduled_snapshot() {
+    let report = UsageReport {
+        schema_version: 1,
+        generated_at: time::OffsetDateTime::UNIX_EPOCH,
+        providers: vec![],
+        failures: vec![],
+    };
+    let mut snapshot = None;
+
+    assert!(!merge_refresh_report(
+        &mut snapshot,
+        0,
+        &[Provider::Amp],
+        &[Provider::Amp, Provider::Codex],
+        Some("account-id"),
+        report,
+    ));
+    assert!(snapshot.is_none());
+}
+
+#[test]
+fn full_refresh_initializes_snapshot_independent_of_provider_order() {
+    let report = UsageReport {
+        schema_version: 1,
+        generated_at: time::OffsetDateTime::UNIX_EPOCH,
+        providers: vec![],
+        failures: vec![],
+    };
+    let mut snapshot = None;
+
+    assert!(merge_refresh_report(
+        &mut snapshot,
+        0,
+        &[Provider::Amp, Provider::Codex],
+        &[Provider::Codex, Provider::Amp],
+        None,
+        report,
+    ));
+    assert!(snapshot.is_some());
+}
+
+#[tokio::test]
 async fn account_scoped_refresh_reports_account_removed_before_collection() {
     let (mut state, dir, id) = fixture().await;
     Arc::get_mut(&mut state).unwrap().no_saved_accounts = false;

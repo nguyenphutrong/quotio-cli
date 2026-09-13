@@ -2734,6 +2734,31 @@
       },
       "RefreshRequest": {
         "type": "object",
+        "allOf": [
+          {
+            "if": {
+              "required": [
+                "account_id"
+              ],
+              "properties": {
+                "account_id": {
+                  "type": "string"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "providers"
+              ],
+              "properties": {
+                "providers": {
+                  "minItems": 1,
+                  "maxItems": 1
+                }
+              }
+            }
+          }
+        ],
         "properties": {
           "providers": {
             "type": "array",

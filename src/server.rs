@@ -367,14 +367,14 @@ async fn manual_refresh(
         .values
         .providers()
         .unwrap_or_default();
-    if request.providers.is_empty() {
+    if request.account_id.is_some() && request.providers.len() != 1 {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_refresh_scope"));
+    }
+    if request.providers.is_empty() && request.account_id.is_none() {
         request.providers = enabled.clone();
     }
     request.providers.sort_by_key(|p| p.id());
     request.providers.dedup();
-    if request.account_id.is_some() && request.providers.len() != 1 {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_refresh_scope"));
-    }
     if let Some(id) = &request.account_id {
         management::validate_refresh_account(&state, request.providers[0], id).await?;
     } else if request.providers.iter().any(|p| !enabled.contains(p)) {
@@ -515,34 +515,65 @@ async fn refresh(state: &ApiState, request: Option<RefreshRequest>) -> Result<Va
     }
     let result = json!({"providers":successes,"failures":failures,"report":&report});
     let mut snapshot = state.snapshot.write().await;
-    // Replace the requested scope, never restore failed data here; UsageCache owns retention.
-    if selected == enabled && account.is_none() {
-        *snapshot = Some((generation, report));
-    } else if let Some((old_generation, previous)) = &mut *snapshot {
-        if *old_generation == generation {
-            let matches = |provider: &ProviderId, reference: Option<&crate::domain::AccountRef>| {
-                selected.iter().any(|p| p.id() == provider.0)
-                    && account
-                        .as_ref()
-                        .is_none_or(|a| reference.is_some_and(|r| r.id == *a))
-            };
-            previous
-                .providers
-                .retain(|p| !matches(&p.provider, p.account_ref.as_ref()));
-            previous
-                .failures
-                .retain(|p| !matches(&p.provider, p.account_ref.as_ref()));
-            previous.providers.extend(report.providers);
-            previous.failures.extend(report.failures);
-            previous.generated_at = report.generated_at;
-        } else {
-            *snapshot = Some((generation, report));
-        }
-    } else {
-        *snapshot = Some((generation, report));
+    if !merge_refresh_report(
+        &mut snapshot,
+        generation,
+        &selected,
+        &enabled,
+        account.as_deref(),
+        report,
+    ) {
+        tracing::info!(
+            successes,
+            failures,
+            "scoped refresh completed outside scheduled snapshot"
+        );
+        return Ok(result);
     }
     tracing::info!(successes, failures, "refresh completed");
     Ok(result)
+}
+
+fn merge_refresh_report(
+    snapshot: &mut Option<(u64, UsageReport)>,
+    generation: u64,
+    selected: &[Provider],
+    enabled: &[Provider],
+    account: Option<&str>,
+    report: UsageReport,
+) -> bool {
+    if selected.iter().any(|provider| !enabled.contains(provider)) {
+        return false;
+    }
+    // Replace the requested scope, never restore failed data here; UsageCache owns retention.
+    let full_refresh = account.is_none()
+        && selected.len() == enabled.len()
+        && selected.iter().all(|provider| enabled.contains(provider));
+    if full_refresh {
+        *snapshot = Some((generation, report));
+        return true;
+    }
+
+    let Some((old_generation, previous)) = &mut *snapshot else {
+        return false;
+    };
+    if *old_generation != generation {
+        return false;
+    }
+    let matches = |provider: &ProviderId, reference: Option<&crate::domain::AccountRef>| {
+        selected.iter().any(|p| p.id() == provider.0)
+            && account.is_none_or(|a| reference.is_some_and(|r| r.id == a))
+    };
+    previous
+        .providers
+        .retain(|p| !matches(&p.provider, p.account_ref.as_ref()));
+    previous
+        .failures
+        .retain(|p| !matches(&p.provider, p.account_ref.as_ref()));
+    previous.providers.extend(report.providers);
+    previous.failures.extend(report.failures);
+    previous.generated_at = report.generated_at;
+    true
 }
 async fn wait_for_next_refresh(state: &ApiState) {
     let interval = state.settings.read().await.values.refresh_interval;

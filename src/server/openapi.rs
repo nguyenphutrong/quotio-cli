@@ -132,6 +132,21 @@ mod tests {
                 .iter()
                 .any(|p| p["name"] == "Idempotency-Key")
         );
+        let account_refresh = &d["components"]["schemas"]["RefreshRequest"]["allOf"][0];
+        assert_eq!(account_refresh["if"]["required"][0], "account_id");
+        assert_eq!(
+            account_refresh["if"]["properties"]["account_id"]["type"],
+            "string"
+        );
+        assert_eq!(account_refresh["then"]["required"][0], "providers");
+        assert_eq!(
+            account_refresh["then"]["properties"]["providers"]["minItems"],
+            1
+        );
+        assert_eq!(
+            account_refresh["then"]["properties"]["providers"]["maxItems"],
+            1
+        );
     }
 
     #[test]
