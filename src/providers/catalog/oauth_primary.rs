@@ -651,17 +651,14 @@ fn copilot_editor_token(bytes: &[u8]) -> Result<Option<Secret>, ProviderError> {
     Ok(None)
 }
 
-pub(crate) fn copilot_gh_host_present(bytes: &[u8]) -> Result<bool, ProviderError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| ProviderError::Authentication)?;
-    Ok(text.lines().any(|line| {
-        !line.as_bytes().first().is_some_and(u8::is_ascii_whitespace)
-            && line.trim() == "github.com:"
-    }))
+struct CopilotGhHost<'a> {
+    oauth_token: Option<&'a str>,
 }
 
-fn copilot_gh_token(bytes: &[u8]) -> Result<Option<Secret>, ProviderError> {
+fn copilot_gh_host(bytes: &[u8]) -> Result<Option<CopilotGhHost<'_>>, ProviderError> {
     let text = std::str::from_utf8(bytes).map_err(|_| ProviderError::Authentication)?;
     let mut in_github = false;
+    let mut found = false;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -669,6 +666,7 @@ fn copilot_gh_token(bytes: &[u8]) -> Result<Option<Secret>, ProviderError> {
         }
         if !line.as_bytes().first().is_some_and(u8::is_ascii_whitespace) {
             in_github = trimmed == "github.com:";
+            found |= in_github;
             continue;
         }
         if !in_github {
@@ -677,9 +675,21 @@ fn copilot_gh_token(bytes: &[u8]) -> Result<Option<Secret>, ProviderError> {
         let Some(value) = trimmed.strip_prefix("oauth_token:") else {
             continue;
         };
-        return token(value.trim().trim_matches(['\'', '"']));
+        return Ok(Some(CopilotGhHost {
+            oauth_token: Some(value.trim().trim_matches(['\'', '"'])),
+        }));
     }
-    Ok(None)
+    Ok(found.then_some(CopilotGhHost { oauth_token: None }))
+}
+
+pub(crate) fn copilot_gh_host_present(bytes: &[u8]) -> Result<bool, ProviderError> {
+    Ok(copilot_gh_host(bytes)?.is_some())
+}
+
+fn copilot_gh_token(bytes: &[u8]) -> Result<Option<Secret>, ProviderError> {
+    copilot_gh_host(bytes)?
+        .and_then(|host| host.oauth_token)
+        .map_or(Ok(None), token)
 }
 
 fn copilot_keychain_token(bytes: &[u8]) -> Result<Option<Secret>, ProviderError> {
@@ -1135,6 +1145,13 @@ mod tests {
             .0,
             "right"
         );
+        assert!(copilot_gh_host_present(b"github.com:\n  user: fixture\n").unwrap());
+        assert!(
+            copilot_gh_token(b"github.com:\n  user: fixture\n")
+                .unwrap()
+                .is_none()
+        );
+        assert!(!copilot_gh_host_present(b"enterprise.example:\n  oauth_token: wrong\n").unwrap());
         assert_eq!(
             copilot_keychain_token(b"go-keyring-base64:cmlnaHQ=")
                 .unwrap()
