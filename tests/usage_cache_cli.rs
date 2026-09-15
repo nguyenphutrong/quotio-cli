@@ -45,6 +45,7 @@ for line in sys.stdin:
     fn command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_quotio"));
         cmd.env("PATH", &self.0)
+            .env("CODEX_HOME", self.0.join("codex-home"))
             .env("QUOTIO_CACHE_DIR", self.0.join("cache"));
         cmd
     }

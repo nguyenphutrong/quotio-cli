@@ -52,7 +52,15 @@ pub(crate) fn parse(
                 name
             };
             let rate = entry.get("rate_limit").ok_or(ProviderError::InvalidData)?;
-            buckets.insert(format!("additional_{index}"), translated_rate(rate, name)?);
+            let mut id = entry
+                .get("limit_id")
+                .and_then(Value::as_str)
+                .map(super::codex::metric_segment)
+                .unwrap_or_else(|| super::codex::metric_segment(name));
+            if buckets.contains_key(&id) {
+                id = format!("{id}-{}", index + 1);
+            }
+            buckets.insert(id, translated_rate(rate, name)?);
         }
     }
     if buckets.is_empty() {
@@ -71,7 +79,7 @@ pub(crate) fn parse(
 }
 #[cfg(test)]
 tokio::task_local! {
-    static TEST_ENDPOINTS: (String, String, String);
+    pub(crate) static TEST_ENDPOINTS: (String, String, String);
 }
 
 pub async fn fetch(
@@ -122,6 +130,58 @@ pub(crate) async fn fetch_at(
     .await?;
     let mut usage = parse(value, email, context.clock.now())?;
     usage.account.id = account_id.clone();
+    supplement_at(
+        context,
+        credential,
+        &mut usage,
+        inventory_endpoint,
+        profile_endpoint,
+    )
+    .await;
+    Ok(usage)
+}
+
+pub(crate) async fn supplement(
+    context: &ProviderContext,
+    credential: &Credential,
+    usage: &mut ProviderUsage,
+) {
+    #[cfg(test)]
+    if let Ok((_, inventory, profile)) = TEST_ENDPOINTS.try_with(Clone::clone) {
+        supplement_at(context, credential, usage, &inventory, &profile).await;
+        return;
+    }
+    supplement_at(
+        context,
+        credential,
+        usage,
+        "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+        "https://chatgpt.com/backend-api/wham/profiles/me",
+    )
+    .await;
+}
+
+async fn supplement_at(
+    context: &ProviderContext,
+    credential: &Credential,
+    usage: &mut ProviderUsage,
+    inventory_endpoint: &str,
+    profile_endpoint: &str,
+) {
+    let Credential::CodexOAuth {
+        access_token,
+        account_id,
+        ..
+    } = credential
+    else {
+        for source in ["codex_reset_credits", "codex_profile"] {
+            usage.diagnostics.push(UsageDiagnostic {
+                source: source.into(),
+                code: ProviderError::Authentication,
+            });
+        }
+        return;
+    };
     let (inventory, profile) = tokio::join!(
         supplemental(context, access_token, account_id, inventory_endpoint, true),
         supplemental(context, access_token, account_id, profile_endpoint, false),
@@ -152,7 +212,6 @@ pub(crate) async fn fetch_at(
             code,
         }),
     }
-    Ok(usage)
 }
 async fn supplemental(
     context: &ProviderContext,
@@ -512,7 +571,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_quota_preserves_identity_headers_and_sparse_windows() {
-        let (url,task)=http::fixture::server(vec![json!({"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":604800}},"additional_rate_limits":[{"limit_name":"GPT Spark","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000}}}]}), json!({"available_count":0,"credits":[]})]).await;
+        let (url,task)=http::fixture::server(vec![json!({"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":604800}},"additional_rate_limits":[{"limit_id":"gpt-reserve","limit_name":"GPT Spark","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000}}}]}), json!({"available_count":0,"credits":[]})]).await;
         let credential = Credential::CodexOAuth {
             access_token: "synthetic-token".into(),
             refresh_token: "refresh".into(),
@@ -537,6 +596,11 @@ mod tests {
         assert_eq!(usage.windows.len(), 2);
         assert_eq!(usage.windows[0].label, "Weekly");
         assert_eq!(usage.windows[1].label, "Codex Spark Session");
+        assert_eq!(usage.windows[0].metric_id.as_deref(), Some("codex-weekly"));
+        assert_eq!(
+            usage.windows[1].metric_id.as_deref(),
+            Some("gpt-reserve-session")
+        );
         assert_eq!(usage.account.id, "workspace-a");
         assert_eq!(usage.account.plan.as_deref(), Some("pro"));
         let req = task.await.unwrap();

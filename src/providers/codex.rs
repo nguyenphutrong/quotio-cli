@@ -1,5 +1,5 @@
 use super::{FetchFuture, ProviderAdapter, ProviderContext, process};
-use crate::{domain::*, error::ProviderError};
+use crate::{accounts::Credential, domain::*, error::ProviderError};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf};
@@ -66,6 +66,27 @@ fn account(value: Value) -> Result<Account, ProviderError> {
     }
     Ok(account)
 }
+pub(crate) fn metric_segment(value: &str) -> String {
+    let mut normalized = String::new();
+    let mut separator = false;
+    for character in value.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            if separator && !normalized.is_empty() {
+                normalized.push('-');
+            }
+            normalized.push(character);
+            separator = false;
+        } else {
+            separator = true;
+        }
+    }
+    let normalized = normalized.trim_end_matches('-');
+    if normalized.is_empty() {
+        "codex".into()
+    } else {
+        normalized.into()
+    }
+}
 fn parse(
     account: Account,
     value: Value,
@@ -131,6 +152,12 @@ fn parse(
             } else {
                 format!("{prefix}{period}")
             };
+            let bucket_id = metric_segment(&id);
+            let metric_period = if period == "Quota" {
+                format!("quota-{}", index + 1)
+            } else {
+                period.to_ascii_lowercase()
+            };
             let confidence = if quota == Quota::Unknown {
                 Confidence::Unknown
             } else {
@@ -140,7 +167,7 @@ fn parse(
                 order,
                 QuotaWindow {
                     note: None,
-                    metric_id: None,
+                    metric_id: Some(format!("{bucket_id}-{metric_period}")),
                     consumption: None,
                     reset_description: None,
                     amounts: None,
@@ -248,6 +275,42 @@ impl CodexProvider {
             .map_err(|_| ProviderError::Unavailable)?;
         Ok((child, writer, reader))
     }
+
+    async fn local_credential() -> Result<Credential, ProviderError> {
+        let location = if std::env::var_os("CODEX_HOME").is_some() {
+            crate::accounts::sources::CodexLocation::CodexHome
+        } else {
+            crate::accounts::sources::CodexLocation::Default
+        };
+        let source = crate::accounts::sources::CodexNativeReference::system(location)
+            .map_err(|_| ProviderError::Authentication)?;
+        let cap = std::time::Duration::from_secs(1);
+        let budget = super::remaining_fetch_time().map_or(cap, |remaining| {
+            remaining
+                .saturating_sub(std::time::Duration::from_millis(100))
+                .min(cap)
+        });
+        if budget.is_zero() {
+            return Err(ProviderError::Timeout);
+        }
+        let resolved = tokio::time::timeout(budget, source.resolve())
+            .await
+            .map_err(|_| ProviderError::Timeout)?
+            .map_err(|_| ProviderError::Authentication)?;
+        resolved
+            .credentials
+            .into_iter()
+            .next()
+            .ok_or(ProviderError::Authentication)
+    }
+
+    async fn attach_supplemental(
+        context: &ProviderContext,
+        usage: &mut ProviderUsage,
+        credential: Credential,
+    ) {
+        super::codex_api::supplement(context, &credential, usage).await;
+    }
 }
 impl ProviderAdapter for CodexProvider {
     fn cache_identity<'a>(
@@ -331,13 +394,20 @@ impl ProviderAdapter for CodexProvider {
             }
             let result = parse(after, limits, context.clock.now());
             child.kill().await.map_err(|_| ProviderError::Unavailable)?;
-            result
+            let mut usage = result?;
+            if self.executable == std::path::Path::new("codex")
+                && let Ok(credential) = Self::local_credential().await
+            {
+                Self::attach_supplemental(context, &mut usage, credential).await;
+            }
+            Ok(usage)
         })
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::http;
     fn identity() -> Account {
         account(json!({"account":{"type":"chatgpt","email":"demo@example.com","planType":"pro"}}))
             .unwrap()
@@ -368,7 +438,7 @@ mod tests {
     fn compact_labels_omit_absent_session_and_preserve_weekly_primary() {
         let report = parse(identity(), json!({"rateLimitsByLimitId":{
             "codex":{"primary":{"usedPercent":70,"windowDurationMins":10080}},
-            "codex_bengalfox":{"limitName":"GPT-5.3-Codex-Spark","primary":{"usedPercent":25,"windowDurationMins":300},"secondary":{"usedPercent":40,"windowDurationMins":10080}}
+            "gpt-reserve":{"limitName":"GPT-5.3-Codex-Spark","primary":{"usedPercent":25,"windowDurationMins":300},"secondary":{"usedPercent":40,"windowDurationMins":10080}}
         }}), OffsetDateTime::UNIX_EPOCH).unwrap();
         assert_eq!(
             report
@@ -377,6 +447,14 @@ mod tests {
                 .map(|w| w.label.as_str())
                 .collect::<Vec<_>>(),
             vec!["Weekly", "Codex Spark Session", "Codex Spark Weekly"]
+        );
+        assert_eq!(
+            report
+                .windows
+                .iter()
+                .map(|w| w.metric_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["codex-weekly", "gpt-reserve-session", "gpt-reserve-weekly"]
         );
         assert_eq!(report.windows[0].quota, Quota::from_used(Some(70.0)));
         assert_eq!(report.windows[1].quota, Quota::from_used(Some(25.0)));
@@ -429,5 +507,101 @@ mod tests {
             report.windows[0].label.as_str(),
             "Session" | "Weekly"
         ));
+    }
+
+    #[tokio::test]
+    async fn local_usage_attaches_supplemental_data_without_exposing_credentials() {
+        let (inventory_url, inventory_task) = http::fixture::server(vec![json!({
+            "available_count": 2,
+            "credits": [{"id":"private-credit-id","status":"available"}]
+        })])
+        .await;
+        let (profile_url, profile_task) = http::fixture::server(vec![json!({
+            "stats": {"lifetime_tokens": 42}
+        })])
+        .await;
+        let context = http::fixture::context();
+        let mut usage = parse(
+            identity(),
+            json!({"rateLimits":{"primary":{"usedPercent":10,"windowDurationMins":300}}}),
+            context.clock.now(),
+        )
+        .unwrap();
+        let credential = Credential::CodexOAuth {
+            access_token: "private-access-token".into(),
+            refresh_token: String::new(),
+            id_token: String::new(),
+            account_id: "workspace-a".into(),
+            email: "demo@example.com".into(),
+            expires_at: i64::MAX,
+        };
+        super::super::codex_api::TEST_ENDPOINTS
+            .scope(
+                ("unused".into(), inventory_url, profile_url),
+                CodexProvider::attach_supplemental(&context, &mut usage, credential),
+            )
+            .await;
+        assert_eq!(usage.windows.len(), 1);
+        assert_eq!(
+            usage.codex_reset_credits.as_ref().unwrap().available_count,
+            2
+        );
+        assert_eq!(
+            usage.codex_profile.as_ref().unwrap().lifetime_tokens,
+            Some(42)
+        );
+        let serialized = serde_json::to_string(&usage).unwrap();
+        assert!(!serialized.contains("private-access-token"));
+        assert!(!serialized.contains("private-credit-id"));
+        inventory_task.await.unwrap();
+        profile_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_supplemental_failure_preserves_app_server_quota() {
+        let (inventory_url, inventory_task) =
+            http::fixture::server_status(vec![(503, json!({"error":"private-inventory-error"}))])
+                .await;
+        let (profile_url, profile_task) =
+            http::fixture::server_status(vec![(503, json!({"error":"private-profile-error"}))])
+                .await;
+        let mut usage = parse(
+            identity(),
+            json!({"rateLimits":{"primary":{"usedPercent":10,"windowDurationMins":300}}}),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        let credential = Credential::CodexOAuth {
+            access_token: "private-access-token".into(),
+            refresh_token: String::new(),
+            id_token: String::new(),
+            account_id: "workspace-a".into(),
+            email: "demo@example.com".into(),
+            expires_at: i64::MAX,
+        };
+        let context = http::fixture::context();
+        super::super::codex_api::TEST_ENDPOINTS
+            .scope(
+                ("unused".into(), inventory_url, profile_url),
+                CodexProvider::attach_supplemental(&context, &mut usage, credential),
+            )
+            .await;
+        assert_eq!(usage.windows.len(), 1);
+        assert_eq!(usage.windows[0].provenance.source, "codex_app_server");
+        assert!(usage.codex_reset_credits.is_none());
+        assert!(usage.codex_profile.is_none());
+        assert_eq!(usage.diagnostics.len(), 2);
+        assert!(
+            usage
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == ProviderError::Transient)
+        );
+        let serialized = serde_json::to_string(&usage).unwrap();
+        assert!(!serialized.contains("private-access-token"));
+        assert!(!serialized.contains("private-inventory-error"));
+        assert!(!serialized.contains("private-profile-error"));
+        inventory_task.await.unwrap();
+        profile_task.await.unwrap();
     }
 }
