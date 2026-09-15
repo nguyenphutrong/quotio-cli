@@ -511,6 +511,8 @@ mod tests {
 
     #[tokio::test]
     async fn local_usage_attaches_supplemental_data_without_exposing_credentials() {
+        let (usage_url, usage_task) =
+            http::fixture::server(vec![json!({"credits":{"balance":0}})]).await;
         let (inventory_url, inventory_task) = http::fixture::server(vec![json!({
             "available_count": 2,
             "credits": [{"id":"private-credit-id","status":"available"}]
@@ -537,11 +539,17 @@ mod tests {
         };
         super::super::codex_api::TEST_ENDPOINTS
             .scope(
-                ("unused".into(), inventory_url, profile_url),
+                (usage_url, inventory_url, profile_url),
                 CodexProvider::attach_supplemental(&context, &mut usage, credential),
             )
             .await;
-        assert_eq!(usage.windows.len(), 1);
+        assert_eq!(usage.windows.len(), 2);
+        let extra = usage
+            .windows
+            .iter()
+            .find(|window| window.metric_id.as_deref() == Some("codex-extra-usage"))
+            .unwrap();
+        assert_eq!(extra.amounts.as_ref().unwrap().remaining, 0.0);
         assert_eq!(
             usage.codex_reset_credits.as_ref().unwrap().available_count,
             2
@@ -553,12 +561,15 @@ mod tests {
         let serialized = serde_json::to_string(&usage).unwrap();
         assert!(!serialized.contains("private-access-token"));
         assert!(!serialized.contains("private-credit-id"));
+        usage_task.await.unwrap();
         inventory_task.await.unwrap();
         profile_task.await.unwrap();
     }
 
     #[tokio::test]
     async fn local_supplemental_failure_preserves_app_server_quota() {
+        let (usage_url, usage_task) =
+            http::fixture::server_status(vec![(503, json!({"error":"private-usage-error"}))]).await;
         let (inventory_url, inventory_task) =
             http::fixture::server_status(vec![(503, json!({"error":"private-inventory-error"}))])
                 .await;
@@ -582,7 +593,7 @@ mod tests {
         let context = http::fixture::context();
         super::super::codex_api::TEST_ENDPOINTS
             .scope(
-                ("unused".into(), inventory_url, profile_url),
+                (usage_url, inventory_url, profile_url),
                 CodexProvider::attach_supplemental(&context, &mut usage, credential),
             )
             .await;
@@ -590,7 +601,7 @@ mod tests {
         assert_eq!(usage.windows[0].provenance.source, "codex_app_server");
         assert!(usage.codex_reset_credits.is_none());
         assert!(usage.codex_profile.is_none());
-        assert_eq!(usage.diagnostics.len(), 2);
+        assert_eq!(usage.diagnostics.len(), 3);
         assert!(
             usage
                 .diagnostics
@@ -599,8 +610,10 @@ mod tests {
         );
         let serialized = serde_json::to_string(&usage).unwrap();
         assert!(!serialized.contains("private-access-token"));
+        assert!(!serialized.contains("private-usage-error"));
         assert!(!serialized.contains("private-inventory-error"));
         assert!(!serialized.contains("private-profile-error"));
+        usage_task.await.unwrap();
         inventory_task.await.unwrap();
         profile_task.await.unwrap();
     }

@@ -27,6 +27,7 @@ pub(crate) fn parse(
     email: &str,
     now: time::OffsetDateTime,
 ) -> Result<ProviderUsage, ProviderError> {
+    let extra_usage = parse_extra_usage(&value, now);
     let plan = value
         .get("plan_type")
         .and_then(Value::as_str)
@@ -75,7 +76,54 @@ pub(crate) fn parse(
     for w in &mut usage.windows {
         w.provenance.source = "codex_api".into();
     }
+    match extra_usage {
+        Ok(Some(extra_usage)) => usage.windows.push(extra_usage),
+        Ok(None) => {}
+        Err(code) => usage.diagnostics.push(UsageDiagnostic {
+            source: "codex_extra_usage".into(),
+            code,
+        }),
+    }
     Ok(usage)
+}
+
+fn parse_extra_usage(
+    value: &Value,
+    now: time::OffsetDateTime,
+) -> Result<Option<QuotaWindow>, ProviderError> {
+    let Some(credits) = value.get("credits").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let balance = match credits.get("balance") {
+        Some(Value::Number(value)) => value.as_f64(),
+        Some(Value::String(value)) => value.parse().ok(),
+        Some(Value::Null) | None if credits.get("has_credits") == Some(&Value::Bool(false)) => {
+            Some(0.0)
+        }
+        Some(Value::Null) | None => return Ok(None),
+        _ => None,
+    }
+    .filter(|value| value.is_finite() && *value >= 0.0)
+    .ok_or(ProviderError::InvalidData)?;
+    Ok(Some(QuotaWindow {
+        note: None,
+        metric_id: Some("codex-extra-usage".into()),
+        consumption: None,
+        label: "Extra Usage".into(),
+        quota: Quota::Unknown,
+        amounts: Some(QuotaAmounts {
+            remaining: balance,
+            limit: None,
+            unit: "credits".into(),
+        }),
+        resets_at: None,
+        reset_description: None,
+        provenance: Provenance {
+            source: "codex_api".into(),
+            confidence: Confidence::Exact,
+        },
+        fetched_at: now,
+    }))
 }
 #[cfg(test)]
 tokio::task_local! {
@@ -134,6 +182,7 @@ pub(crate) async fn fetch_at(
         context,
         credential,
         &mut usage,
+        None,
         inventory_endpoint,
         profile_endpoint,
     )
@@ -147,14 +196,23 @@ pub(crate) async fn supplement(
     usage: &mut ProviderUsage,
 ) {
     #[cfg(test)]
-    if let Ok((_, inventory, profile)) = TEST_ENDPOINTS.try_with(Clone::clone) {
-        supplement_at(context, credential, usage, &inventory, &profile).await;
+    if let Ok((quota, inventory, profile)) = TEST_ENDPOINTS.try_with(Clone::clone) {
+        supplement_at(
+            context,
+            credential,
+            usage,
+            Some(&quota),
+            &inventory,
+            &profile,
+        )
+        .await;
         return;
     }
     supplement_at(
         context,
         credential,
         usage,
+        Some("https://chatgpt.com/backend-api/wham/usage"),
         "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
         "https://chatgpt.com/backend-api/wham/profiles/me",
     )
@@ -165,6 +223,7 @@ async fn supplement_at(
     context: &ProviderContext,
     credential: &Credential,
     usage: &mut ProviderUsage,
+    usage_endpoint: Option<&str>,
     inventory_endpoint: &str,
     profile_endpoint: &str,
 ) {
@@ -174,7 +233,7 @@ async fn supplement_at(
         ..
     } = credential
     else {
-        for source in ["codex_reset_credits", "codex_profile"] {
+        for source in ["codex_extra_usage", "codex_reset_credits", "codex_profile"] {
             usage.diagnostics.push(UsageDiagnostic {
                 source: source.into(),
                 code: ProviderError::Authentication,
@@ -182,10 +241,19 @@ async fn supplement_at(
         }
         return;
     };
-    let (inventory, profile) = tokio::join!(
+    let (extra_usage, inventory, profile) = tokio::join!(
+        fetch_extra_usage(context, access_token, account_id, usage_endpoint),
         supplemental(context, access_token, account_id, inventory_endpoint, true),
         supplemental(context, access_token, account_id, profile_endpoint, false),
     );
+    match extra_usage {
+        Ok(Some(extra_usage)) => usage.windows.push(extra_usage),
+        Ok(_) => {}
+        Err(code) => usage.diagnostics.push(UsageDiagnostic {
+            source: "codex_extra_usage".into(),
+            code,
+        }),
+    }
     match inventory.and_then(|value| parse_inventory(value, context.clock.now())) {
         Ok(inventory) => {
             usage.reset_credits = Some(ResetCredits {
@@ -211,6 +279,20 @@ async fn supplement_at(
             source: "codex_profile".into(),
             code,
         }),
+    }
+}
+
+async fn fetch_extra_usage(
+    context: &ProviderContext,
+    access_token: &str,
+    account_id: &str,
+    endpoint: Option<&str>,
+) -> Result<Option<QuotaWindow>, ProviderError> {
+    match endpoint {
+        Some(endpoint) => supplemental(context, access_token, account_id, endpoint, false)
+            .await
+            .and_then(|value| parse_extra_usage(&value, context.clock.now())),
+        None => Ok(None),
     }
 }
 async fn supplemental(
@@ -571,7 +653,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_quota_preserves_identity_headers_and_sparse_windows() {
-        let (url,task)=http::fixture::server(vec![json!({"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":604800}},"additional_rate_limits":[{"limit_id":"gpt-reserve","limit_name":"GPT Spark","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000}}}]}), json!({"available_count":0,"credits":[]})]).await;
+        let (url,task)=http::fixture::server(vec![json!({"plan_type":"pro","credits":{"balance":2.9},"rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":604800}},"additional_rate_limits":[{"limit_id":"gpt-reserve","limit_name":"GPT Spark","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000}}}]}), json!({"available_count":0,"credits":[]})]).await;
         let credential = Credential::CodexOAuth {
             access_token: "synthetic-token".into(),
             refresh_token: "refresh".into(),
@@ -593,7 +675,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(usage.windows.len(), 2);
+        assert_eq!(usage.windows.len(), 3);
         assert_eq!(usage.windows[0].label, "Weekly");
         assert_eq!(usage.windows[1].label, "Codex Spark Session");
         assert_eq!(usage.windows[0].metric_id.as_deref(), Some("codex-weekly"));
@@ -601,6 +683,9 @@ mod tests {
             usage.windows[1].metric_id.as_deref(),
             Some("gpt-reserve-session")
         );
+        let extra = &usage.windows[2];
+        assert_eq!(extra.metric_id.as_deref(), Some("codex-extra-usage"));
+        assert_eq!(extra.amounts.as_ref().unwrap().remaining, 2.9);
         assert_eq!(usage.account.id, "workspace-a");
         assert_eq!(usage.account.plan.as_deref(), Some("pro"));
         let req = task.await.unwrap();
@@ -639,5 +724,23 @@ mod tests {
                 .contains("originator: codex desktop")
         );
         assert!(!profile_requests[0].to_lowercase().contains("openai-beta:"));
+    }
+
+    #[test]
+    fn malformed_extra_usage_preserves_rate_limits() {
+        let usage = parse(
+            json!({
+                "credits": {"balance": {}},
+                "rate_limit": {"primary_window": {"used_percent": 20, "limit_window_seconds": 604800}}
+            }),
+            "demo@example.com",
+            time::OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap();
+
+        assert_eq!(usage.windows.len(), 1);
+        assert_eq!(usage.diagnostics.len(), 1);
+        assert_eq!(usage.diagnostics[0].source, "codex_extra_usage");
+        assert_eq!(usage.diagnostics[0].code, ProviderError::InvalidData);
     }
 }
