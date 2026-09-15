@@ -40,6 +40,7 @@ this revision was verified with Rust 1.92.0. `Cargo.lock` pins dependencies.
 ```sh
 cargo run -- --help
 cargo run -- providers
+cargo run -- usage
 cargo run -- usage --provider mock --format text
 cargo run -- usage --provider mock --format json
 cargo run -- usage --provider mock --provider mock --timeout 5 --no-color --verbose
@@ -151,7 +152,8 @@ verified stale snapshot. Cancellation interrupts identity checks and provider wo
 
 ```toml
 # config.toml
-enabled_providers = ["mock"]
+disabled_providers = ["amp"] # optional; excluded from automatic CLI discovery
+enabled_providers = ["mock"] # server selection; mock always requires explicit CLI selection
 cache_ttl_seconds = 300 # optional; default is 5 minutes
 ```
 
@@ -162,11 +164,17 @@ cache_ttl_seconds = 300 # optional; default is 5 minutes
 - Linux: `$XDG_CONFIG_HOME/quotio/config.toml`, or `~/.config/quotio/config.toml`
 - Windows: the application config directory returned by `ProjectDirs`.
 
-Without `--provider`, selection comes from `enabled_providers`. Explicit providers
-override selection, but any loaded config must still be valid. Missing default
-config means no enabled providers, with exit code 3. A missing explicit config,
-invalid TOML, unknown fields or unsupported provider is a config error, code 2.
-The CLI does not create a config file. It creates the usage cache directory when needed.
+Without `--provider`, `quotio usage` automatically selects enabled saved accounts and
+detectable local sources, including supported environment credentials and installed
+Codex/Amp CLIs. Providers in `disabled_providers` are excluded. Disabled saved
+accounts and the `mock` fixture are never auto-selected. An explicit `--provider`
+overrides automatic discovery and the disabled list.
+
+`enabled_providers` remains the server's configured selection. A missing default
+config is valid; if CLI discovery finds nothing, `usage` exits with code 3. A missing
+explicit config, invalid TOML, unknown fields or unsupported provider is a config
+error, code 2. The CLI does not create a config file. It creates the usage cache
+directory when needed.
 
 Do not put credentials in config. Unknown fields, including token fields, are
 rejected. Parse errors show a line and column without echoing input. Argument

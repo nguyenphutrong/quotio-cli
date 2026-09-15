@@ -43,7 +43,7 @@ pub enum Command {
     },
     /// Add, select, list or remove accounts managed by Quotio
     Accounts(AccountsArgs),
-    /// Collect quota for selected or configured providers
+    /// Collect quota for detected or explicitly selected providers
     Usage(UsageArgs),
     /// Serve cached usage through a local read-only HTTP API
     Serve(ServeArgs),
@@ -137,7 +137,7 @@ pub struct UsageArgs {
     /// Fetch selected accounts even when their cached usage is fresh
     #[arg(long)]
     pub force: bool,
-    /// Select a provider; repeat to select more than one
+    /// Select a provider instead of auto-detection; repeat to select more than one
     #[arg(long, value_enum)]
     pub provider: Vec<Provider>,
     #[arg(long, value_enum, default_value = "text")]

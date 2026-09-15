@@ -11,6 +11,7 @@ use crate::{
         amp::AmpApiProvider, codex_api, factory::FactoryProvider,
     },
 };
+use clap::ValueEnum;
 use std::{collections::HashMap, sync::Arc};
 
 pub struct Keys(HashMap<String, String>);
@@ -985,11 +986,19 @@ async fn local_sources(requested: &[Provider], timeout: std::time::Duration) -> 
         .iter()
         .copied()
         .filter(|p| {
-            (p.key_api().is_some()
-                || p.catalog()
-                    .is_some_and(|d| d.auth == crate::providers::catalog::AuthKind::ApiKey))
-                && p.api_key_name()
-                    .is_some_and(|name| std::env::var_os(name).is_some())
+            let configured = p
+                .api_key_name()
+                .is_some_and(|name| std::env::var_os(name).is_some());
+            if let Some(definition) = p.catalog() {
+                definition.auth == crate::providers::catalog::AuthKind::ApiKey
+                    && configured
+                    && definition
+                        .settings
+                        .iter()
+                        .all(|setting| !setting.required || std::env::var_os(setting.env).is_some())
+            } else {
+                p.key_api().is_some() && configured
+            }
         })
         .collect();
     for (provider, token) in [
@@ -1043,6 +1052,27 @@ async fn local_sources(requested: &[Provider], timeout: std::time::Duration) -> 
     }
     sources
 }
+
+fn automatically_detected_providers(
+    candidates: &[Provider],
+    disabled: &[Provider],
+    accounts: &[Account],
+    local_sources: &[Provider],
+) -> Vec<Provider> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|provider| {
+            *provider != Provider::Mock
+                && !disabled.contains(provider)
+                && (local_sources.contains(provider)
+                    || accounts
+                        .iter()
+                        .any(|account| account.provider == *provider && account.enabled()))
+        })
+        .collect()
+}
+
 fn managed(vault: &Vault, account: &Account) -> Arc<dyn ProviderAdapter> {
     Arc::new(ManagedProvider {
         factory_oauth: matches!(account.credential, Credential::FactoryOAuth { .. }),
@@ -1187,6 +1217,41 @@ pub async fn adapters(
     filter: Option<&str>,
 ) -> Result<Vec<Arc<dyn ProviderAdapter>>, AccountError> {
     adapters_with_vault(providers, saved, timeout, filter, Vault::for_usage).await
+}
+
+pub async fn detected_adapters(
+    disabled: Vec<Provider>,
+    saved: bool,
+    timeout: std::time::Duration,
+) -> Result<Vec<Arc<dyn ProviderAdapter>>, AccountError> {
+    let candidates: Vec<_> = Provider::value_variants()
+        .iter()
+        .copied()
+        .filter(|provider| *provider != Provider::Mock && !disabled.contains(provider))
+        .collect();
+    if !saved || !cfg!(any(target_os = "macos", target_os = "linux")) {
+        let local_sources = local_sources(&candidates, timeout).await;
+        return Ok(local_sources.into_iter().map(Provider::adapter).collect());
+    }
+    let vault = Vault::for_usage()?;
+    let (accounts, local_sources) = tokio::join!(
+        discover(vault.clone(), timeout),
+        local_sources(&candidates, timeout)
+    );
+    let accounts = accounts?;
+    let providers =
+        automatically_detected_providers(&candidates, &disabled, &accounts, &local_sources);
+    let enabled_accounts = accounts
+        .into_iter()
+        .filter(Account::enabled)
+        .collect::<Vec<_>>();
+    choose(
+        providers,
+        None,
+        Ok(enabled_accounts),
+        &vault,
+        &local_sources,
+    )
 }
 
 pub(crate) async fn adapters_in_vault(
@@ -3731,6 +3796,33 @@ mod tests {
             vec!["local", "saved"]
         );
         cleanup(path);
+    }
+    #[test]
+    fn automatic_detection_excludes_mock_disabled_providers_and_disabled_accounts() {
+        let account = |provider: Provider, enabled| Account {
+            id: format!("{}-account", provider.id()),
+            provider,
+            label: "Test".into(),
+            identity: "test".into(),
+            active: true,
+            enabled,
+            credential: Credential::ApiKey {
+                token: "test-key".into(),
+                region: None,
+                organization: None,
+            },
+        };
+        let candidates = Provider::value_variants();
+        let detected = automatically_detected_providers(
+            candidates,
+            &[Provider::Factory],
+            &[
+                account(Provider::Codex, true),
+                account(Provider::Amp, false),
+            ],
+            &[Provider::Factory, Provider::Mock],
+        );
+        assert_eq!(detected, vec![Provider::Codex]);
     }
     #[test]
     fn codex_selection_includes_inactive_accounts_and_filters_by_id() {

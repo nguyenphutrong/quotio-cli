@@ -262,18 +262,19 @@ async fn run() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            let configured = match config.providers() {
+            if let Err(error) = config.providers() {
+                eprintln!("{error}");
+                return ExitCode::from(2);
+            }
+            let disabled = match config.disabled_providers() {
                 Ok(providers) => providers,
                 Err(error) => {
                     eprintln!("{error}");
                     return ExitCode::from(2);
                 }
             };
-            let selected = if args.provider.is_empty() {
-                configured
-            } else {
-                args.provider
-            };
+            let automatic = args.provider.is_empty();
+            let selected = args.provider;
             let mut unique = Vec::new();
             for provider in selected {
                 if !unique.contains(&provider) {
@@ -281,7 +282,22 @@ async fn run() -> ExitCode {
                 }
             }
             let providers = tokio::select! {
-                providers=quotio::accounts::service::adapters(unique, !args.no_saved_accounts, Duration::from_secs(args.timeout), args.account.as_deref())=>providers,
+                providers=async {
+                    if automatic {
+                        quotio::accounts::service::detected_adapters(
+                            disabled,
+                            !args.no_saved_accounts,
+                            Duration::from_secs(args.timeout),
+                        ).await
+                    } else {
+                        quotio::accounts::service::adapters(
+                            unique,
+                            !args.no_saved_accounts,
+                            Duration::from_secs(args.timeout),
+                            args.account.as_deref(),
+                        ).await
+                    }
+                }=>providers,
                 _=tokio::signal::ctrl_c()=>{eprintln!("Account discovery cancelled.");return ExitCode::from(3)},
             };
             let providers = match providers {
@@ -293,7 +309,7 @@ async fn run() -> ExitCode {
             };
             if providers.is_empty() {
                 eprintln!(
-                    "No providers selected. Use --provider mock or set enabled_providers in config."
+                    "No providers detected. Sign in to a supported provider or use --provider explicitly."
                 );
             }
             tracing::debug!(count = providers.len(), "collecting provider usage");

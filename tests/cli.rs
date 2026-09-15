@@ -30,6 +30,7 @@ impl Drop for ConfigFile {
 fn run(args: &[&str], config: &ConfigFile) -> Output {
     Command::new(env!("CARGO_BIN_EXE_quotio"))
         .args(args)
+        .env_clear()
         .env("QUOTIO_CACHE_DIR", config.0.with_extension("cache"))
         .arg("--no-saved-accounts")
         .arg("--config")
@@ -110,9 +111,9 @@ fn json_contract_and_deduplication() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("collecting provider usage"));
 }
 #[test]
-fn text_and_config_selection() {
+fn text_output_and_explicit_selection() {
     let config = ConfigFile::new("enabled_providers = [\"mock\"]");
-    let result = run(&["usage", "--no-color"], &config);
+    let result = run(&["usage", "--provider", "mock", "--no-color"], &config);
     assert_eq!(result.status.code(), Some(0));
     assert!(result.stderr.is_empty());
     let text = String::from_utf8(result.stdout).unwrap();
@@ -565,6 +566,14 @@ fn force_and_cache_ttl_contract() {
         assert!(args.force);
     }
     assert_eq!(Config::default().cache_ttl_seconds, 300);
+    assert!(Config::default().disabled_providers.is_empty());
+    assert_eq!(
+        Config::parse("disabled_providers = ['amp', 'amp', 'factory-droid']")
+            .unwrap()
+            .disabled_providers()
+            .unwrap(),
+        vec![quotio::cli::Provider::Amp, quotio::cli::Provider::Factory]
+    );
     assert_eq!(
         Config::parse("enabled_providers = []")
             .unwrap()

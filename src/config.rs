@@ -9,7 +9,7 @@ pub enum ConfigError {
     #[error("could not read config file")]
     Read,
     #[error(
-        "invalid TOML config at line {line}, column {column}; expected enabled_providers = [\"provider-id\"]"
+        "invalid TOML config at line {line}, column {column}; expected provider lists such as disabled_providers = [\"provider-id\"]"
     )]
     Parse { line: usize, column: usize },
     #[error("config contains an unsupported provider; run quotio providers")]
@@ -36,6 +36,8 @@ pub struct Config {
     pub notifications: Option<LegacyNotificationPreferences>,
     #[serde(default)]
     pub enabled_providers: Vec<String>,
+    #[serde(default)]
+    pub disabled_providers: Vec<String>,
     /// Maximum cache age in seconds; zero refreshes every time.
     #[serde(default = "default_cache_ttl")]
     pub cache_ttl_seconds: u64,
@@ -58,6 +60,7 @@ impl Default for Config {
         Self {
             notifications: None,
             enabled_providers: vec![],
+            disabled_providers: vec![],
             cache_ttl_seconds: default_cache_ttl(),
             refresh_interval: default_refresh_interval(),
             provider_timeout: default_provider_timeout(),
@@ -93,13 +96,20 @@ impl Config {
         })
     }
     pub fn providers(&self) -> Result<Vec<Provider>, ConfigError> {
-        let mut providers = Vec::new();
-        for id in &self.enabled_providers {
-            let provider = Provider::from_str(id, false).map_err(|_| ConfigError::Unsupported)?;
-            if !providers.contains(&provider) {
-                providers.push(provider);
-            }
-        }
-        Ok(providers)
+        parse_providers(&self.enabled_providers)
     }
+    pub fn disabled_providers(&self) -> Result<Vec<Provider>, ConfigError> {
+        parse_providers(&self.disabled_providers)
+    }
+}
+
+fn parse_providers(ids: &[String]) -> Result<Vec<Provider>, ConfigError> {
+    let mut providers = Vec::new();
+    for id in ids {
+        let provider = Provider::from_str(id, false).map_err(|_| ConfigError::Unsupported)?;
+        if !providers.contains(&provider) {
+            providers.push(provider);
+        }
+    }
+    Ok(providers)
 }

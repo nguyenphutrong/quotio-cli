@@ -2652,6 +2652,12 @@
               "$ref": "#/components/schemas/ProviderId"
             }
           },
+          "disabled_providers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProviderId"
+            }
+          },
           "cache_ttl_seconds": {
             "type": "integer",
             "minimum": 0
@@ -2682,6 +2688,7 @@
         "required": [
           "revision",
           "enabled_providers",
+          "disabled_providers",
           "cache_ttl_seconds",
           "refresh_interval",
           "provider_timeout",
@@ -2695,6 +2702,15 @@
             "type": "string"
           },
           "enabled_providers": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ProviderId"
+            }
+          },
+          "disabled_providers": {
             "type": [
               "array",
               "null"
